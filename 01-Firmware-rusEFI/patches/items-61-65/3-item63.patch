@@ -1,0 +1,397 @@
+From 20e4afedbf9860d77193d2dcefe64d6c0c267b14 Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sun, 1 Nov 2026 14:54:17 +0000
+Subject: [PATCH] Shift light, pro-style: shift RPM per gear, lamp output
+ and LED bar data
+
+Requested by Carlos (next firmware round, 01/11).
+- new module ShiftLight: shift RPM for gear unknown / neutral plus gears
+  1 to 6 (a gear left at 0 uses the first value); turns on at the shift RPM
+  and off 100 RPM below it
+- lamp output shiftLightPin (steady or blinking 1-20 Hz)
+- LED bar: fills from shift RPM - shiftLightPreRpm up to the shift RPM
+- live data for the app (flash the screen, draw the LED bar): Shift light
+  RPM (this gear), Shift light bar %, Shift light on
+- all 0 = off (default)
+- TunerStudio: Advanced > Shift light
+- 4 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ firmware/console/binary/output_channels.txt   |  3 +
+ firmware/controllers/algo/engine.h            |  2 +
+ firmware/controllers/modules/modules.mk       |  1 +
+ .../modules/shift_light/shift_light.cpp       | 71 ++++++++++++++++
+ .../modules/shift_light/shift_light.h         | 40 ++++++++++
+ .../modules/shift_light/shift_light.mk        |  3 +
+ firmware/controllers/system/efi_gpio.cpp      |  1 +
+ firmware/controllers/system/efi_gpio.h        |  1 +
+ firmware/integration/rusefi_config.txt        |  8 ++
+ firmware/tunerstudio/top_level_menu.ini       |  1 +
+ firmware/tunerstudio/tunerstudio.template.ini | 14 ++++
+ unit_tests/tests/test_shift_light.cpp         | 80 +++++++++++++++++++
+ unit_tests/tests/tests.mk                     |  1 +
+ 13 files changed, 226 insertions(+)
+ create mode 100644 firmware/controllers/modules/shift_light/shift_light.cpp
+ create mode 100644 firmware/controllers/modules/shift_light/shift_light.h
+ create mode 100644 firmware/controllers/modules/shift_light/shift_light.mk
+ create mode 100644 unit_tests/tests/test_shift_light.cpp
+
+diff --git a/firmware/console/binary/output_channels.txt b/firmware/console/binary/output_channels.txt
+index a15326f2db5..e9726623224 100644
+--- a/firmware/console/binary/output_channels.txt
++++ b/firmware/console/binary/output_channels.txt
+@@ -520,4 +520,7 @@ float mapFast
+ 	int8_t[8 iterate] autoscale cylLambdaTrim;Lambda trim cyl;"%", 0.2, 0, -25, 25, 1
+ 	int16_t egtRiseRate;EGT rise rate (fastest);"C/s", 1, 0, -1000, 1000, 0
+ 	uint8_t blipThrottleAdd;Downshift blip throttle add;"%", 1, 0, 0, 100, 0
++	uint16_t shiftLightTarget;Shift light RPM (this gear);"RPM", 1, 0, 0, 18000, 0
++	uint8_t shiftLightProgress;Shift light bar;"%", 1, 0, 0, 100, 0
++	uint8_t shiftLightOn;Shift light on;"", 1, 0, 0, 1, 0
+ end_struct
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index b8dddafa7fb..b59667f13b6 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -39,6 +39,7 @@
+ #include "cylinder_lambda_trim.h"
+ #include "egt_rise_monitor.h"
+ #include "downshift_blip.h"
++#include "shift_light.h"
+ #include "ecu_passwords.h"
+ #include "hall_pullup.h"
+ #include "cold_start_injector.h"
+@@ -216,6 +217,7 @@ public:
+         CylinderLambdaTrim,
+         EgtRiseMonitor,
+         DownshiftBlip,
++        ShiftLight,
+         HallPullupController,
+         ColdStartInjector,
+         GearShiftDetector,
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index f253e921755..ff8d21e6c9b 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -25,6 +25,7 @@ include $(PROJECT_DIR)/controllers/modules/rgb_status_led/rgb_status_led.mk
+ include $(PROJECT_DIR)/controllers/modules/cylinder_lambda_trim/cylinder_lambda_trim.mk
+ include $(PROJECT_DIR)/controllers/modules/egt_rise/egt_rise.mk
+ include $(PROJECT_DIR)/controllers/modules/downshift_blip/downshift_blip.mk
++include $(PROJECT_DIR)/controllers/modules/shift_light/shift_light.mk
+ include $(PROJECT_DIR)/controllers/modules/hall_pullup/hall_pullup.mk
+ include $(PROJECT_DIR)/controllers/modules/cold_start_injector/cold_start_injector.mk
+ include $(PROJECT_DIR)/controllers/modules/gear_shift/gear_shift.mk
+diff --git a/firmware/controllers/modules/shift_light/shift_light.cpp b/firmware/controllers/modules/shift_light/shift_light.cpp
+new file mode 100644
+index 00000000000..d6ec1cc311a
+--- /dev/null
++++ b/firmware/controllers/modules/shift_light/shift_light.cpp
+@@ -0,0 +1,71 @@
++#include "pch.h"
++
++#include "shift_light.h"
++
++// RPM below the shift RPM that turns the light off again (no flicker at the limit)
++static constexpr int shiftLightHysteresis = 100;
++
++int ShiftLight::getShiftRpm(int gear) const {
++	if (gear < 1 || gear >= SHIFT_LIGHT_GEARS) {
++		gear = 0;
++	}
++	int rpm = engineConfiguration->shiftLightRpm[gear];
++	// a gear left at 0 uses the 'gear unknown' RPM
++	return rpm > 0 ? rpm : engineConfiguration->shiftLightRpm[0];
++}
++
++void ShiftLight::update(float rpm, int gear, efitick_t nowNt) {
++	m_target = getShiftRpm(gear);
++	if (m_target <= 0) {
++		m_on = false;
++		m_progress = 0;
++		return;
++	}
++
++	bool wasOn = m_on;
++	if (rpm >= m_target) {
++		m_on = true;
++	} else if (rpm < m_target - shiftLightHysteresis) {
++		m_on = false;
++	}
++	if (m_on && !wasOn) {
++		m_onSince = nowNt;
++	}
++
++	int pre = engineConfiguration->shiftLightPreRpm;
++	if (m_on) {
++		m_progress = 100;
++	} else if (pre <= 0) {
++		m_progress = 0;
++	} else {
++		float start = m_target - pre;
++		float progress = (rpm - start) * 100 / pre;
++		m_progress = (uint8_t)clampF(0, progress, 99);
++	}
++}
++
++bool ShiftLight::getLampState(efitick_t nowNt) const {
++	if (!m_on) {
++		return false;
++	}
++	int hz = engineConfiguration->shiftLightBlinkHz;
++	if (hz <= 0) {
++		return true;
++	}
++	// starts lit, half period on, half off
++	float elapsed = NT2US(nowNt - m_onSince) * 1e-6f;
++	int halfPeriods = (int)(elapsed * hz * 2);
++	return (halfPeriods % 2) == 0;
++}
++
++void ShiftLight::onFastCallback() {
++	efitick_t nowNt = getTimeNowNt();
++	auto gear = Sensor::get(SensorType::DetectedGear);
++	int gearNumber = gear ? (int)(gear.Value + 0.5f) : 0;
++	update(Sensor::getOrZero(SensorType::Rpm), gearNumber, nowNt);
++
++	engine->outputChannels.shiftLightTarget = m_target;
++	engine->outputChannels.shiftLightProgress = m_progress;
++	engine->outputChannels.shiftLightOn = m_on;
++	enginePins.shiftLight.setValue(getLampState(nowNt));
++}
+diff --git a/firmware/controllers/modules/shift_light/shift_light.h b/firmware/controllers/modules/shift_light/shift_light.h
+new file mode 100644
+index 00000000000..7e0c2e98c19
+--- /dev/null
++++ b/firmware/controllers/modules/shift_light/shift_light.h
+@@ -0,0 +1,40 @@
++/*
++ * @file shift_light.h
++ *
++ * pro-style shift light: one shift RPM per gear (plus one for gear unknown / neutral),
++ * a lamp output (steady or blinking) and live data for the app to flash the screen and draw
++ * the LED bar (progress from shift RPM - pre RPM up to the shift RPM).
++ */
++
++#pragma once
++
++class ShiftLight : public EngineModule {
++public:
++	using interface_t = ShiftLight;
++
++	void onFastCallback() override;
++
++	// gear < 1 or above the table = first entry (gear unknown / neutral)
++	void update(float rpm, int gear, efitick_t nowNt);
++
++	// shift RPM for the gear, 0 = off
++	int getShiftRpm(int gear) const;
++	bool isOn() const {
++		return m_on;
++	}
++	// 0..100 %, LED bar fill
++	uint8_t getProgress() const {
++		return m_progress;
++	}
++	int getTargetRpm() const {
++		return m_target;
++	}
++	// lamp state including blinking
++	bool getLampState(efitick_t nowNt) const;
++
++private:
++	bool m_on = false;
++	uint8_t m_progress = 0;
++	int m_target = 0;
++	efitick_t m_onSince = 0;
++};
+diff --git a/firmware/controllers/modules/shift_light/shift_light.mk b/firmware/controllers/modules/shift_light/shift_light.mk
+new file mode 100644
+index 00000000000..0b1eef80836
+--- /dev/null
++++ b/firmware/controllers/modules/shift_light/shift_light.mk
+@@ -0,0 +1,3 @@
++# pro-style shift light: shift RPM per gear, lamp output and live data for the app
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/shift_light
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/shift_light/shift_light.cpp
+diff --git a/firmware/controllers/system/efi_gpio.cpp b/firmware/controllers/system/efi_gpio.cpp
+index ff852c27770..a35b8aa4cf4 100644
+--- a/firmware/controllers/system/efi_gpio.cpp
++++ b/firmware/controllers/system/efi_gpio.cpp
+@@ -156,6 +156,7 @@ EnginePins::EnginePins() :
+ 		rgbLedRed("RGB LED red", CONFIG_PIN_OFFSETS(rgbLedRed)),
+ 		rgbLedGreen("RGB LED green", CONFIG_PIN_OFFSETS(rgbLedGreen)),
+ 		rgbLedBlue("RGB LED blue", CONFIG_PIN_OFFSETS(rgbLedBlue)),
++		shiftLight("Shift light", CONFIG_PIN_OFFSETS(shiftLight)),
+ 		hallPullupCrank1("Hall pull-up crank 1", CONFIG_PIN_OFFSETS(hallPullupCrank1)),
+ 		hallPullupCrank2("Hall pull-up crank 2", CONFIG_PIN_OFFSETS(hallPullupCrank2)),
+ 		hallPullupCam1("Hall pull-up cam 1", CONFIG_PIN_OFFSETS(hallPullupCam1)),
+diff --git a/firmware/controllers/system/efi_gpio.h b/firmware/controllers/system/efi_gpio.h
+index dbb25542482..007d694177b 100644
+--- a/firmware/controllers/system/efi_gpio.h
++++ b/firmware/controllers/system/efi_gpio.h
+@@ -96,6 +96,7 @@ public:
+ 	RegisteredOutputPin rgbLedRed;
+ 	RegisteredOutputPin rgbLedGreen;
+ 	RegisteredOutputPin rgbLedBlue;
++	RegisteredOutputPin shiftLight;
+ 	// Hall pull-up enable per input: crank 1, crank 2, cam 1 to 4, see HallPullupController
+ 	RegisteredOutputPin hallPullupCrank1;
+ 	RegisteredOutputPin hallPullupCrank2;
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 272858c9e30..35efe62bb7d 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2083,6 +2083,14 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ 	uint16_t blipDuration;How long the blip lasts.;"ms", 1, 0, 0, 2000, 0
+ 	uint16_t blipMinRpm;No blip below this RPM.;"RPM", 1, 0, 0, 15000, 0
+ 
++! pro-style shift light, see ShiftLight
++#define SHIFT_LIGHT_GEARS 7
++	uint16_t[SHIFT_LIGHT_GEARS iterate] shiftLightRpm;Shift RPM. First value: gear unknown or neutral (also used when gear detection is off or a gear is left at 0), then gears 1 to 6. All 0 = shift light off.;"RPM", 1, 0, 0, 18000, 0
++	uint16_t shiftLightPreRpm;The LED bar (and the app bar) starts filling this many RPM before the shift RPM. 0 = no bar, only the light.;"RPM", 1, 0, 0, 5000, 0
++	output_pin_e shiftLightPin;Shift light lamp.
++	pin_output_mode_e shiftLightPinMode;
++	uint8_t shiftLightBlinkHz;Lamp blink rate at the shift RPM. 0 = steady.;"Hz", 1, 0, 0, 20, 0
++
+ ! pro-style custom firing order, used when firingOrder is FO_CUSTOM
+ 	uint8_t[MAX_CYLINDER_COUNT iterate] customFiringOrder;Cylinder number fired at this position of the custom firing order (only the first 'Number of cylinders' positions are used). Example K20: 1, 3, 4, 2. Each cylinder must appear once, or 1, 2, 3... is used and a warning is shown.;"", 1, 0, 1, @@MAX_CYLINDER_COUNT@@, 0
+ 
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index f2122c07361..49a92e3467c 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -218,6 +218,7 @@
+ 			groupChildMenu = tune3BoostClosedTbl, "Tune 3: Boost target (closed loop)", { tuneCount >= 3 && isBoostControlEnabled && boostType == 1 }
+ 
+ 		subMenu = std_separator
++		subMenu = shiftLightSettings, "Shift light"
+ 		groupMenu = "Alerts"
+ 			groupChildMenu = alertSettings, "Alert output and safe mode"
+ 			groupChildMenu = alert1, "Alert 1"
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 4f4b0de1bdc..ccbdeab3463 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -5800,6 +5800,20 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "High oil pressure protection timeout", maxOilPressureTimeout
+ 		panel = maximumOilPressure
+ 
++	dialog = shiftLightSettings, "Shift light"
++		field = "Shift RPM per gear. 'Gear unknown' is used when gear detection is off, in neutral, or for a gear left at 0. All 0 = off."
++		field = "Gear unknown / neutral",			shiftLightRpm1
++		field = "Gear 1",							shiftLightRpm2
++		field = "Gear 2",							shiftLightRpm3
++		field = "Gear 3",							shiftLightRpm4
++		field = "Gear 4",							shiftLightRpm5
++		field = "Gear 5",							shiftLightRpm6
++		field = "Gear 6",							shiftLightRpm7
++		field = "LED bar starts before shift RPM",	shiftLightPreRpm
++		field = "Lamp output",						shiftLightPin
++		field = "Lamp output mode",					shiftLightPinMode, { shiftLightPin != 0 }
++		field = "Lamp blink (0 = steady)",			shiftLightBlinkHz, { shiftLightPin != 0 }
++
+ 	dialog = etbSpeedLimitSettings, "Throttle speed by coolant temperature"
+ 		field = "Limit throttle speed",					etbSpeedLimitEnabled
+ 		field = "0 %/s in a point means no limit there."
+diff --git a/unit_tests/tests/test_shift_light.cpp b/unit_tests/tests/test_shift_light.cpp
+new file mode 100644
+index 00000000000..d8711d14798
+--- /dev/null
++++ b/unit_tests/tests/test_shift_light.cpp
+@@ -0,0 +1,80 @@
++#include "pch.h"
++
++#include "shift_light.h"
++
++// pro-style shift light: RPM per gear, LED bar progress, lamp blink
++
++static void setupShiftLight() {
++	engineConfiguration->shiftLightRpm[0] = 7000; // gear unknown
++	engineConfiguration->shiftLightRpm[1] = 6500; // 1st
++	engineConfiguration->shiftLightRpm[2] = 7500; // 2nd
++	engineConfiguration->shiftLightPreRpm = 1000;
++	engineConfiguration->shiftLightBlinkHz = 0;
++}
++
++TEST(ShiftLight, offByDefault) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	ShiftLight light;
++	light.update(9000, 0, getTimeNowNt());
++	EXPECT_FALSE(light.isOn());
++	EXPECT_EQ(0, light.getProgress());
++	EXPECT_EQ(0, light.getTargetRpm());
++}
++
++TEST(ShiftLight, rpmPerGear) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupShiftLight();
++	ShiftLight light;
++
++	EXPECT_EQ(6500, light.getShiftRpm(1));
++	EXPECT_EQ(7500, light.getShiftRpm(2));
++	// gear left at 0 and unknown gear use the first value
++	EXPECT_EQ(7000, light.getShiftRpm(3));
++	EXPECT_EQ(7000, light.getShiftRpm(0));
++	EXPECT_EQ(7000, light.getShiftRpm(9));
++
++	light.update(6600, 1, getTimeNowNt());
++	EXPECT_TRUE(light.isOn());
++	light.update(6600, 2, getTimeNowNt());
++	EXPECT_FALSE(light.isOn());
++}
++
++TEST(ShiftLight, barAndHysteresis) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupShiftLight();
++	ShiftLight light;
++
++	light.update(5000, 2, getTimeNowNt());
++	EXPECT_EQ(0, light.getProgress());
++	light.update(7000, 2, getTimeNowNt());
++	EXPECT_EQ(50, light.getProgress());
++	EXPECT_FALSE(light.isOn());
++
++	light.update(7500, 2, getTimeNowNt());
++	EXPECT_TRUE(light.isOn());
++	EXPECT_EQ(100, light.getProgress());
++
++	// stays on just below the shift RPM, off 100 RPM below
++	light.update(7450, 2, getTimeNowNt());
++	EXPECT_TRUE(light.isOn());
++	light.update(7390, 2, getTimeNowNt());
++	EXPECT_FALSE(light.isOn());
++}
++
++TEST(ShiftLight, blink) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupShiftLight();
++	engineConfiguration->shiftLightBlinkHz = 5; // 100 ms on, 100 ms off
++	ShiftLight light;
++
++	light.update(8000, 0, getTimeNowNt());
++	EXPECT_TRUE(light.getLampState(getTimeNowNt()));
++	advanceTimeUs(150'000);
++	EXPECT_FALSE(light.getLampState(getTimeNowNt()));
++	advanceTimeUs(100'000);
++	EXPECT_TRUE(light.getLampState(getTimeNowNt()));
++
++	engineConfiguration->shiftLightBlinkHz = 0;
++	advanceTimeUs(100'000);
++	EXPECT_TRUE(light.getLampState(getTimeNowNt()));
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 06b3a295532..d5c4a70106b 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -284,6 +284,7 @@ TESTS_SRC_CPP = \
+ 	tests/test_egt_rise.cpp \
+ 	tests/test_oil_restart_lock.cpp \
+ 	tests/test_downshift_blip.cpp \
++	tests/test_shift_light.cpp \
+ 	tests/test_custom_firing_order.cpp \
+ 	tests/controllers/modules/map_averaging/test_map_averaging.cpp \
+ 	tests/util/test_utils.cpp \
+-- 
+2.43.0
+

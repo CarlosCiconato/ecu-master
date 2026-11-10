@@ -1,0 +1,422 @@
+From a89ea8a70212f8aa6a9336250f6fb7f5eb75622d Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 11:34:54 +0000
+Subject: [PATCH] Cold start injector: extra injector pulsing while cranking
+ cold (pro-style)
+
+New output coldStartInjector. While cranking, and for coldStartInjectorAfterStart
+seconds after start, with the coolant below coldStartInjectorMaxClt, it pulses every
+coldStartInjectorPeriod ms for a time taken from a coolant temperature curve.
+Failed coolant sensor or no pin set: nothing happens. TS: Cranking > Cold start injector.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../algo/defaults/default_cranking.cpp        |   7 ++
+ firmware/controllers/algo/engine.h            |   2 +
+ .../cold_start_injector.cpp                   |  47 +++++++
+ .../cold_start_injector/cold_start_injector.h |  29 +++++
+ .../cold_start_injector.mk                    |   3 +
+ firmware/controllers/modules/modules.mk       |   1 +
+ firmware/controllers/system/efi_gpio.cpp      |   1 +
+ firmware/controllers/system/efi_gpio.h        |   2 +
+ firmware/integration/rusefi_config.txt        |  10 ++
+ firmware/tunerstudio/top_level_menu.ini       |   1 +
+ firmware/tunerstudio/tunerstudio.template.ini |  19 +++
+ .../controllers/test_cold_start_injector.cpp  | 119 ++++++++++++++++++
+ unit_tests/tests/tests.mk                     |   1 +
+ 13 files changed, 242 insertions(+)
+ create mode 100644 firmware/controllers/modules/cold_start_injector/cold_start_injector.cpp
+ create mode 100644 firmware/controllers/modules/cold_start_injector/cold_start_injector.h
+ create mode 100644 firmware/controllers/modules/cold_start_injector/cold_start_injector.mk
+ create mode 100644 unit_tests/tests/controllers/test_cold_start_injector.cpp
+
+diff --git a/firmware/controllers/algo/defaults/default_cranking.cpp b/firmware/controllers/algo/defaults/default_cranking.cpp
+index 5f06725..498abe3 100644
+--- a/firmware/controllers/algo/defaults/default_cranking.cpp
++++ b/firmware/controllers/algo/defaults/default_cranking.cpp
+@@ -39,6 +39,13 @@ void setDefaultCranking() {
+ 	setLinearCurve(config->crankingAdvanceCltBins, -40, 100, 1);
+ 	setArrayValues(config->crankingAdvanceCltAdder, 0);
+ 
++	// cold start injector: no output pin by default, so nothing happens until one is set
++	engineConfiguration->coldStartInjectorMaxClt = 20;
++	engineConfiguration->coldStartInjectorAfterStart = 0;
++	engineConfiguration->coldStartInjectorPeriod = 500;
++	setLinearCurve(config->coldStartInjectorCltBins, -40, 100, 1);
++	copyArray(config->coldStartInjectorPulse, { 150, 120, 80, 40, 0, 0, 0, 0 });
++
+ #if CRANKING_CURVE_SIZE == 8
+ 	// Cranking temperature compensation
+ 	static const float crankingCoef[] = {
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index 428ec1e..e7d998b 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -36,6 +36,7 @@
+ #include "alert_manager.h"
+ #include "tune_selector.h"
+ #include "hall_pullup.h"
++#include "cold_start_injector.h"
+ #include "shift_torque_reduction_controller.h"
+ #include "nitrous_controller.h"
+ #include "antilag_system.h"
+@@ -203,6 +204,7 @@ public:
+         AlertManager,
+         TuneSelector,
+         HallPullupController,
++        ColdStartInjector,
+ #if EFI_LAUNCH_CONTROL
+ #if EFI_ENGINE_CONTROL
+         NitrousController,
+diff --git a/firmware/controllers/modules/cold_start_injector/cold_start_injector.cpp b/firmware/controllers/modules/cold_start_injector/cold_start_injector.cpp
+new file mode 100644
+index 0000000..33681de
+--- /dev/null
++++ b/firmware/controllers/modules/cold_start_injector/cold_start_injector.cpp
+@@ -0,0 +1,47 @@
++#include "pch.h"
++
++#include "cold_start_injector.h"
++
++void ColdStartInjector::update() {
++	bool isCranking = engine->rpmCalculator.isCranking();
++	if (isCranking) {
++		m_sinceCranking.reset();
++		m_crankedThisStart = true;
++	}
++
++	bool isAfterStart = m_crankedThisStart
++		&& engine->rpmCalculator.isRunning()
++		&& !m_sinceCranking.hasElapsedSec(engineConfiguration->coldStartInjectorAfterStart);
++
++	auto clt = Sensor::get(SensorType::Clt);
++	// failed coolant sensor: do not inject
++	bool shouldBeActive = (isCranking || isAfterStart)
++		&& clt
++		&& clt.Value < engineConfiguration->coldStartInjectorMaxClt;
++
++	if (!shouldBeActive) {
++		m_isActive = false;
++		enginePins.coldStartInjector.setValue(false);
++		return;
++	}
++
++	if (!m_isActive) {
++		// first pulse right away
++		m_pulseTimer.reset();
++		m_isActive = true;
++	}
++
++	float pulseMs = interpolate2d(clt.Value, config->coldStartInjectorCltBins, config->coldStartInjectorPulse);
++	float periodMs = std::max<float>(engineConfiguration->coldStartInjectorPeriod, 20);
++	float positionMs = fmodf(m_pulseTimer.getElapsedSeconds() * 1000, periodMs);
++
++	enginePins.coldStartInjector.setValue(positionMs < pulseMs);
++}
++
++void ColdStartInjector::onFastCallback() {
++	update();
++}
++
++void ColdStartInjector::onEngineStop() {
++	m_crankedThisStart = false;
++}
+diff --git a/firmware/controllers/modules/cold_start_injector/cold_start_injector.h b/firmware/controllers/modules/cold_start_injector/cold_start_injector.h
+new file mode 100644
+index 0000000..2d87b3d
+--- /dev/null
++++ b/firmware/controllers/modules/cold_start_injector/cold_start_injector.h
+@@ -0,0 +1,29 @@
++/*
++ * @file cold_start_injector.h
++ *
++ * pro-style cold start injector: an extra injector (for example gasoline on an
++ * ethanol engine) that pulses while cranking, and for a set time after start, when the
++ * coolant is below a limit. Pulse length comes from a coolant temperature curve.
++ */
++
++#pragma once
++
++class ColdStartInjector : public EngineModule {
++public:
++	using interface_t = ColdStartInjector;
++
++	void onFastCallback() override;
++	void onEngineStop() override;
++
++	void update();
++
++	bool isActive() const {
++		return m_isActive;
++	}
++
++private:
++	bool m_isActive = false;
++	bool m_crankedThisStart = false;
++	Timer m_sinceCranking;
++	Timer m_pulseTimer;
++};
+diff --git a/firmware/controllers/modules/cold_start_injector/cold_start_injector.mk b/firmware/controllers/modules/cold_start_injector/cold_start_injector.mk
+new file mode 100644
+index 0000000..d0580a5
+--- /dev/null
++++ b/firmware/controllers/modules/cold_start_injector/cold_start_injector.mk
+@@ -0,0 +1,3 @@
++# pro-style extra cold start injector
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/cold_start_injector
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/cold_start_injector/cold_start_injector.cpp
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index afd2342..d1f3f58 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -22,6 +22,7 @@ include $(PROJECT_DIR)/controllers/modules/rolling_launch/rolling_launch.mk
+ include $(PROJECT_DIR)/controllers/modules/alerts/alerts.mk
+ include $(PROJECT_DIR)/controllers/modules/tune_selector/tune_selector.mk
+ include $(PROJECT_DIR)/controllers/modules/hall_pullup/hall_pullup.mk
++include $(PROJECT_DIR)/controllers/modules/cold_start_injector/cold_start_injector.mk
+ include $(PROJECT_DIR)/controllers/modules/burst_knock/burst_knock.mk
+ include $(PROJECT_DIR)/controllers/modules/engine_state_machine/engine_state_machine.mk
+ include $(PROJECT_DIR)/controllers/modules/wot_enrichment/wot_enrichment.mk
+diff --git a/firmware/controllers/system/efi_gpio.cpp b/firmware/controllers/system/efi_gpio.cpp
+index cf55c99..21070e5 100644
+--- a/firmware/controllers/system/efi_gpio.cpp
++++ b/firmware/controllers/system/efi_gpio.cpp
+@@ -159,6 +159,7 @@ EnginePins::EnginePins() :
+ 		hallPullupCam2("Hall pull-up cam 2", CONFIG_PIN_OFFSETS(hallPullupCam2)),
+ 		hallPullupCam3("Hall pull-up cam 3", CONFIG_PIN_OFFSETS(hallPullupCam3)),
+ 		hallPullupCam4("Hall pull-up cam 4", CONFIG_PIN_OFFSETS(hallPullupCam4)),
++		coldStartInjector("Cold start injector", CONFIG_PIN_OFFSETS(coldStartInjector)),
+ #if EFI_HD_ACR
+ 		harleyAcr("Harley ACR", CONFIG_OFFSET(acrPin)),
+ 		harleyAcr2("Harley ACR 2", CONFIG_OFFSET(acrPin2)),
+diff --git a/firmware/controllers/system/efi_gpio.h b/firmware/controllers/system/efi_gpio.h
+index 876e488..5531aa8 100644
+--- a/firmware/controllers/system/efi_gpio.h
++++ b/firmware/controllers/system/efi_gpio.h
+@@ -100,6 +100,8 @@ public:
+ 	RegisteredOutputPin hallPullupCam2;
+ 	RegisteredOutputPin hallPullupCam3;
+ 	RegisteredOutputPin hallPullupCam4;
++	// pro-style extra cold start injector, see ColdStartInjector
++	RegisteredOutputPin coldStartInjector;
+ #if EFI_HD_ACR
+ 	RegisteredNamedOutputPin harleyAcr;
+ 	RegisteredOutputPin harleyAcr2;
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 1df2c40..509429f 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2029,6 +2029,13 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ 	uint16_t launchBoostTarget;Boost target during 2-step, closed loop.;"kPa", 1, 0, 0, 1000, 0
+ 	uint16_t antilagBoostTarget;Boost target during anti-lag, closed loop.;"kPa", 1, 0, 0, 1000, 0
+ 
++! pro-style cold start injector (extra injector, for example gasoline on an ethanol engine)
++	output_pin_e coldStartInjectorPin;Extra cold start injector. It pulses while cranking, and after start if set, when the coolant is below the limit.
++	pin_output_mode_e coldStartInjectorPinMode;
++	int8_t coldStartInjectorMaxClt;The cold start injector only works below this coolant temperature.;"C", 1, 0, -40, 100, 0
++	uint8_t autoscale coldStartInjectorAfterStart;Keep pulsing this long after the engine starts. 0 = only while cranking.;"s", 0.1, 0, 0, 25, 1
++	uint16_t coldStartInjectorPeriod;Time from the start of one pulse to the start of the next.;"ms", 1, 0, 20, 5000, 0
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+@@ -2183,6 +2190,9 @@ float[TMF_RATIO_SIZE x TMF_SIZE] tmfTable;;"", 1, 0, 0, 255, 2
+ uint16_t[CRANKING_ADVANCE_CURVE_SIZE] crankingAdvanceBins;Optional timing advance table for Cranking (see useSeparateAdvanceForCranking);"RPM", 1, 0, 0, 25000, 0
+ int16_t[CRANKING_ADVANCE_CURVE_SIZE] autoscale crankingAdvance;Optional timing advance table for Cranking (see useSeparateAdvanceForCranking);"deg", 0.01, 0, -20, 90, 2
+ int8_t[CLT_CRANKING_CURVE_SIZE] crankingAdvanceCltBins;pro-style cranking timing by coolant temperature;"C", 1, 0, -40, 120, 0
++#define COLD_START_INJ_CURVE_SIZE 8
++int8_t[COLD_START_INJ_CURVE_SIZE] coldStartInjectorCltBins;;"C", 1, 0, -40, 100, 0
++uint16_t[COLD_START_INJ_CURVE_SIZE] autoscale coldStartInjectorPulse;Cold start injector pulse length by coolant temperature.;"ms", 0.1, 0, 0, 5000, 1
+ int8_t[CLT_CRANKING_CURVE_SIZE] autoscale crankingAdvanceCltAdder;Added to the cranking timing, by coolant temperature. 0 = no change.;"deg", 0.5, 0, -20, 20, 1
+ uint8_t[CLT_CURVE_SIZE] autoscale iacCoastingRpmBins;RPM-based idle position for coasting;"RPM", @@RPM_AS_BYTE_SCALE@@, 0, 0, @@RPM_AS_BYTE_LIMIT@@, 0
+ uint8_t[CLT_CURVE_SIZE] autoscale iacCoasting;    RPM-based idle position for coasting;"%", 0.5, 0, 0, 100, 1
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index e9a56b1..a65a78c 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -135,6 +135,7 @@
+ 
+ 	menu = "&Cranking"
+ 		subMenu = crankingDialog,			"Cranking settings"
++		subMenu = coldStartInjectorDialog,	"Cold start injector"
+ 		subMenu = cltCrankingCurveDialog,			"Cranking Air Amount vs CLT", 1, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }
+ 		subMenu = postCrankingEnrichmentTbl,"After-start enrichment", { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }
+ 		subMenu = primingFuelPulsePanel,	"Priming pulse", { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index a2c81c1..0b67b4c 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -971,6 +971,14 @@ include_file controllers/actuators/boost_control.curves.ini
+ 		yBins		= crankingAdvanceCltAdder
+ 		gauge		= CLTGauge
+ 
++	curve = coldStartInjectorCurve, "Cold start injector pulse"
++		columnLabel = "Coolant", "ms"
++		xAxis		= -40, 100, 8
++		yAxis		= 0, 500, 6
++		xBins		= coldStartInjectorCltBins, coolantTemperature
++		yBins		= coldStartInjectorPulse
++		gauge		= CLTGauge
++
+ 	curve = fuelLevelCurve, "Fuel Level"
+ 		columnLabel = "Voltage", "%"
+ 		xAxis		= 0, 5, 6
+@@ -5328,6 +5336,17 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "Fixed Cranking Dwell",						ignitionDwellForCrankingMs
+ 		panel = crankingAdvanceCltCurve
+ 
++	dialog = coldStartInjectorSettings, "Cold start injector"
++		field = "Output",						coldStartInjectorPin
++		field = "Output mode",					coldStartInjectorPinMode
++		field = "Works below coolant",			coldStartInjectorMaxClt
++		field = "Keep pulsing after start",		coldStartInjectorAfterStart
++		field = "Pulse period",					coldStartInjectorPeriod
++
++	dialog = coldStartInjectorDialog, "Cold start injector", border
++		panel = coldStartInjectorSettings, West
++		panel = coldStartInjectorCurve, Center
++
+ 	dialog = primingFuelPulsePanel, "Priming fuel pulse"
+ 		topicHelp = "primingFuelPulsePanelHelp"
+ @@BOARD_PRIMING_PULSE_PANEL_FROM_FILE@@
+diff --git a/unit_tests/tests/controllers/test_cold_start_injector.cpp b/unit_tests/tests/controllers/test_cold_start_injector.cpp
+new file mode 100644
+index 0000000..e46b74a
+--- /dev/null
++++ b/unit_tests/tests/controllers/test_cold_start_injector.cpp
+@@ -0,0 +1,119 @@
++#include "pch.h"
++
++#include "cold_start_injector.h"
++
++// pro-style cold start injector: pulses while cranking (and after start if set)
++// when the coolant is below the limit, pulse length by coolant temperature.
++
++class ColdStartInjectorTest : public testing::Test {
++protected:
++	EngineTestHelper eth{engine_type_e::TEST_ENGINE};
++
++	ColdStartInjector& dut() {
++		return engine->module<ColdStartInjector>().unmock();
++	}
++
++	bool isOn() {
++		return enginePins.coldStartInjector.getLogicValue();
++	}
++
++	void SetUp() override {
++		engineConfiguration->cranking.rpm = 400;
++		engineConfiguration->coldStartInjectorMaxClt = 20;
++		engineConfiguration->coldStartInjectorAfterStart = 0;
++		engineConfiguration->coldStartInjectorPeriod = 500;
++		copyArray(config->coldStartInjectorCltBins, { -40, -20, 0, 20, 40, 60, 80, 100 });
++		copyArray(config->coldStartInjectorPulse, { 150, 120, 80, 40, 0, 0, 0, 0 });
++		Sensor::setMockValue(SensorType::Clt, 0);
++	}
++};
++
++TEST_F(ColdStartInjectorTest, OffWithEngineStopped) {
++	engine->rpmCalculator.setRpmValue(0);
++	dut().update();
++	EXPECT_FALSE(dut().isActive());
++	EXPECT_FALSE(isOn());
++}
++
++TEST_F(ColdStartInjectorTest, PulsesWhileCrankingCold) {
++	engine->rpmCalculator.setRpmValue(200);
++
++	// 80 ms on at 0 C, then off until the next pulse 500 ms later
++	dut().update();
++	EXPECT_TRUE(dut().isActive());
++	EXPECT_TRUE(isOn());
++	advanceTimeUs(70'000);
++	dut().update();
++	EXPECT_TRUE(isOn());
++	advanceTimeUs(20'000);
++	dut().update();
++	EXPECT_FALSE(isOn());
++	advanceTimeUs(400'000);
++	dut().update();
++	EXPECT_FALSE(isOn());
++	advanceTimeUs(20'000);
++	dut().update();
++	EXPECT_TRUE(isOn());
++}
++
++TEST_F(ColdStartInjectorTest, PulseLengthFollowsCoolant) {
++	engine->rpmCalculator.setRpmValue(200);
++	Sensor::setMockValue(SensorType::Clt, -20);
++	dut().update();
++	advanceTimeUs(110'000);
++	dut().update();
++	// 120 ms at -20 C
++	EXPECT_TRUE(isOn());
++	advanceTimeUs(20'000);
++	dut().update();
++	EXPECT_FALSE(isOn());
++}
++
++TEST_F(ColdStartInjectorTest, WarmEngineOrFailedSensorDoesNothing) {
++	engine->rpmCalculator.setRpmValue(200);
++
++	Sensor::setMockValue(SensorType::Clt, 25);
++	dut().update();
++	EXPECT_FALSE(dut().isActive());
++	EXPECT_FALSE(isOn());
++
++	Sensor::setInvalidMockValue(SensorType::Clt);
++	dut().update();
++	EXPECT_FALSE(dut().isActive());
++	EXPECT_FALSE(isOn());
++}
++
++TEST_F(ColdStartInjectorTest, StopsWhenEngineStartsUnlessAfterStartIsSet) {
++	engine->rpmCalculator.setRpmValue(200);
++	dut().update();
++	EXPECT_TRUE(isOn());
++
++	engine->rpmCalculator.setRpmValue(1000);
++	dut().update();
++	EXPECT_FALSE(dut().isActive());
++	EXPECT_FALSE(isOn());
++}
++
++TEST_F(ColdStartInjectorTest, KeepsPulsingAfterStart) {
++	engineConfiguration->coldStartInjectorAfterStart = 2; // seconds
++
++	engine->rpmCalculator.setRpmValue(200);
++	dut().update();
++	engine->rpmCalculator.setRpmValue(1000);
++	advanceTimeUs(1'000'000);
++	dut().update();
++	EXPECT_TRUE(dut().isActive());
++
++	advanceTimeUs(1'100'000);
++	dut().update();
++	EXPECT_FALSE(dut().isActive());
++	EXPECT_FALSE(isOn());
++}
++
++TEST_F(ColdStartInjectorTest, NoAfterStartWithoutCranking) {
++	engineConfiguration->coldStartInjectorAfterStart = 2;
++	// running without a crank seen by this module, for example after a stall recovery
++	engine->rpmCalculator.setRpmValue(1000);
++	dut().update();
++	EXPECT_FALSE(dut().isActive());
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index fffd3fa..93e6a6b 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -271,6 +271,7 @@ TESTS_SRC_CPP = \
+ 	tests/controllers/test_alert_manager.cpp \
+ 	tests/controllers/test_tune_selector.cpp \
+ 	tests/controllers/test_hall_pullup.cpp \
++	tests/controllers/test_cold_start_injector.cpp \
+ 	tests/ignition_injection/test_ignition_state.cpp \
+ 	tests/core/test_main_loop.cpp \
+ 	tests/test_trip_odometer.cpp \
+-- 
+2.43.0
+

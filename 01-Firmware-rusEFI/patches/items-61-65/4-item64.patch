@@ -1,0 +1,545 @@
+From d648e2f20fea725ffb124b46a50f3e1f99852e85 Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sun, 1 Nov 2026 15:06:19 +0000
+Subject: [PATCH] Water/methanol injection (WMI): tank level, fault alert,
+ timing and fuel while flowing
+
+Requested by Carlos (next firmware round, 01/11).
+- the WMI valve or pump is one of the 8 Generic PWM outputs (pin,
+  frequency, MAP x RPM duty table, or on/off); wmiGppwmChannel picks it
+- new module WaterMethanol:
+  - tank low switch (wmiLevelPin, with a delay for slosh): turns the WMI
+    output off so the pump does not run dry
+  - status: off / ready / flowing (duty above wmiActiveDuty) / tank low /
+    fault (WMI asked with the tank low)
+  - timing added (wmiTimingAdd) and fuel change (wmiFuelTrim) while WMI
+    flows, full value at 100 % duty, scaled by the duty
+- new alert sensor 'WMI fault' (gppwm channel 48) so an alert can cut
+  boost (safe mode) or warn; ve/afr blend axis label offset 48 -> 49
+- live data: WMI duty, WMI status
+- TunerStudio: Advanced > Water/methanol injection
+- 4 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ firmware/console/binary/output_channels.txt   |  3 +
+ .../actuators/gppwm/gppwm_channel.cpp         |  3 +-
+ .../actuators/gppwm_channel_reader.cpp        |  3 +
+ firmware/controllers/algo/engine.h            |  2 +
+ firmware/controllers/algo/fuel_math.cpp       |  3 +
+ .../algo/ignition/ignition_state.cpp          |  1 +
+ firmware/controllers/algo/rusefi_enums.h      |  2 +
+ firmware/controllers/modules/modules.mk       |  1 +
+ .../modules/water_methanol/water_methanol.cpp | 72 ++++++++++++++++
+ .../modules/water_methanol/water_methanol.h   | 58 +++++++++++++
+ .../modules/water_methanol/water_methanol.mk  |  3 +
+ firmware/integration/rusefi_config.txt        |  9 ++
+ firmware/tunerstudio/top_level_menu.ini       |  1 +
+ firmware/tunerstudio/tunerstudio.template.ini | 27 ++++--
+ unit_tests/tests/test_water_methanol.cpp      | 82 +++++++++++++++++++
+ unit_tests/tests/tests.mk                     |  1 +
+ 16 files changed, 262 insertions(+), 9 deletions(-)
+ create mode 100644 firmware/controllers/modules/water_methanol/water_methanol.cpp
+ create mode 100644 firmware/controllers/modules/water_methanol/water_methanol.h
+ create mode 100644 firmware/controllers/modules/water_methanol/water_methanol.mk
+ create mode 100644 unit_tests/tests/test_water_methanol.cpp
+
+diff --git a/firmware/console/binary/output_channels.txt b/firmware/console/binary/output_channels.txt
+index e9726623224..f47ff0d4c09 100644
+--- a/firmware/console/binary/output_channels.txt
++++ b/firmware/console/binary/output_channels.txt
+@@ -523,4 +523,7 @@ float mapFast
+ 	uint16_t shiftLightTarget;Shift light RPM (this gear);"RPM", 1, 0, 0, 18000, 0
+ 	uint8_t shiftLightProgress;Shift light bar;"%", 1, 0, 0, 100, 0
+ 	uint8_t shiftLightOn;Shift light on;"", 1, 0, 0, 1, 0
++	uint8_t wmiDuty;WMI duty;"%", 1, 0, 0, 100, 0
++! 0 off, 1 ready, 2 flowing, 3 tank low, 4 fault (asked with the tank low)
++	uint8_t wmiStatus;WMI status;"", 1, 0, 0, 4, 0
+ end_struct
+diff --git a/firmware/controllers/actuators/gppwm/gppwm_channel.cpp b/firmware/controllers/actuators/gppwm/gppwm_channel.cpp
+index 9d760a16ea2..2760e201b43 100644
+--- a/firmware/controllers/actuators/gppwm/gppwm_channel.cpp
++++ b/firmware/controllers/actuators/gppwm/gppwm_channel.cpp
+@@ -84,7 +84,8 @@ GppwmResult GppwmChannel::update(size_t index) {
+ 	}
+ 
+ 	auto output = getOutput(index);
+-	output.Result = setOutput(output.Result);
++	// water/methanol: output kept off while the tank is low
++	output.Result = setOutput(engine->module<WaterMethanol>()->filterDuty(index, output.Result));
+ 
+ 	return output;
+ }
+diff --git a/firmware/controllers/actuators/gppwm_channel_reader.cpp b/firmware/controllers/actuators/gppwm_channel_reader.cpp
+index 1d206c16fae..be87065e409 100644
+--- a/firmware/controllers/actuators/gppwm_channel_reader.cpp
++++ b/firmware/controllers/actuators/gppwm_channel_reader.cpp
+@@ -6,6 +6,7 @@
+ #include "throttle_model.h"
+ #include "gppwm_channel_reader.h"
+ #include "egt_rise_monitor.h"
++#include "water_methanol.h"
+ 
+ // fuel pressure above manifold pressure, from the fuel pressure sensor whatever the injector compensation mode
+ static expected<float> readFuelPressureDiff() {
+@@ -167,6 +168,8 @@ expected<float> readGppwmChannel(gppwm_channel_e channel) {
+ 		return readMapOverEthanolLimit();
+ 	case GPPWM_EgtRiseRate:
+ 		return engine->module<EgtRiseMonitor>()->getMaxRiseRate();
++	case GPPWM_WmiFault:
++		return engine->module<WaterMethanol>()->isFault() ? 1.0f : 0.0f;
+ 	case GPPWM_ThrottleRatio:
+ #if EFI_ENGINE_CONTROL
+ 		return getThrottlePressureRatio(Sensor::getOrZero(SensorType::Map));
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index b59667f13b6..550f80e445e 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -40,6 +40,7 @@
+ #include "egt_rise_monitor.h"
+ #include "downshift_blip.h"
+ #include "shift_light.h"
++#include "water_methanol.h"
+ #include "ecu_passwords.h"
+ #include "hall_pullup.h"
+ #include "cold_start_injector.h"
+@@ -218,6 +219,7 @@ public:
+         EgtRiseMonitor,
+         DownshiftBlip,
+         ShiftLight,
++        WaterMethanol,
+         HallPullupController,
+         ColdStartInjector,
+         GearShiftDetector,
+diff --git a/firmware/controllers/algo/fuel_math.cpp b/firmware/controllers/algo/fuel_math.cpp
+index 2d22b8e4b6a..590abfcf241 100644
+--- a/firmware/controllers/algo/fuel_math.cpp
++++ b/firmware/controllers/algo/fuel_math.cpp
+@@ -169,6 +169,9 @@ float getRunningFuel(float baseFuel) {
+ 	engine->fuelComputer.running.loadFuelCoefficient = getLoadFuelCoefficient();
+ 	correction *= engine->fuelComputer.running.loadFuelCoefficient;
+ 
++	// water/methanol flowing
++	correction *= engine->module<WaterMethanol>()->getFuelCoefficient();
++
+ 	correction *= getLimpManager()->getLimitingFuelCorrection();
+ 
+ 	float runningFuel = baseFuel * correction;
+diff --git a/firmware/controllers/algo/ignition/ignition_state.cpp b/firmware/controllers/algo/ignition/ignition_state.cpp
+index e2cf2ce7663..77d71b6dee0 100644
+--- a/firmware/controllers/algo/ignition/ignition_state.cpp
++++ b/firmware/controllers/algo/ignition/ignition_state.cpp
+@@ -303,6 +303,7 @@ angle_t getAdvanceCorrections(float engineLoad) {
+ #endif // EFI_IDLE_CONTROL
+ 		- engine->ignitionState.dfcoTimingRetard
+ 		- engine->module<BurstKnock>().unmock().getTimingRetard()
++		+ engine->module<WaterMethanol>()->getTimingAdd()
+ #if EFI_LAUNCH_CONTROL
+ 		- engine->module<RollingLaunchControl>().unmock().getTimingRetard()
+ #endif
+diff --git a/firmware/controllers/algo/rusefi_enums.h b/firmware/controllers/algo/rusefi_enums.h
+index d0527b5be64..61a4ee8e3ec 100644
+--- a/firmware/controllers/algo/rusefi_enums.h
++++ b/firmware/controllers/algo/rusefi_enums.h
+@@ -771,6 +771,8 @@ typedef enum __attribute__ ((__packed__)) {
+ 	GPPWM_MapOverEthanolLimit = 46,
+ 	// fastest rising EGT, C per second (pro-style fast EGT rise alert)
+ 	GPPWM_EgtRiseRate = 47,
++	// water/methanol asked but the tank is low (1) or not (0)
++	GPPWM_WmiFault = 48,
+ 	// remember to manually sync 'pwmAxisLabels' in tunerstudio.template.ini
+ 	// todo: rename 'pwmAxisLabels' and maybe even gppwm_channel_e since we now use wider than just 'gppwm'?
+ } gppwm_channel_e;
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index ff8d21e6c9b..acbd4366e7d 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -26,6 +26,7 @@ include $(PROJECT_DIR)/controllers/modules/cylinder_lambda_trim/cylinder_lambda_
+ include $(PROJECT_DIR)/controllers/modules/egt_rise/egt_rise.mk
+ include $(PROJECT_DIR)/controllers/modules/downshift_blip/downshift_blip.mk
+ include $(PROJECT_DIR)/controllers/modules/shift_light/shift_light.mk
++include $(PROJECT_DIR)/controllers/modules/water_methanol/water_methanol.mk
+ include $(PROJECT_DIR)/controllers/modules/hall_pullup/hall_pullup.mk
+ include $(PROJECT_DIR)/controllers/modules/cold_start_injector/cold_start_injector.mk
+ include $(PROJECT_DIR)/controllers/modules/gear_shift/gear_shift.mk
+diff --git a/firmware/controllers/modules/water_methanol/water_methanol.cpp b/firmware/controllers/modules/water_methanol/water_methanol.cpp
+new file mode 100644
+index 00000000000..94b19c90e82
+--- /dev/null
++++ b/firmware/controllers/modules/water_methanol/water_methanol.cpp
+@@ -0,0 +1,72 @@
++#include "pch.h"
++
++#include "water_methanol.h"
++
++bool WaterMethanol::isWmiOutput(size_t gppwmIndex) const {
++	int channel = engineConfiguration->wmiGppwmChannel;
++	return channel > 0 && (size_t)(channel - 1) == gppwmIndex;
++}
++
++void WaterMethanol::updateLevel(bool lowSwitch, efitick_t nowNt) {
++	if (lowSwitch != m_lastSwitch) {
++		m_lastSwitch = lowSwitch;
++		m_switchTimer.reset(nowNt);
++	}
++	// tank slosh: the switch has to stay put for the delay before the state changes
++	if (m_tankLow != lowSwitch && m_switchTimer.getElapsedSeconds(nowNt) >= engineConfiguration->wmiLevelDelay) {
++		m_tankLow = lowSwitch;
++	}
++}
++
++float WaterMethanol::filterDuty(size_t gppwmIndex, float requestedDuty) {
++	if (!isWmiOutput(gppwmIndex)) {
++		return requestedDuty;
++	}
++	m_requestedDuty = requestedDuty;
++	return m_tankLow ? 0 : requestedDuty;
++}
++
++float WaterMethanol::getDuty() const {
++	if (engineConfiguration->wmiGppwmChannel == 0 || m_tankLow) {
++		return 0;
++	}
++	return m_requestedDuty;
++}
++
++WmiStatus WaterMethanol::getStatus() const {
++	if (engineConfiguration->wmiGppwmChannel == 0) {
++		return WmiStatus::Off;
++	}
++	bool asked = m_requestedDuty > engineConfiguration->wmiActiveDuty;
++	if (m_tankLow) {
++		return asked ? WmiStatus::Fault : WmiStatus::TankLow;
++	}
++	return asked ? WmiStatus::Flowing : WmiStatus::Ready;
++}
++
++angle_t WaterMethanol::getTimingAdd() const {
++	if (getStatus() != WmiStatus::Flowing) {
++		return 0;
++	}
++	return engineConfiguration->wmiTimingAdd * clampF(0, getDuty(), 100) / 100;
++}
++
++float WaterMethanol::getFuelCoefficient() const {
++	if (getStatus() != WmiStatus::Flowing) {
++		return 1;
++	}
++	return 1 + engineConfiguration->wmiFuelTrim * clampF(0, getDuty(), 100) / 100 / 100;
++}
++
++void WaterMethanol::onSlowCallback() {
++#if EFI_GPIO_HARDWARE
++	bool low = isBrainPinValid(engineConfiguration->wmiLevelPin)
++		&& efiReadPin(engineConfiguration->wmiLevelPin, engineConfiguration->wmiLevelPinMode);
++#else
++	bool low = false;
++#endif
++	updateLevel(low, getTimeNowNt());
++
++	engine->outputChannels.wmiDuty = getDuty();
++	engine->outputChannels.wmiStatus = (uint8_t)getStatus();
++}
+diff --git a/firmware/controllers/modules/water_methanol/water_methanol.h b/firmware/controllers/modules/water_methanol/water_methanol.h
+new file mode 100644
+index 00000000000..94c0805f355
+--- /dev/null
++++ b/firmware/controllers/modules/water_methanol/water_methanol.h
+@@ -0,0 +1,58 @@
++/*
++ * @file water_methanol.h
++ *
++ * Water/methanol injection (WMI). The nozzle valve or the pump is one of the generic PWM
++ * outputs (duty table by MAP x RPM, also on/off); this module adds what a WMI kit needs:
++ * - tank level switch: with the tank low the WMI output is turned off (the pump does not
++ *   run dry) and 'WMI fault' turns on while the table asks for WMI, so an alert can cut
++ *   boost (safe mode) or warn
++ * - timing added and fuel trim while WMI flows, scaled by the duty (full value at 100 %)
++ */
++
++#pragma once
++
++#include <rusefi/timer.h>
++
++enum class WmiStatus : uint8_t {
++	Off = 0,		// no generic PWM output chosen
++	Ready = 1,		// table asks for no WMI now
++	Flowing = 2,
++	TankLow = 3,	// tank low, WMI not asked now
++	Fault = 4,		// WMI asked but the tank is low: output kept off
++};
++
++class WaterMethanol : public EngineModule {
++public:
++	using interface_t = WaterMethanol;
++
++	void onSlowCallback() override;
++
++	// level switch reading (true = tank low), debounced with wmiLevelDelay
++	void updateLevel(bool lowSwitch, efitick_t nowNt);
++
++	// called by the generic PWM output: duty asked by its table; returns the duty to use
++	float filterDuty(size_t gppwmIndex, float requestedDuty);
++
++	bool isWmiOutput(size_t gppwmIndex) const;
++	bool isTankLow() const {
++		return m_tankLow;
++	}
++	float getRequestedDuty() const {
++		return m_requestedDuty;
++	}
++	// actual duty, 0 while blocked
++	float getDuty() const;
++	WmiStatus getStatus() const;
++	bool isFault() const {
++		return getStatus() == WmiStatus::Fault;
++	}
++
++	angle_t getTimingAdd() const;
++	float getFuelCoefficient() const;
++
++private:
++	bool m_tankLow = false;
++	bool m_lastSwitch = false;
++	Timer m_switchTimer;
++	float m_requestedDuty = 0;
++};
+diff --git a/firmware/controllers/modules/water_methanol/water_methanol.mk b/firmware/controllers/modules/water_methanol/water_methanol.mk
+new file mode 100644
+index 00000000000..1537b98de22
+--- /dev/null
++++ b/firmware/controllers/modules/water_methanol/water_methanol.mk
+@@ -0,0 +1,3 @@
++# Water/methanol injection: tank level, fault and timing/fuel while WMI flows
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/water_methanol
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/water_methanol/water_methanol.cpp
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 35efe62bb7d..c97b54e6797 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2091,6 +2091,15 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ 	pin_output_mode_e shiftLightPinMode;
+ 	uint8_t shiftLightBlinkHz;Lamp blink rate at the shift RPM. 0 = steady.;"Hz", 1, 0, 0, 20, 0
+ 
++! Water/methanol injection, see WaterMethanol
++	uint8_t wmiGppwmChannel;Generic PWM output (1 to 8) that drives the WMI valve or pump. Its table (MAP x RPM) gives the WMI duty. 0 = WMI off.;"", 1, 0, 0, 8, 0
++	uint8_t wmiActiveDuty;Above this duty the WMI counts as flowing (timing and fuel below apply and 'WMI fault' can trip).;"%", 1, 0, 0, 100, 0
++	switch_input_pin_e wmiLevelPin;Tank level switch - active = tank low. Tank low turns the WMI output off and 'WMI fault' on while WMI is asked (use an alert on 'WMI fault' to cut boost).
++	pin_input_mode_e wmiLevelPinMode;
++	uint8_t autoscale wmiLevelDelay;The level switch must stay put this long (tank slosh).;"s", 0.1, 0, 0, 25, 1
++	int8_t autoscale wmiTimingAdd;Timing added while WMI flows - full value at 100 % duty - scaled by the duty.;"deg", 0.1, 0, -12, 12, 1
++	int8_t wmiFuelTrim;Fuel change while WMI flows - full value at 100 % duty - scaled by the duty (methanol is fuel: often negative).;"%", 1, 0, -50, 50, 0
++
+ ! pro-style custom firing order, used when firingOrder is FO_CUSTOM
+ 	uint8_t[MAX_CYLINDER_COUNT iterate] customFiringOrder;Cylinder number fired at this position of the custom firing order (only the first 'Number of cylinders' positions are used). Example K20: 1, 3, 4, 2. Each cylinder must appear once, or 1, 2, 3... is used and a warning is shown.;"", 1, 0, 1, @@MAX_CYLINDER_COUNT@@, 0
+ 
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index 49a92e3467c..b691444ce2e 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -219,6 +219,7 @@
+ 
+ 		subMenu = std_separator
+ 		subMenu = shiftLightSettings, "Shift light"
++		subMenu = wmiSettings, "Water/methanol injection"
+ 		groupMenu = "Alerts"
+ 			groupChildMenu = alertSettings, "Alert output and safe mode"
+ 			groupChildMenu = alert1, "Alert 1"
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index ccbdeab3463..bc31e779b17 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -116,7 +116,7 @@ enable2ndByteCanID = false
+ #define pin_mode_e_enum="default", "INVALID", "INVALID", "INVALID", "opendrain", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "PULLUP", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "PULLDOWN"
+ #define pin_input_mode_e_enum="DEFAULT", "PULLUP", "PULLDOWN", "INVALID", "INVERTED DEFAULT", "INVERTED PULLUP", "INVERTED PULLDOWN", "INVALID
+ #define pin_output_mode_e_enum="default", "default inverted", "open collector", "open collector inverted"
+-#define gppwm_channel_e_enum="Zero", "TPS", "MAP", "CLT", "IAT", "Fuel Load", "Ignition Load", "Aux Temp 1", "Aux Temp 2", "Accel Pedal", "Battery Voltage", "VVT 1 In Actual", "VVT 1 Ex Actual", "VVT 2 In Actual", "VVT 2 Ex Actual", "Ethanol (Flex) %", "Aux Linear 1", "Aux Linear 2", "GPPWM Output 1", "GPPWM Output 2", "GPPWM Output 3", "GPPWM Output 4", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure", "EGT 1", "EGT 2", "Aux Linear 3", "Aux Linear 4", "Vehicle speed", "Oil pressure", "Oil temp", "Fuel Pressure", "Throttle Ratio", "EGT 3", "EGT 4", "EGT 5", "EGT 6", "EGT 7", "EGT 8", "Fuel Pressure Diff", "EGT max", "Closed loop trim", "Turbo speed", "MAP over ethanol limit", "EGT rise rate"
++#define gppwm_channel_e_enum="Zero", "TPS", "MAP", "CLT", "IAT", "Fuel Load", "Ignition Load", "Aux Temp 1", "Aux Temp 2", "Accel Pedal", "Battery Voltage", "VVT 1 In Actual", "VVT 1 Ex Actual", "VVT 2 In Actual", "VVT 2 Ex Actual", "Ethanol (Flex) %", "Aux Linear 1", "Aux Linear 2", "GPPWM Output 1", "GPPWM Output 2", "GPPWM Output 3", "GPPWM Output 4", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure", "EGT 1", "EGT 2", "Aux Linear 3", "Aux Linear 4", "Vehicle speed", "Oil pressure", "Oil temp", "Fuel Pressure", "Throttle Ratio", "EGT 3", "EGT 4", "EGT 5", "EGT 6", "EGT 7", "EGT 8", "Fuel Pressure Diff", "EGT max", "Closed loop trim", "Turbo speed", "MAP over ethanol limit", "EGT rise rate", "WMI fault"
+ #define spi_device_e_enum="Off", "SPI1", "SPI2", "SPI3", "SPI4", "SPI5", "SPI6"
+ 
+ ; Remove next line when Java toolset gets adjusted to load those from json config into VariablesRegistry
+@@ -396,7 +396,7 @@ include_file @@TUNING_SECTION_FILE@@
+ 	targetMixtureFinalTargetLabels = bits, U08, [0:1], "Final target AFR (fuel)", "Final target lambda"
+ 	; [tag:ve_blend_default_axis] Display-only entries 36..39 follow veLoadSrc; 36..41 follow afrLoadSrc.
+ 	; The first 36 entries retain their GPPWM channel indices.
+-	pwmAxisLabels = bits, U08, [0:5], "Zero", "TPS %", "MAP kPa", "CLT C", "IAT C", "Fuel Load", "Ignition Load", "Aux Temp 1 C", "Aux Temp 2 C", "Accel Pedal %", "Battery Voltage Volts", "VVT 1 I Deg", "VVT 1 E Deg", "VVT 2 I Deg", "VVT 2 E Deg", "Ethanol (Flex) %", "Aux Linear 1 *", "Aux Linear 2 *", "GPPWM Output 1 %", "GPPWM Output 2 %", "GPPWM Output 3 %", "GPPWM Output 4 %", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure kPa", "EGT 1 C", "EGT 2 C", "Aux Linear 3", "Aux Linear 4", "Vehicle Speed KPH", "Oil pressure kPa", "Oil temp C", "Fuel Pressure", "Throttle Pressure Ratio", "EGT 3 C", "EGT 4 C", "EGT 5 C", "EGT 6 C", "EGT 7 C", "EGT 8 C", "Fuel Pressure Diff kPa", "EGT max C", "Closed loop trim %", "Turbo speed RPM", "MAP over E% limit kPa", "EGT rise C/s", "MAP kPa", "TPS %", "Air Charge %", "Lua load", "Accel Pedal %", "Cylinder Filling %"
++	pwmAxisLabels = bits, U08, [0:5], "Zero", "TPS %", "MAP kPa", "CLT C", "IAT C", "Fuel Load", "Ignition Load", "Aux Temp 1 C", "Aux Temp 2 C", "Accel Pedal %", "Battery Voltage Volts", "VVT 1 I Deg", "VVT 1 E Deg", "VVT 2 I Deg", "VVT 2 E Deg", "Ethanol (Flex) %", "Aux Linear 1 *", "Aux Linear 2 *", "GPPWM Output 1 %", "GPPWM Output 2 %", "GPPWM Output 3 %", "GPPWM Output 4 %", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure kPa", "EGT 1 C", "EGT 2 C", "Aux Linear 3", "Aux Linear 4", "Vehicle Speed KPH", "Oil pressure kPa", "Oil temp C", "Fuel Pressure", "Throttle Pressure Ratio", "EGT 3 C", "EGT 4 C", "EGT 5 C", "EGT 6 C", "EGT 7 C", "EGT 8 C", "Fuel Pressure Diff kPa", "EGT max C", "Closed loop trim %", "Turbo speed RPM", "MAP over E% limit kPa", "EGT rise C/s", "WMI fault", "MAP kPa", "TPS %", "Air Charge %", "Lua load", "Accel Pedal %", "Cylinder Filling %"
+ 	veAxisLabels = bits, U08, [0:1], "MAP", "TPS", "Air Charge", "Lua"
+ 	targetAfrAxisLabels = bits, U08, [0:2], "MAP", "TPS", "Air Charge", "Lua", "Acc Pedal", "Cyl Filling"
+ 	; [tag:ignition_blend_load_axis] Native-unit labels follow ignLoadSrc without changing GPPWM indices.
+@@ -1600,7 +1600,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend1Table, veBlend1Map, @@VE_BLEND1_TABLE_NAME@@, 1
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends1_yAxisOverride ? veBlends1_yAxisOverride : 48 + veLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends1_yAxisOverride ? veBlends1_yAxisOverride : 49 + veLoadSrc)}
+ 		xBins		= veBlends1_rpmBins, RPMValue
+ 		yBins		= veBlends1_loadBins, veBlendYAxis1
+ 		zBins		= veBlends1_table
+@@ -1608,7 +1608,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend2Table, veBlend2Map, "VE blend 2", 1@@if_ts_show_veBlends2
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends2
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends2_yAxisOverride ? veBlends2_yAxisOverride : 48 + veLoadSrc)}@@if_ts_show_veBlends2
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends2_yAxisOverride ? veBlends2_yAxisOverride : 49 + veLoadSrc)}@@if_ts_show_veBlends2
+ 		xBins		= veBlends2_rpmBins, RPMValue@@if_ts_show_veBlends2
+ 		yBins		= veBlends2_loadBins, veBlendYAxis2@@if_ts_show_veBlends2
+ 		zBins		= veBlends2_table@@if_ts_show_veBlends2
+@@ -1616,7 +1616,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend3Table, veBlend3Map, "VE blend 3", 1@@if_ts_show_veBlends3
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends3
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends3_yAxisOverride ? veBlends3_yAxisOverride : 48 + veLoadSrc)}@@if_ts_show_veBlends3
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends3_yAxisOverride ? veBlends3_yAxisOverride : 49 + veLoadSrc)}@@if_ts_show_veBlends3
+ 		xBins		= veBlends3_rpmBins, RPMValue@@if_ts_show_veBlends3
+ 		yBins		= veBlends3_loadBins, veBlendYAxis3@@if_ts_show_veBlends3
+ 		zBins		= veBlends3_table@@if_ts_show_veBlends3
+@@ -1624,7 +1624,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend4Table, veBlend4Map, "VE blend 4", 1@@if_ts_show_veBlends4
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends4
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends4_yAxisOverride ? veBlends4_yAxisOverride : 48 + veLoadSrc)}@@if_ts_show_veBlends4
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends4_yAxisOverride ? veBlends4_yAxisOverride : 49 + veLoadSrc)}@@if_ts_show_veBlends4
+ 		xBins		= veBlends4_rpmBins, RPMValue@@if_ts_show_veBlends4
+ 		yBins		= veBlends4_loadBins, veBlendYAxis4@@if_ts_show_veBlends4
+ 		zBins		= veBlends4_table@@if_ts_show_veBlends4
+@@ -1667,7 +1667,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 	table = targetAfrBlend1Table, targetAfrBlend1Map, "Target Mixture Adder 1", 1
+ 		topicHelp = "targetMixtureAdderHelp"
+ 		; [tag:ve_blend_default_axis] Zero inherits the main target-table load source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends1_yAxisOverride ? targetAfrBlends1_yAxisOverride : 48 + afrLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends1_yAxisOverride ? targetAfrBlends1_yAxisOverride : 49 + afrLoadSrc)}
+ 		xBins = targetAfrBlends1_rpmBins, RPMValue
+ 		yBins = targetAfrBlends1_loadBins, targetAfrBlendYAxis1
+ 		; [tag:target_adder_display] Both unit modes share this editor and the native saved table.
+@@ -1678,7 +1678,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 	table = targetAfrBlend2Table, targetAfrBlend2Map, "Target Mixture Adder 2", 1
+ 		topicHelp = "targetMixtureAdderHelp"
+ 		; [tag:ve_blend_default_axis] Zero inherits the main target-table load source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends2_yAxisOverride ? targetAfrBlends2_yAxisOverride : 48 + afrLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends2_yAxisOverride ? targetAfrBlends2_yAxisOverride : 49 + afrLoadSrc)}
+ 		xBins = targetAfrBlends2_rpmBins, RPMValue
+ 		yBins = targetAfrBlends2_loadBins, targetAfrBlendYAxis2
+ 		; [tag:target_adder_display] Both unit modes share this editor and the native saved table.
+@@ -5814,6 +5814,17 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "Lamp output mode",					shiftLightPinMode, { shiftLightPin != 0 }
+ 		field = "Lamp blink (0 = steady)",			shiftLightBlinkHz, { shiftLightPin != 0 }
+ 
++	dialog = wmiSettings, "Water/methanol injection"
++		field = "Set one Generic PWM output for the WMI valve or pump (pin, frequency, MAP x RPM duty table), then pick it here."
++		field = "WMI output (Generic PWM 1-8, 0 = off)",	wmiGppwmChannel
++		field = "Flowing above duty",				wmiActiveDuty, { wmiGppwmChannel != 0 }
++		field = "Tank low switch",					wmiLevelPin, { wmiGppwmChannel != 0 }
++		field = "Tank low switch mode",				wmiLevelPinMode, { wmiGppwmChannel != 0 && wmiLevelPin != 0 }
++		field = "Tank low switch delay",			wmiLevelDelay, { wmiGppwmChannel != 0 && wmiLevelPin != 0 }
++		field = "Timing added at 100 % duty",		wmiTimingAdd, { wmiGppwmChannel != 0 }
++		field = "Fuel change at 100 % duty",		wmiFuelTrim, { wmiGppwmChannel != 0 }
++		field = "#Alert sensor 'WMI fault' = 1 when WMI is asked and the tank is low."
++
+ 	dialog = etbSpeedLimitSettings, "Throttle speed by coolant temperature"
+ 		field = "Limit throttle speed",					etbSpeedLimitEnabled
+ 		field = "0 %/s in a point means no limit there."
+diff --git a/unit_tests/tests/test_water_methanol.cpp b/unit_tests/tests/test_water_methanol.cpp
+new file mode 100644
+index 00000000000..c2c700f7c55
+--- /dev/null
++++ b/unit_tests/tests/test_water_methanol.cpp
+@@ -0,0 +1,82 @@
++#include "pch.h"
++
++#include "water_methanol.h"
++#include "gppwm_channel_reader.h"
++
++// Water/methanol injection: tank level, fault, timing and fuel while flowing
++
++static void setupWmi() {
++	engineConfiguration->wmiGppwmChannel = 2; // Generic PWM 2
++	engineConfiguration->wmiActiveDuty = 10;
++	engineConfiguration->wmiLevelDelay = 1;
++	engineConfiguration->wmiTimingAdd = 4;
++	engineConfiguration->wmiFuelTrim = -10;
++}
++
++TEST(WaterMethanol, offByDefault) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	WaterMethanol wmi;
++	EXPECT_EQ(60, wmi.filterDuty(1, 60));
++	EXPECT_EQ(WmiStatus::Off, wmi.getStatus());
++	EXPECT_EQ(0, wmi.getTimingAdd());
++	EXPECT_EQ(1, wmi.getFuelCoefficient());
++}
++
++TEST(WaterMethanol, flowingAddsTimingAndFuelByDuty) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupWmi();
++	WaterMethanol wmi;
++
++	// other outputs pass untouched
++	EXPECT_EQ(30, wmi.filterDuty(0, 30));
++	EXPECT_EQ(WmiStatus::Ready, wmi.getStatus());
++
++	EXPECT_EQ(50, wmi.filterDuty(1, 50));
++	EXPECT_EQ(WmiStatus::Flowing, wmi.getStatus());
++	EXPECT_NEAR(2, wmi.getTimingAdd(), 1e-4);
++	EXPECT_NEAR(0.95, wmi.getFuelCoefficient(), 1e-4);
++
++	// below the flowing duty: nothing added
++	wmi.filterDuty(1, 5);
++	EXPECT_EQ(WmiStatus::Ready, wmi.getStatus());
++	EXPECT_EQ(0, wmi.getTimingAdd());
++}
++
++TEST(WaterMethanol, tankLowStopsOutputAfterDelayAndFaults) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupWmi();
++	WaterMethanol wmi;
++
++	wmi.updateLevel(false, getTimeNowNt());
++	wmi.updateLevel(true, getTimeNowNt());
++	advanceTimeUs(500'000);
++	wmi.updateLevel(true, getTimeNowNt());
++	EXPECT_FALSE(wmi.isTankLow());
++	EXPECT_EQ(50, wmi.filterDuty(1, 50));
++
++	advanceTimeUs(600'000);
++	wmi.updateLevel(true, getTimeNowNt());
++	EXPECT_TRUE(wmi.isTankLow());
++	EXPECT_EQ(0, wmi.filterDuty(1, 50));
++	EXPECT_EQ(WmiStatus::Fault, wmi.getStatus());
++	EXPECT_EQ(0, wmi.getTimingAdd());
++	EXPECT_EQ(1, wmi.getFuelCoefficient());
++
++	// not asked: tank low only, no fault
++	wmi.filterDuty(1, 0);
++	EXPECT_EQ(WmiStatus::TankLow, wmi.getStatus());
++	EXPECT_FALSE(wmi.isFault());
++}
++
++TEST(WaterMethanol, faultAlertChannel) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupWmi();
++	auto& wmi = engine->module<WaterMethanol>().unmock();
++	EXPECT_EQ(0, readGppwmChannel(GPPWM_WmiFault).value_or(-1));
++
++	wmi.updateLevel(true, getTimeNowNt());
++	advanceTimeUs(1'100'000);
++	wmi.updateLevel(true, getTimeNowNt());
++	wmi.filterDuty(1, 80);
++	EXPECT_EQ(1, readGppwmChannel(GPPWM_WmiFault).value_or(-1));
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index d5c4a70106b..be47024b97a 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -285,6 +285,7 @@ TESTS_SRC_CPP = \
+ 	tests/test_oil_restart_lock.cpp \
+ 	tests/test_downshift_blip.cpp \
+ 	tests/test_shift_light.cpp \
++	tests/test_water_methanol.cpp \
+ 	tests/test_custom_firing_order.cpp \
+ 	tests/controllers/modules/map_averaging/test_map_averaging.cpp \
+ 	tests/util/test_utils.cpp \
+-- 
+2.43.0
+

@@ -1,0 +1,290 @@
+From 3bebfe84ebac9d69bd5fb09ac5b908aaae179ce2 Mon Sep 17 00:00:00 2001
+From: Carlos Ciconato <354919267+CarlosCiconato@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 11:32:42 +0000
+Subject: [PATCH] LTFT on the Injection time (ms) table
+
+In Injection time (ms) mode the long term trims learn and apply on the ms
+table axes (RPM x MAP or TPS), and Apply writes into the ms table,
+scaling only the pulse above the reference deadtime. TunerStudio shows
+the trims on the ms table axes in that mode.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ firmware/controllers/long_term_fuel_trim.cpp  |  48 ++++++--
+ firmware/tunerstudio/top_level_menu.ini       |   6 +-
+ firmware/tunerstudio/tunerstudio.template.ini |  17 +++
+ .../controllers/test_ltft_injection_time.cpp  | 109 ++++++++++++++++++
+ unit_tests/tests/tests.mk                     |   1 +
+ 5 files changed, 172 insertions(+), 9 deletions(-)
+ create mode 100644 unit_tests/tests/controllers/test_ltft_injection_time.cpp
+
+diff --git a/firmware/controllers/long_term_fuel_trim.cpp b/firmware/controllers/long_term_fuel_trim.cpp
+index 49de586..f3ab189 100644
+--- a/firmware/controllers/long_term_fuel_trim.cpp
++++ b/firmware/controllers/long_term_fuel_trim.cpp
+@@ -12,6 +12,7 @@
+ #include "storage.h"
+ 
+ #include "long_term_fuel_trim.h"
++#include "fuel_math.h"
+ 
+ #include "board_overrides.h"
+ 
+@@ -28,6 +29,26 @@ static LtftState ltftState;
+ // LTFT to VE table custom apply algo
+ std::optional<setup_custom_board_overrides_type> custom_board_LtftTrimToVeApply;
+ 
++// The trims share one grid with the main fuel table: VE, or the Injection time (ms) table
++static_assert(INJ_TIME_LOAD_COUNT == VE_LOAD_COUNT && INJ_TIME_RPM_COUNT == VE_RPM_COUNT,
++	"LTFT trims grid must match the Injection time (ms) table");
++
++static bool isInjectionTimeFueling() {
++	return engineConfiguration->fuelAlgorithm == engine_load_mode_e::LM_INJ_TIME;
++}
++
++// In Injection time (ms) mode the trims follow the ms table axes and its own load (MAP or TPS)
++static float getTrimsLoad(float fuelLoad) {
++	return isInjectionTimeFueling() ? getInjectionTimeTableLoad() : fuelLoad;
++}
++
++static float interpolateTrims(const float (&trims)[VE_LOAD_COUNT][VE_RPM_COUNT], float load, float rpm) {
++	if (isInjectionTimeFueling()) {
++		return interpolate3d(trims, config->injTimeLoadBins, load, config->injTimeRpmBins, rpm);
++	}
++	return interpolate3d(trims, config->veLoadBins, load, config->veRpmBins, rpm);
++}
++
+ bool LtftState::save() {
+ #if EFI_PROD_CODE
+ 	StorageStatus status = storageWrite(EFI_LTFT_RECORD_ID, (const uint8_t *)trims, sizeof(trims));
+@@ -72,6 +93,10 @@ void LtftState::applyToVe() {
+ 		return;
+ 	}
+ 
++	// The ms table pulse includes the deadtime: only the effective part is scaled,
++	// the same way the trims are applied at runtime
++	floatms_t deadtime = isInjectionTimeFueling() ? getInjectionTimeReferenceDeadtime() : 0;
++
+ 	for (size_t loadIndex = 0; loadIndex < VE_LOAD_COUNT; loadIndex++) {
+ 		for (size_t rpmIndex = 0; rpmIndex < VE_RPM_COUNT; rpmIndex++) {
+ 			float k = 0;
+@@ -82,6 +107,14 @@ void LtftState::applyToVe() {
+ 			}
+ 			k = k / FT_BANK_COUNT;
+ 
++			if (isInjectionTimeFueling()) {
++				float pulseMs = config->injTimeTable[loadIndex][rpmIndex];
++				if (pulseMs > deadtime) {
++					config->injTimeTable[loadIndex][rpmIndex] = deadtime + (pulseMs - deadtime) * k;
++				}
++				continue;
++			}
++
+ 			config->veTable[loadIndex][rpmIndex] = config->veTable[loadIndex][rpmIndex] * k;
+ 		}
+ 	}
+@@ -137,8 +170,13 @@ void LongTermFuelTrim::learn(ClosedLoopFuelResult clResult, float rpm, float fue
+ 
+ 	// TODO: should we swap x and y here to keep aligned to wierd TS table definition?
+ 	// x - load, y - rpm
+-	auto x = priv::getClosestBin(fuelLoad, config->veLoadBins);
+-	auto y = priv::getClosestBin(rpm, config->veRpmBins);
++	float load = getTrimsLoad(fuelLoad);
++	auto x = isInjectionTimeFueling()
++		? priv::getClosestBin(load, config->injTimeLoadBins)
++		: priv::getClosestBin(load, config->veLoadBins);
++	auto y = isInjectionTimeFueling()
++		? priv::getClosestBin(rpm, config->injTimeRpmBins)
++		: priv::getClosestBin(rpm, config->veRpmBins);
+ 
+ 	// Skip learning if current load point falls far outside the table
+ 	if ((abs(x.Frac) > 0.5) ||
+@@ -236,11 +274,7 @@ ClosedLoopFuelResult LongTermFuelTrim::getTrims(float rpm, float fuelLoad) {
+ 	// Is there any reason we should not apply LTFT?
+ 
+ 	for (size_t bank = 0; bank < FT_BANK_COUNT; bank++) {
+-		ltftCorrection[bank] = 1.0f + interpolate3d(
+-			m_state->trims[bank],
+-			config->veLoadBins, fuelLoad,
+-			config->veRpmBins, rpm
+-		);
++		ltftCorrection[bank] = 1.0f + interpolateTrims(m_state->trims[bank], getTrimsLoad(fuelLoad), rpm);
+ 	}
+ 
+ 	ClosedLoopFuelResult result;
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index 7b21f9e..470acc5 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -53,8 +53,10 @@
+ 		subMenu = fuelClosedLoopDialog,	"Short term fuel trim/Closed loop", 0, {isInjectionEnabled == 1}
+ @@if_block LTFT_PAGE_ENABLED@@
+ 		subMenu = fuelLTFCDialog, "Long term fuel trims", 0, {isInjectionEnabled == 1}
+-		subMenu = ltftBank1Tbl, @@GAUGE_NAME_FUEL_LTFT_1@@, { ltft_enabled }
+-		subMenu = ltftBank2Tbl, @@GAUGE_NAME_FUEL_LTFT_2@@, { ltft_enabled }
++		subMenu = ltftBank1Tbl, @@GAUGE_NAME_FUEL_LTFT_1@@, { ltft_enabled && fuelAlgorithm != @@engine_load_mode_e_LM_INJ_TIME@@ }
++		subMenu = ltftBank2Tbl, @@GAUGE_NAME_FUEL_LTFT_2@@, { ltft_enabled && fuelAlgorithm != @@engine_load_mode_e_LM_INJ_TIME@@ }
++		subMenu = ltftBank1InjTimeTbl, @@GAUGE_NAME_FUEL_LTFT_1@@, { ltft_enabled && fuelAlgorithm == @@engine_load_mode_e_LM_INJ_TIME@@ }
++		subMenu = ltftBank2InjTimeTbl, @@GAUGE_NAME_FUEL_LTFT_2@@, { ltft_enabled && fuelAlgorithm == @@engine_load_mode_e_LM_INJ_TIME@@ }
+ @@endif_block
+ 		subMenu = std_separator
+ 
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index d2eb74e..60e8e66 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -2004,6 +2004,23 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 		zBins       = ltft_table_bank2
+ 		upDownLabel = "RICHER", "LEANER"
+ 		gridOrient  = 250,   0, 340 ; Space 123 rotation of grid in degrees.
++
++	; Same trims, shown on the Injection time (ms) table axes
++	table = ltftBank1InjTimeTbl, ltftBank1InjTimeMap, @@GAUGE_NAME_FUEL_LTFT_1@@
++		xyLabels	= "RPM", {injTimeUseTps ? "TPS" : "MAP"}
++		xBins		= injTimeRpmBins, RPMValue, readOnly
++		yBins		= injTimeLoadBins, injTimeTableYAxis, readOnly
++		zBins       = ltft_table_bank1
++		upDownLabel = "RICHER", "LEANER"
++		gridOrient  = 250,   0, 340 ; Space 123 rotation of grid in degrees.
++
++	table = ltftBank2InjTimeTbl, ltftBank2InjTimeMap, @@GAUGE_NAME_FUEL_LTFT_2@@
++		xyLabels	= "RPM", {injTimeUseTps ? "TPS" : "MAP"}
++		xBins		= injTimeRpmBins, RPMValue, readOnly
++		yBins		= injTimeLoadBins, injTimeTableYAxis, readOnly
++		zBins       = ltft_table_bank2
++		upDownLabel = "RICHER", "LEANER"
++		gridOrient  = 250,   0, 340 ; Space 123 rotation of grid in degrees.
+ @@endif_block
+ 
+ [GaugeConfigurations]
+diff --git a/unit_tests/tests/controllers/test_ltft_injection_time.cpp b/unit_tests/tests/controllers/test_ltft_injection_time.cpp
+new file mode 100644
+index 0000000..9f013fe
+--- /dev/null
++++ b/unit_tests/tests/controllers/test_ltft_injection_time.cpp
+@@ -0,0 +1,109 @@
++#include "pch.h"
++#include "fuel_math.h"
++
++// LTFT on top of the Injection time (ms) main table: trims follow the ms table
++// axes (RPM x MAP or TPS) and "Apply" writes into the ms table, not VE.
++
++#define ITERATE_TIME(time, action)	\
++	for (size_t i = 0; i < (time * 1000 / FAST_CALLBACK_PERIOD_MS); i++) { \
++		(action); \
++	}
++
++class LtftInjectionTime : public testing::Test {
++protected:
++	EngineTestHelper eth{engine_type_e::TEST_ENGINE};
++	LtftState ltftState;
++	LongTermFuelTrim ltft;
++
++	void SetUp() override {
++		ltftState.load();
++		ltft.init(&ltftState);
++
++		engineConfiguration->fuelAlgorithm = engine_load_mode_e::LM_INJ_TIME;
++		engineConfiguration->ltft.enabled = true;
++		engineConfiguration->ltft.correctionEnabled = true;
++		engineConfiguration->ltft.deadband = 0.5; // %
++		engineConfiguration->ltft.maxAdd = 15.0; // %
++		engineConfiguration->ltft.maxRemove = 5; // %
++		engineConfiguration->ltft.timeConstant[ftRegionCruise] = 30; // seconds
++
++		// Axes deliberately different from the VE table ones
++		setLinearCurve(config->injTimeLoadBins, 0, 150, 1);
++		setLinearCurve(config->injTimeRpmBins, 500, 8000, 1);
++
++		// 1 ms deadtime everywhere
++		engineConfiguration->useAbsolutePressureForLagTime = false;
++		setTable(engineConfiguration->injector.battLagCorrTable, 1.0f);
++	}
++};
++
++TEST_F(LtftInjectionTime, LearnsOnMsTableAxesWithTps) {
++	engineConfiguration->injTimeUseTps = true;
++
++	float rpm = config->injTimeRpmBins[5];
++	Sensor::setMockValue(SensorType::Tps1, config->injTimeLoadBins[3]);
++	// The VE fuel load is ignored in this mode
++	float veFuelLoad = 999;
++
++	ClosedLoopFuelResult clInput;
++	clInput.region = ftRegionCruise;
++	clInput.banks[0] = clInput.banks[1] = 1.5;
++	ITERATE_TIME(100, ltft.learn(clInput, rpm, veFuelLoad))
++
++	EXPECT_TRUE(ltft.ltftLearning);
++	EXPECT_FLOAT_EQ(0.15f, ltftState.trims[0][3][5]);
++	EXPECT_FLOAT_EQ(0.15f, ltftState.trims[1][3][5]);
++	EXPECT_FLOAT_EQ(1.15f, ltft.getTrims(rpm, veFuelLoad).banks[0]);
++
++	// Another TPS cell is not affected
++	Sensor::setMockValue(SensorType::Tps1, config->injTimeLoadBins[10]);
++	EXPECT_FLOAT_EQ(1.0f, ltft.getTrims(rpm, veFuelLoad).banks[0]);
++}
++
++TEST_F(LtftInjectionTime, LearnsOnMsTableAxesWithMap) {
++	engineConfiguration->injTimeUseTps = false;
++
++	float rpm = config->injTimeRpmBins[2];
++	Sensor::setMockValue(SensorType::Map, config->injTimeLoadBins[8]);
++
++	ClosedLoopFuelResult clInput;
++	clInput.region = ftRegionCruise;
++	clInput.banks[0] = clInput.banks[1] = 0.5;
++	ITERATE_TIME(100, ltft.learn(clInput, rpm, 0))
++
++	EXPECT_FLOAT_EQ(-0.05f, ltftState.trims[0][8][2]);
++	EXPECT_FLOAT_EQ(0.95f, ltft.getTrims(rpm, 0).banks[0]);
++}
++
++TEST_F(LtftInjectionTime, ApplyScalesOnlyEffectivePulse) {
++	setTable(config->injTimeTable, 6.0f);
++	setTable(config->veTable, 80);
++	ltftState.trims[0][2][4] = 0.1f;
++	ltftState.trims[1][2][4] = 0.1f;
++	// Pulse below the deadtime stays as it is
++	config->injTimeTable[7][7] = 0.8f;
++	ltftState.trims[0][7][7] = 0.1f;
++	ltftState.trims[1][7][7] = 0.1f;
++
++	ltftState.applyToVe();
++
++	// 1 ms deadtime + 5 ms * 1.1
++	EXPECT_NEAR(6.5f, config->injTimeTable[2][4], 0.001f);
++	EXPECT_NEAR(6.0f, config->injTimeTable[2][5], 0.001f);
++	EXPECT_NEAR(0.8f, config->injTimeTable[7][7], 0.001f);
++	// VE is not touched in this mode
++	EXPECT_NEAR(80, config->veTable[2][4], 0.01f);
++}
++
++TEST_F(LtftInjectionTime, VeModeStillAppliesToVe) {
++	engineConfiguration->fuelAlgorithm = engine_load_mode_e::LM_SPEED_DENSITY;
++	setTable(config->injTimeTable, 6.0f);
++	setTable(config->veTable, 80);
++	ltftState.trims[0][2][4] = 0.1f;
++	ltftState.trims[1][2][4] = 0.1f;
++
++	ltftState.applyToVe();
++
++	EXPECT_NEAR(88, config->veTable[2][4], 0.01f);
++	EXPECT_NEAR(6.0f, config->injTimeTable[2][4], 0.001f);
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 0d6a08f..626a284 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -264,6 +264,7 @@ TESTS_SRC_CPP = \
+ 	tests/controllers/can/test_obd2.cpp \
+ 	tests/controllers/can/test_uds.cpp \
+ 	tests/controllers/test_long_term_fuel_trim.cpp \
++	tests/controllers/test_ltft_injection_time.cpp \
+ 	tests/ignition_injection/test_ignition_state.cpp \
+ 	tests/core/test_main_loop.cpp \
+ 	tests/test_trip_odometer.cpp \
+-- 
+2.43.0
+

@@ -1,0 +1,262 @@
+From 0cba8ff3e2a3998d0ecaf318ae3adb2dad809f38 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:34:32 +0000
+Subject: [PATCH] Timing and fuel compensation by gear, RPM x gear tables
+ (pro-style)
+
+New tables gearTimingTable (deg) and gearFuelTable (%) on gearCompRpmBins x
+gearCompGearBins (gears 1-6). Timing goes into the advance corrections, fuel into the
+running fuel corrections. Neutral, unknown gear or no gear detection: no change.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ firmware/controllers/algo/advance_map.h       |  3 ++
+ .../algo/defaults/default_ignition.cpp        |  9 +++++
+ .../controllers/algo/fuel/fuel_computer.txt   |  1 +
+ firmware/controllers/algo/fuel_math.cpp       |  4 +++
+ .../algo/ignition/ignition_state.cpp          | 33 +++++++++++++++++
+ .../algo/ignition/ignition_state.txt          |  1 +
+ firmware/integration/rusefi_config.txt        |  7 ++++
+ firmware/tunerstudio/top_level_menu.ini       |  2 ++
+ firmware/tunerstudio/tunerstudio.template.ini | 12 +++++++
+ .../test_ignition_state.cpp                   | 35 +++++++++++++++++++
+ 10 files changed, 107 insertions(+)
+
+diff --git a/firmware/controllers/algo/advance_map.h b/firmware/controllers/algo/advance_map.h
+index f7eabfb..4f416a8 100644
+--- a/firmware/controllers/algo/advance_map.h
++++ b/firmware/controllers/algo/advance_map.h
+@@ -16,6 +16,9 @@ float getInitialAdvance(float rpm, float map, float advanceMax);
+ angle_t getCrankingAdvance(float rpm, float engineLoad);
+ angle_t getRunningAdvance(float rpm, float engineLoad);
+ angle_t getAdvanceCorrections(float engineLoad);
++// pro-style compensation by gear
++angle_t getGearTimingCorrection();
++float getGearFuelCoefficient();
+ 
+ size_t getMultiSparkCount(float rpm);
+ void initIgnitionAdvanceControl();
+diff --git a/firmware/controllers/algo/defaults/default_ignition.cpp b/firmware/controllers/algo/defaults/default_ignition.cpp
+index e677e54..567d208 100644
+--- a/firmware/controllers/algo/defaults/default_ignition.cpp
++++ b/firmware/controllers/algo/defaults/default_ignition.cpp
+@@ -15,6 +15,14 @@ static void setDefaultMultisparkParameters() {
+ 	engineConfiguration->multisparkMaxSparkingAngle = 30;
+ }
+ 
++static void setDefaultGearCompensation() {
++	// gears 1 to 6, no change by default
++	setLinearCurve(config->gearCompGearBins, 1, GEAR_COMP_GEAR_COUNT, 1);
++	setLinearCurve(config->gearCompRpmBins, 1000, 8000, 50);
++	setTable(config->gearTimingTable, 0);
++	setTable(config->gearFuelTable, 0);
++}
++
+ static void setDefaultIatTimingCorrection() {
+ 	setLinearCurve(config->ignitionIatCorrLoadBins, /*from=*/ 0, /*to*/ 140, 1);
+ 
+@@ -133,6 +141,7 @@ void setDefaultIgnition() {
+ 
+ 	// IAT correction
+ 	setDefaultIatTimingCorrection();
++	setDefaultGearCompensation();
+ 
+ 	// Give default axes for cylinder trim tables
+ #if IGN_TRIM_SIZE == 4
+diff --git a/firmware/controllers/algo/fuel/fuel_computer.txt b/firmware/controllers/algo/fuel/fuel_computer.txt
+index 13c4eea..e07e63f 100644
+--- a/firmware/controllers/algo/fuel/fuel_computer.txt
++++ b/firmware/controllers/algo/fuel/fuel_computer.txt
+@@ -7,6 +7,7 @@ struct_no_prefix fuel_computer_s
+ 		float postCrankingFuelCorrection;Post cranking mult
+ 		float intakeTemperatureCoefficient;@@GAUGE_NAME_FUEL_IAT_CORR@@
+ 		float coolantTemperatureCoefficient;@@GAUGE_NAME_FUEL_CLT_CORR@@
++		float gearFuelCoefficient;Fuel: gear correction
+ 		float timeSinceCrankingInSecs;time run since cranking;"secs", 1,0, 0,600000, 0, @@GAUGE_CATEGORY_FUEL_MATH@@
+ 
+ 		uint16_t autoscale baseFuel;@@GAUGE_NAME_FUEL_BASE@@\nThis is the raw value we take from the fuel map or base fuel algorithm, before the corrections;"mg",{1/@@PACK_MULT_FUEL_MASS@@}, 0, 0, 0, 3
+diff --git a/firmware/controllers/algo/fuel_math.cpp b/firmware/controllers/algo/fuel_math.cpp
+index a391d6d..ff5b03c 100644
+--- a/firmware/controllers/algo/fuel_math.cpp
++++ b/firmware/controllers/algo/fuel_math.cpp
+@@ -127,6 +127,10 @@ float getRunningFuel(float baseFuel) {
+ 
+ 	float correction = baroCorrection * iatCorrection * cltCorrection * postCrankingFuelCorrection;
+ 
++	// pro-style fuel by gear
++	engine->fuelComputer.running.gearFuelCoefficient = getGearFuelCoefficient();
++	correction *= engine->fuelComputer.running.gearFuelCoefficient;
++
+ #if EFI_ANTILAG_SYSTEM
+ 	correction *= (1 + engine->antilagController.fuelALSCorrection / 100);
+ #endif /* EFI_ANTILAG_SYSTEM */
+diff --git a/firmware/controllers/algo/ignition/ignition_state.cpp b/firmware/controllers/algo/ignition/ignition_state.cpp
+index d964085..570af61 100644
+--- a/firmware/controllers/algo/ignition/ignition_state.cpp
++++ b/firmware/controllers/algo/ignition/ignition_state.cpp
+@@ -195,6 +195,36 @@ void IgnitionState::updateAdvanceCorrections(float engineLoad) {
+ 	cltTimingCorrection = getCltTimingCorrection(engineLoad);
+ }
+ 
++template <typename TTable>
++static float getGearCompensation(const TTable& table) {
++	// pro-style compensation by gear, 0 in neutral or without gear detection
++	auto gear = Sensor::get(SensorType::DetectedGear);
++	if (!gear.Valid || gear.Value < 1) {
++		return 0;
++	}
++	float rpm = Sensor::getOrZero(SensorType::Rpm);
++	// rows are whole gears, no blending between them
++	float row = std::round(gear.Value);
++	size_t i = 0;
++	for (; i < GEAR_COMP_GEAR_COUNT; i++) {
++		if (config->gearCompGearBins[i] == row) {
++			break;
++		}
++	}
++	if (i == GEAR_COMP_GEAR_COUNT) {
++		return 0;
++	}
++	return interpolate2d(rpm, config->gearCompRpmBins, table[i]);
++}
++
++angle_t getGearTimingCorrection() {
++	return getGearCompensation(config->gearTimingTable);
++}
++
++float getGearFuelCoefficient() {
++	return 1 + getGearCompensation(config->gearFuelTable) / 100;
++}
++
+ angle_t getAdvanceCorrections(float engineLoad) {
+ 	auto iat = Sensor::get(SensorType::Iat);
+ 
+@@ -216,12 +246,15 @@ angle_t getAdvanceCorrections(float engineLoad) {
+ 
+ 	engine->ignitionState.dfcoTimingRetard = engine->module<DfcoController>()->getTimingRetard();
+ 
++	engine->ignitionState.timingGearCorrection = getGearTimingCorrection();
++
+ #if EFI_TUNER_STUDIO
+ 	engine->outputChannels.multiSparkCounter = engine->engineState.multispark.count;
+ #endif /* EFI_TUNER_STUDIO */
+ 
+ 	return engine->ignitionState.timingIatCorrection
+ 		+ engine->ignitionState.cltTimingCorrection
++		+ engine->ignitionState.timingGearCorrection
+ 		+ engine->ignitionState.timingPidCorrection
+ 		- engine->ignitionState.dfcoTimingRetard
+ 		- engine->module<BurstKnock>().unmock().getTimingRetard()
+diff --git a/firmware/controllers/algo/ignition/ignition_state.txt b/firmware/controllers/algo/ignition/ignition_state.txt
+index 5c94ecd..8c9c698 100644
+--- a/firmware/controllers/algo/ignition/ignition_state.txt
++++ b/firmware/controllers/algo/ignition/ignition_state.txt
+@@ -10,6 +10,7 @@ struct_no_prefix ignition_state_s
+ 
+ 	int16_t autoscale cltTimingCorrection;CLT correction;"deg",{1/@@PACK_MULT_PERCENT@@},0, -20,20, 2,@@GAUGE_CATEGORY_TIMING@@
+ 	int16_t autoscale timingIatCorrection;IAT correction;"deg",{1/@@PACK_MULT_PERCENT@@},0, -20,20, 2,@@GAUGE_CATEGORY_TIMING@@
++	int16_t autoscale timingGearCorrection;Gear correction;"deg",{1/@@PACK_MULT_PERCENT@@},0, -20,20, 2,@@GAUGE_CATEGORY_TIMING@@
+ 	int16_t autoscale baseIgnitionAdvance;@@GAUGE_NAME_TIMING_ADVANCE@@;"deg",{1/@@PACK_MULT_ANGLE@@}, 0, 0, 0, 1
+ 	int16_t autoscale correctedIgnitionAdvance;@@GAUGE_NAME_ADJUSTED_TIMING@@;"deg",{1/@@PACK_MULT_ANGLE@@}, 0, 0, 0, 1
+ 
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index f9e05f2..c443f1f 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2246,6 +2246,13 @@ float[MAF_DECODING_COUNT] mafDecodingBins;;"V", 1, 0, -5, 150, 2
+ 
+ int16_t[IAT_IGN_CORR_LOAD_COUNT x IAT_IGN_CORR_TEMP_COUNT] autoscale ignitionIatCorrTable;;"deg", 0.1, 0, -50, 50, 1
+ int8_t[IAT_IGN_CORR_TEMP_COUNT] ignitionIatCorrTempBins;;{bitStringValue(unitsLabels, useMetricOnInterface)}, {useMetricOnInterface ? 1 : 1.8}, {useMetricOnInterface ? 0 : 17.77777}, {useMetricOnInterface ? -40 : -40}, {useMetricOnInterface ? 150 : 300}, 0
++! pro-style compensation by gear, timing and fuel, RPM x gear
++#define GEAR_COMP_GEAR_COUNT 6
++#define GEAR_COMP_RPM_COUNT 8
++uint8_t[GEAR_COMP_GEAR_COUNT] gearCompGearBins;Gear of each row of the gear compensation tables.;"gear", 1, 0, 1, 10, 0
++uint8_t[GEAR_COMP_RPM_COUNT] autoscale gearCompRpmBins;;"RPM", 50, 0, 0, 12000, 0
++int8_t[GEAR_COMP_GEAR_COUNT x GEAR_COMP_RPM_COUNT] autoscale gearTimingTable;Timing added in each gear. 0 = no change.;"deg", 0.5, 0, -20, 20, 1
++int8_t[GEAR_COMP_GEAR_COUNT x GEAR_COMP_RPM_COUNT] gearFuelTable;Fuel added in each gear. 0 = no change.;"%", 1, 0, -50, 50, 0
+ uint8_t[IAT_IGN_CORR_LOAD_COUNT] autoscale ignitionIatCorrLoadBins;;{bitStringValue(pressureUnitsLabels, useMetricOnInterface)}, {useMetricOnInterface ? 5 : 5 * @@UNITS_KPA_TO_PSI@@}, 0, 0, {useMetricOnInterface ? @@MAP_UPPER_LIMIT@@ : @@MAP_UPPER_LIMIT@@ * @@UNITS_KPA_TO_PSI@@}, 0
+ 
+ #define INJ_PHASE_LOAD_COUNT 16
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index 15b1d3b..6eda103 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -87,6 +87,8 @@
+ 		subMenu = secondIgnitionTableDialog,	@@SECOND_IGNITION_TABLE@@, 0, {isIgnitionEnabled == 1}
+ 		subMenu = ignitionCltCorrTable,			"CLT timing correction", 0, {isIgnitionEnabled == 1}
+ 		subMenu = ignitionIatCorrTableTbl,	"IAT timing correction", 0, {isIgnitionEnabled == 1}
++		subMenu = gearTimingTableTbl,		"Timing by gear", 0, {isIgnitionEnabled == 1}
++		subMenu = gearFuelTableTbl,			"Fuel by gear"
+ 		subMenu = dwellSettings,				"Dwell", 0, {isIgnitionEnabled == 1}
+ 		subMenu = std_separator
+ 
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index d0d21d1..917a51a 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -1612,6 +1612,18 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 		gridOrient  = 250,	0, 340 ; Space 123 rotation of grid in degrees.
+ 		upDownLabel = "(RICHER)", "(LEANER)"
+ 
++	table = gearTimingTableTbl, gearTimingTableMap, "Timing by gear", 1
++		xyLabels = "RPM", "Gear"
++		xBins		= gearCompRpmBins, RPMValue
++		yBins		= gearCompGearBins, detectedGear
++		zBins		= gearTimingTable
++
++	table = gearFuelTableTbl, gearFuelTableMap, "Fuel by gear", 1
++		xyLabels = "RPM", "Gear"
++		xBins		= gearCompRpmBins, RPMValue
++		yBins		= gearCompGearBins, detectedGear
++		zBins		= gearFuelTable
++
+ 	table = ignitionCltCorrTable, ignitionCltCorrMap, "Warmup timing correction", 1
+ 		xyLabels = "CLT Temp", "Ignition Load"
+ 		xBins		= ignitionCltCorrTempBins,  coolantTemperature
+diff --git a/unit_tests/tests/ignition_injection/test_ignition_state.cpp b/unit_tests/tests/ignition_injection/test_ignition_state.cpp
+index b3d47e3..91ec08a 100644
+--- a/unit_tests/tests/ignition_injection/test_ignition_state.cpp
++++ b/unit_tests/tests/ignition_injection/test_ignition_state.cpp
+@@ -372,3 +372,38 @@ TEST(ignition_state, crankingAdvanceByClt) {
+ 	Sensor::setMockValue(SensorType::Clt, 0);
+ 	EXPECT_NEAR(12, getCrankingAdvance(engine->rpmCalculator.getMinCrankingRpm(), 50), EPS2D);
+ }
++
++// pro-style timing and fuel compensation by gear (RPM x gear tables)
++TEST(ignition_state, gearCompensation) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++
++	Sensor::setMockValue(SensorType::Rpm, 3000);
++	Sensor::setMockValue(SensorType::DetectedGear, 3);
++
++	// default tables change nothing
++	EXPECT_NEAR(0, getGearTimingCorrection(), EPS2D);
++	EXPECT_NEAR(1, getGearFuelCoefficient(), EPS2D);
++
++	// third gear row: -2 deg and +5 % fuel
++	setArrayValues(config->gearTimingTable[2], -2);
++	setArrayValues(config->gearFuelTable[2], 5);
++	EXPECT_NEAR(-2, getGearTimingCorrection(), EPS2D);
++	EXPECT_NEAR(1.05, getGearFuelCoefficient(), EPS2D);
++
++	// another gear uses its own row
++	Sensor::setMockValue(SensorType::DetectedGear, 2);
++	EXPECT_NEAR(0, getGearTimingCorrection(), EPS2D);
++
++	// neutral, no gear detection or a gear without a row: no change
++	Sensor::setMockValue(SensorType::DetectedGear, 0);
++	EXPECT_NEAR(0, getGearTimingCorrection(), EPS2D);
++	Sensor::setInvalidMockValue(SensorType::DetectedGear);
++	EXPECT_NEAR(1, getGearFuelCoefficient(), EPS2D);
++	Sensor::setMockValue(SensorType::DetectedGear, 8);
++	EXPECT_NEAR(0, getGearTimingCorrection(), EPS2D);
++
++	// the gear timing goes into the timing corrections
++	Sensor::setMockValue(SensorType::DetectedGear, 3);
++	getAdvanceCorrections(50);
++	EXPECT_NEAR(-2, engine->ignitionState.timingGearCorrection, 0.01);
++}
+-- 
+2.43.0
+

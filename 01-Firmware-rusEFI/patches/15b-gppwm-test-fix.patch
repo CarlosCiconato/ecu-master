@@ -1,0 +1,61 @@
+From 4f7864d2f67068e18ffe00ba0f49dd7eb25282ae Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 22:33:34 +0000
+Subject: [PATCH] GPPWM test: check channel 8 on a local channel in PWM mode
+
+The test used the global channels with on-off mode: it expected the table value
+instead of the switched state, and left channel 8 pointing at a freed config.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ unit_tests/tests/actuators/test_gppwm.cpp | 25 +++++++++++++++--------
+ 1 file changed, 16 insertions(+), 9 deletions(-)
+
+diff --git a/unit_tests/tests/actuators/test_gppwm.cpp b/unit_tests/tests/actuators/test_gppwm.cpp
+index 7956b9f..e9c1ef5 100644
+--- a/unit_tests/tests/actuators/test_gppwm.cpp
++++ b/unit_tests/tests/actuators/test_gppwm.cpp
+@@ -224,23 +224,30 @@ TEST(GpPwm, EightChannels) {
+ 	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
+ 
+ 	EXPECT_EQ(8u, efi::size(engineConfiguration->gppwm));
++	EXPECT_EQ(8u, efi::size(engineConfiguration->gpPwmNote));
+ 	EXPECT_EQ(8u, efi::size(engine->outputChannels.gppwmOutput));
+ 
++	// channel 8 works like the others; built locally so no global channel keeps
++	// pointing at this test's config
+ 	auto& cfg = engineConfiguration->gppwm[7];
+-	cfg.pin = Gpio::A7;
+-	cfg.pwmFrequency = 0;
+-	cfg.onAboveDuty = 60;
+-	cfg.offBelowDuty = 50;
+ 	cfg.rpmAxis = GPPWM_Rpm;
+ 	cfg.loadAxis = GPPWM_Tps;
+ 	setTable(cfg.table, 80);
+-	initGpPwm();
++
++	Map3D<GPPWM_RPM_COUNT, GPPWM_LOAD_COUNT, uint8_t, int16_t, int16_t> table{"gppwm8"};
++	table.initTable(cfg.table, cfg.rpmBins, cfg.loadBins);
++
++	StrictMock<MockPwm> pwm;
++	EXPECT_CALL(pwm, setSimplePwmDutyCycle(0.8f));
++
++	GppwmChannel ch;
++	ch.init(true, &pwm, nullptr, &table, &cfg);
+ 
+ 	Sensor::setMockValue(SensorType::Rpm, 2000);
+ 	Sensor::setMockValue(SensorType::Tps1, 30);
+-	updateGppwm();
++	auto result = ch.update(7);
+ 
+-	EXPECT_NEAR(80, engine->outputChannels.gppwmOutput[7], 0.5);
+-	EXPECT_NEAR(2000, engine->outputChannels.gppwmXAxis[7], 1);
+-	EXPECT_NEAR(30, engine->outputChannels.gppwmYAxis[7], 0.1);
++	EXPECT_NEAR(80, result.Result, 0.5);
++	EXPECT_NEAR(2000, result.X, 1);
++	EXPECT_NEAR(30, result.Y, 0.1);
+ }
+-- 
+2.43.0
+

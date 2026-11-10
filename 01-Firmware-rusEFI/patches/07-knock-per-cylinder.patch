@@ -1,0 +1,326 @@
+From 7d64c1c2ce1e744d84f7b22ebc4717f462ece710 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 19:49:25 +0000
+Subject: [PATCH] Per cylinder knock retard (pro-style)
+
+New option knockRetardPerCylinder: knock retard is kept for each cylinder and only the
+cylinder that knocked loses timing. Each cylinder has its own limit and reapply. The
+shared knock retard shows the highest cylinder, and live data has the retard per cylinder.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ firmware/controllers/algo/engine2.cpp         |  12 +-
+ .../engine_cycle/knock_controller.cpp         |  59 ++++++++--
+ .../engine_cycle/knock_controller.txt         |   1 +
+ .../controllers/engine_cycle/knock_logic.h    |   7 ++
+ firmware/integration/rusefi_config.txt        |   2 +-
+ firmware/tunerstudio/tunerstudio.template.ini |   1 +
+ unit_tests/tests/test_knock.cpp               | 106 ++++++++++++++++++
+ 7 files changed, 174 insertions(+), 14 deletions(-)
+
+diff --git a/firmware/controllers/algo/engine2.cpp b/firmware/controllers/algo/engine2.cpp
+index 6c332a2..8984e88 100644
+--- a/firmware/controllers/algo/engine2.cpp
++++ b/firmware/controllers/algo/engine2.cpp
+@@ -118,16 +118,18 @@ void EngineState::periodicFastCallback() {
+ 	float l_ignitionLoad = getIgnitionLoad();
+ 	engine->ignitionState.updateAdvanceCorrections(l_ignitionLoad);
+ 	float baseAdvance = engine->ignitionState.getWrappedAdvance(rpm, l_ignitionLoad);
+-	float corrections = engineConfiguration->timingMode == TM_DYNAMIC ?
+-			// Pull any extra timing for knock retard
+-			- engine->module<KnockController>()->getKnockRetard()
++	bool isDynamicTiming = engineConfiguration->timingMode == TM_DYNAMIC;
++	auto& knock = engine->module<KnockController>().unmock();
++	float corrections = isDynamicTiming ?
+ 			// Degrees of timing REMOVED from actual timing during soft RPM limit window
+ 			- getLimpManager()->getLimitingTimingRetard() :
+ 			0;
++	// Knock retard is applied per cylinder below, it can differ between cylinders
+ 	float correctedIgnitionAdvance = baseAdvance + corrections;
+ 	// these fields are scaled_channel so let's only use for observability, with a local variables holding value while it matters locally
+ 	engine->ignitionState.baseIgnitionAdvance = MAKE_HUMAN_READABLE_ADVANCE(baseAdvance);
+-	engine->ignitionState.correctedIgnitionAdvance = MAKE_HUMAN_READABLE_ADVANCE(correctedIgnitionAdvance);
++	engine->ignitionState.correctedIgnitionAdvance = MAKE_HUMAN_READABLE_ADVANCE(
++		correctedIgnitionAdvance - (isDynamicTiming ? knock.getKnockRetard() : 0));
+ 
+ 	// compute per-bank fueling
+ 	for (size_t bankIndex = 0; bankIndex < FT_BANK_COUNT; bankIndex++) {
+@@ -151,6 +153,8 @@ void EngineState::periodicFastCallback() {
+ 		engine->engineState.injectionMass[cylinderIndex] = untrimmedInjectionMass * bankTrim * cylinderTrim * knockTrim;
+ 
+ 		angle_t cylinderIgnitionAdvance = correctedIgnitionAdvance
++									// Pull any extra timing for knock retard
++									- (isDynamicTiming ? knock.getKnockRetard(cylinderIndex) : 0)
+ 									+ getCylinderIgnitionTrim(cylinderIndex, rpm, l_ignitionLoad)
+ 									// spark hardware latency correction, for implementation details see:
+ 									// https://github.com/rusefi/rusefi/issues/6832:
+diff --git a/firmware/controllers/engine_cycle/knock_controller.cpp b/firmware/controllers/engine_cycle/knock_controller.cpp
+index 0a30e92..cd241f5 100644
+--- a/firmware/controllers/engine_cycle/knock_controller.cpp
++++ b/firmware/controllers/engine_cycle/knock_controller.cpp
+@@ -105,8 +105,15 @@ bool KnockControllerBase::onKnockSenseCompleted(uint8_t cylinderNumber, float db
+ 			// Adjust knock retard under lock
+ 			chibios_rt::CriticalSectionLocker csl;
+ 
+-			auto newRetard = m_knockRetard + retardAmount;
+-			m_knockRetard = clampF(0.f, newRetard, m_maximumRetard);
++			if (engineConfiguration->knockRetardPerCylinder) {
++				// pro-style: only the cylinder that knocked is retarded
++				auto newRetard = m_cylinderRetard[cylinderNumber] + retardAmount;
++				m_cylinderRetard[cylinderNumber] = clampF(0.f, newRetard, m_maximumRetard);
++			} else {
++				auto newRetard = m_knockRetard + retardAmount;
++				m_knockRetard = clampF(0.f, newRetard, m_maximumRetard);
++			}
++			updateRetardOutputs();
+ 
+ 			auto newFuelTrim = m_knockFuelTrimMultiplier + trimFuelAmount;
+ 			m_knockFuelTrimMultiplier = clampF(0.f, newFuelTrim, maximumFuelTrim);
+@@ -120,6 +127,28 @@ float KnockControllerBase::getKnockRetard() const {
+ 	return m_knockRetard;
+ }
+ 
++float KnockControllerBase::getKnockRetard(size_t cylinderIndex) const {
++	if (engineConfiguration->knockRetardPerCylinder && cylinderIndex < MAX_CYLINDER_COUNT) {
++		return m_cylinderRetard[cylinderIndex];
++	}
++	return m_knockRetard;
++}
++
++// In per cylinder mode m_knockRetard shows the highest cylinder retard, for gauges and logs
++void KnockControllerBase::updateRetardOutputs() {
++	bool perCylinder = engineConfiguration->knockRetardPerCylinder;
++	if (perCylinder) {
++		float highest = 0;
++		for (size_t i = 0; i < MAX_CYLINDER_COUNT; i++) {
++			highest = std::max(highest, m_cylinderRetard[i]);
++		}
++		m_knockRetard = highest;
++	}
++	for (size_t i = 0; i < MAX_CYLINDER_COUNT; i++) {
++		m_knockCylRetard[i] = perCylinder ? m_cylinderRetard[i] : m_knockRetard;
++	}
++}
++
+ uint32_t KnockControllerBase::getKnockCount() const {
+ 	return m_knockCount;
+ }
+@@ -152,18 +181,30 @@ void KnockControllerBase::onFastCallback() {
+ 		 if(TPSValue < engineConfiguration->knockSuppressMinTps) {
+ 		 	m_knockRetard = 0.0;
+ 		 	m_knockFuelTrimMultiplier = 0.0;
++		 	setArrayValues(m_cylinderRetard, 0.0f);
++		 	updateRetardOutputs();
+ 		 	return;
+ 		 }
+ 
+-		// Reduce knock retard at the requested rate
+-		float newRetard = m_knockRetard - applyRetardAmount;
+-
+-		// don't allow retard to go negative
+-		if (newRetard < 0) {
+-			m_knockRetard = 0;
++		if (engineConfiguration->knockRetardPerCylinder) {
++			// Reapply timing on each cylinder at the requested rate
++			for (size_t i = 0; i < MAX_CYLINDER_COUNT; i++) {
++				m_cylinderRetard[i] = std::max(0.0f, m_cylinderRetard[i] - applyRetardAmount);
++			}
+ 		} else {
+-			m_knockRetard = newRetard;
++			setArrayValues(m_cylinderRetard, 0.0f);
++
++			// Reduce knock retard at the requested rate
++			float newRetard = m_knockRetard - applyRetardAmount;
++
++			// don't allow retard to go negative
++			if (newRetard < 0) {
++				m_knockRetard = 0;
++			} else {
++				m_knockRetard = newRetard;
++			}
+ 		}
++		updateRetardOutputs();
+ 
+ 		// Reduce fuel trim at the requested rate
+ 		float newTrim = m_knockFuelTrimMultiplier - applyFuelAmount;
+diff --git a/firmware/controllers/engine_cycle/knock_controller.txt b/firmware/controllers/engine_cycle/knock_controller.txt
+index 0f7536c..ac5998b 100644
+--- a/firmware/controllers/engine_cycle/knock_controller.txt
++++ b/firmware/controllers/engine_cycle/knock_controller.txt
+@@ -14,6 +14,7 @@ struct_no_prefix knock_controller_s
+ 	uint16_t m_knockFrequencyStart;Start Freq;"Hz", 1, 0, 0, 0, 0
+ 	float    m_knockFrequencyStep;Step Freq;"Hz", 1, 0, 0, 0, 0
+ 	float  	 m_knockFuelTrimMultiplier;Fuel trim when knock;"multiplier", 1, 0, 0, 0, 0
++	uint8_t[MAX_CYLINDER_COUNT iterate] autoscale m_knockCylRetard;Cyl retard;"deg", 0.1, 0, 0, 25, 1
+ 	bit hasKnockRecently;Detected recently
+ 	bit hasKnockRetardNow;Retard active
+ end_struct
+diff --git a/firmware/controllers/engine_cycle/knock_logic.h b/firmware/controllers/engine_cycle/knock_logic.h
+index 97bd3bd..243fd61 100644
+--- a/firmware/controllers/engine_cycle/knock_logic.h
++++ b/firmware/controllers/engine_cycle/knock_logic.h
+@@ -28,7 +28,10 @@ public:
+ 	bool onKnockSenseCompleted(uint8_t cylinderNumber, float dbv, efitick_t lastKnockTime);
+ 
+ 	float getFuelTrimMultiplier() const;
++	// Highest retard among cylinders
+ 	float getKnockRetard() const;
++	// Retard for one cylinder: its own in per cylinder mode, else the shared one
++	float getKnockRetard(size_t cylinderIndex) const;
+ 	uint32_t getKnockCount() const;
+ 
+ 	virtual float getKnockThreshold() const = 0;
+@@ -42,6 +45,10 @@ private:
+ 	Timer m_lastKnockTimer;
+ 
+ 	int8_t m_gain[MAX_CYLINDER_COUNT];
++
++	// Per cylinder mode only, see knockRetardPerCylinder
++	float m_cylinderRetard[MAX_CYLINDER_COUNT] = {};
++	void updateRetardOutputs();
+ };
+ 
+ class KnockController : public KnockControllerBase {
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 6177f13..dd9fb7a 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -1871,7 +1871,7 @@ uint8_t autoscale knockFuelTrim;Maximum Amount of Fuel trim when knock;"%", 1, 0
+ 	bit vvlControlEnabled,"enabled","disabled"
+ 	bit keepIdleSolenoidWhenStopped,"enabled","disabled";By default the idle solenoid is switched off whenever the engine is not turning, to be quieter and save power. Enable this to keep driving it to the position the idle controller asks for, which at zero RPM is the cranking curve for the current coolant temperature - for valves which need to rest somewhere other than de-energized. The valve is only driven for a minute after the engine stops turning, then switched off anyway to protect the coil and the battery.
+ 	bit canSnifferIncludeBus,"Yes","No";Include CAN bus in trace using Elmue SLCAN prefixes (CAN1: none, CAN2: &, CAN3: $). Disable for standard SLCAN clients such as SavvyCAN or slcand. Reconnect the sniffer after changing this setting.
+-	bit unusedBit_Fancy5
++	bit knockRetardPerCylinder,"per cylinder","all cylinders";pro-style: retard timing only on the cylinder that knocked, instead of on all cylinders.
+ 	bit unusedBit_Fancy6
+ 	bit unusedBit_Fancy7
+ 	bit unusedBit_Fancy8
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 4935c44..3d72c70 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -4525,6 +4525,7 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		panel = knockCylinderMapping@@if_ts_show_knock_cylinder_mapping
+ 
+ 	dialog = softwareKnockResponseCfg, "Response"
++		field = "Retard on",				knockRetardPerCylinder
+ 		field = "Retard Aggression",		knockRetardAggression
+ 		field = "Retard Reapply Rate",	knockRetardReapplyRate
+ 		field = "Fuel Trim Aggression",		knockFuelTrimAggression
+diff --git a/unit_tests/tests/test_knock.cpp b/unit_tests/tests/test_knock.cpp
+index b5b14fc..6683e86 100644
+--- a/unit_tests/tests/test_knock.cpp
++++ b/unit_tests/tests/test_knock.cpp
+@@ -248,3 +248,109 @@ TEST(Knock, FuelTrimReapply) {
+ 	// Should have no knock retard
+ 	EXPECT_FLOAT_EQ(dut.getFuelTrimMultiplier(), 1.0);
+ }
++
++// pro-style per cylinder knock retard, see knockRetardPerCylinder
++
++TEST(Knock, PerCylinderRetardsOnlyKnockingCylinder) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->knockRetardPerCylinder = true;
++	engineConfiguration->knockRetardAggression = 10;
++	engineConfiguration->knockSuppressMinTps = 0;
++	setArrayValues(engine->engineState.timingAdvance, 0.0f);
++
++	MockKnockController dut;
++	dut.onFastCallback();
++
++	// strong knock on cylinder 3 only: 10% of the distance from 0 to -20
++	dut.onKnockSenseCompleted(2, 30, 0);
++	EXPECT_FLOAT_EQ(2, dut.getKnockRetard(2));
++	EXPECT_FLOAT_EQ(0, dut.getKnockRetard(0));
++	EXPECT_FLOAT_EQ(0, dut.getKnockRetard(1));
++	EXPECT_FLOAT_EQ(0, dut.getKnockRetard(3));
++	// the shared value shows the highest cylinder retard
++	EXPECT_FLOAT_EQ(2, dut.getKnockRetard());
++	EXPECT_NEAR(2, dut.m_knockCylRetard[2], 0.1);
++	EXPECT_NEAR(0, dut.m_knockCylRetard[0], 0.1);
++
++	// each cylinder is limited on its own
++	for (size_t i = 0; i < 100; i++) {
++		dut.onKnockSenseCompleted(0, 30, 0);
++	}
++	EXPECT_FLOAT_EQ(8, dut.getKnockRetard(0));
++	EXPECT_FLOAT_EQ(2, dut.getKnockRetard(2));
++	EXPECT_FLOAT_EQ(8, dut.getKnockRetard());
++}
++
++TEST(Knock, PerCylinderReapply) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->knockRetardPerCylinder = true;
++	engineConfiguration->knockRetardAggression = 10;
++	engineConfiguration->knockRetardReapplyRate = 1;
++	engineConfiguration->knockSuppressMinTps = 0;
++	setArrayValues(engine->engineState.timingAdvance, 0.0f);
++
++	MockKnockController dut;
++	dut.onFastCallback();
++
++	dut.onKnockSenseCompleted(1, 30, 0);
++	dut.onKnockSenseCompleted(1, 30, 0);
++	dut.onKnockSenseCompleted(3, 30, 0);
++	EXPECT_FLOAT_EQ(4, dut.getKnockRetard(1));
++	EXPECT_FLOAT_EQ(2, dut.getKnockRetard(3));
++
++	constexpr auto fastPeriodSec = FAST_CALLBACK_PERIOD_MS / 1000.0f;
++	dut.onFastCallback();
++	EXPECT_FLOAT_EQ(4 - fastPeriodSec, dut.getKnockRetard(1));
++	EXPECT_FLOAT_EQ(2 - fastPeriodSec, dut.getKnockRetard(3));
++	EXPECT_FLOAT_EQ(4 - fastPeriodSec, dut.getKnockRetard());
++
++	for (size_t i = 0; i < 1000; i++) {
++		dut.onFastCallback();
++	}
++	EXPECT_FLOAT_EQ(0, dut.getKnockRetard(1));
++	EXPECT_FLOAT_EQ(0, dut.getKnockRetard(3));
++	EXPECT_FLOAT_EQ(0, dut.getKnockRetard());
++}
++
++TEST(Knock, AllCylindersModeSharesRetard) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->knockRetardPerCylinder = false;
++	engineConfiguration->knockRetardAggression = 10;
++	engineConfiguration->knockSuppressMinTps = 0;
++	setArrayValues(engine->engineState.timingAdvance, 0.0f);
++
++	MockKnockController dut;
++	dut.onFastCallback();
++
++	dut.onKnockSenseCompleted(0, 30, 0);
++	EXPECT_FLOAT_EQ(2, dut.getKnockRetard());
++	for (size_t cyl = 0; cyl < 4; cyl++) {
++		EXPECT_FLOAT_EQ(2, dut.getKnockRetard(cyl));
++		EXPECT_NEAR(2, dut.m_knockCylRetard[cyl], 0.1);
++	}
++}
++
++TEST(Knock, PerCylinderRetardReachesIgnitionTiming) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->timingMode = TM_DYNAMIC;
++	engineConfiguration->knockRetardPerCylinder = true;
++	engineConfiguration->knockRetardAggression = 10;
++	engineConfiguration->knockRetardReapplyRate = 0;
++	engineConfiguration->knockSuppressMinTps = 0;
++	setArrayValues(config->knockBaseNoise, 20);
++	setTable(config->maxKnockRetardTable, 8);
++	setTable(config->ignitionTable, 15);
++
++	auto& knock = engine->module<KnockController>().unmock();
++	knock.onFastCallback();
++	setArrayValues(engine->engineState.timingAdvance, 0.0f);
++	knock.onKnockSenseCompleted(1, 50, 0);
++	ASSERT_FLOAT_EQ(2, knock.getKnockRetard(1));
++
++	engine->periodicFastCallback();
++
++	EXPECT_NEAR(15, engine->engineState.timingAdvance[0], EPS4D);
++	EXPECT_NEAR(15 - 2, engine->engineState.timingAdvance[1], EPS4D);
++	EXPECT_NEAR(15, engine->engineState.timingAdvance[2], EPS4D);
++	EXPECT_NEAR(15, engine->engineState.timingAdvance[3], EPS4D);
++}
+-- 
+2.43.0
+

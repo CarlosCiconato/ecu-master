@@ -1,0 +1,135 @@
+From 41d43cb4adf1fae9c1a1e6d05bb9da717ea49825 Mon Sep 17 00:00:00 2001
+From: Carlos Ciconato <354919267+CarlosCiconato@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 18:08:47 +0000
+Subject: [PATCH 2/2] nossa_top6c: PCB rascunho 7 swaps MAP (AIN14) to PC0 and
+ AV1 to PF10
+
+MAP is back on ADC1/2 (fast ADC, crank-synced MAP averaging). AV1 is now an
+ADC3 slow input; TPS/PPS defaults moved to AV2..AV5.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../config/boards/nossa_top6c/adc3_slow_config.h    |  2 +-
+ .../boards/nossa_top6c/board_configuration.cpp      |  2 +-
+ .../connectors/generated_ts_name_by_pin.cpp         |  4 ++--
+ .../config/boards/nossa_top6c/connectors/main.yaml  |  8 ++++----
+ .../config/boards/nossa_top6c/nossa_top6c_meta.h    | 13 +++++++------
+ 5 files changed, 15 insertions(+), 14 deletions(-)
+
+diff --git a/firmware/config/boards/nossa_top6c/adc3_slow_config.h b/firmware/config/boards/nossa_top6c/adc3_slow_config.h
+index d076fe6a342..50246606b7b 100644
+--- a/firmware/config/boards/nossa_top6c/adc3_slow_config.h
++++ b/firmware/config/boards/nossa_top6c/adc3_slow_config.h
+@@ -9,6 +9,6 @@
+ 
+ #define ADC3_SLOW_CHANNELS { \
+ 	EFI_ADC_35, /* PF9  ADC3_IN7, AV11 */ \
+-	EFI_ADC_36, /* PF10 ADC3_IN8, AIN14 internal MAP */ \
++	EFI_ADC_36, /* PF10 ADC3_IN8, AV1 */ \
+ 	EFI_ADC_37, /* PF3  ADC3_IN9, AIN13 */ \
+ }
+diff --git a/firmware/config/boards/nossa_top6c/board_configuration.cpp b/firmware/config/boards/nossa_top6c/board_configuration.cpp
+index 42e61cc9836..fb8d29884a2 100644
+--- a/firmware/config/boards/nossa_top6c/board_configuration.cpp
++++ b/firmware/config/boards/nossa_top6c/board_configuration.cpp
+@@ -104,7 +104,7 @@ static void setupDefaultSensorInputs() {
+ 	engineConfiguration->iat.adcChannel = TOP6C_IN_IAT;
+ 	engineConfiguration->tps1_1AdcChannel = TOP6C_IN_TPS;
+ 
+-	// Internal MAP sensor MPXH6400A (4 bar) on AIN14 / PF10 (ADC3 only: no crank-synced MAP averaging)
++	// Internal MAP sensor MPXH6400A (4 bar) on AIN14 / PC0 (ADC1/2: fast ADC, crank-synced MAP averaging works)
+ 	engineConfiguration->map.sensor.hwChannel = TOP6C_IN_MAP;
+ 	engineConfiguration->map.sensor.type = MT_MPXH6400;
+ 
+diff --git a/firmware/config/boards/nossa_top6c/connectors/generated_ts_name_by_pin.cpp b/firmware/config/boards/nossa_top6c/connectors/generated_ts_name_by_pin.cpp
+index e4b4a3bc8dc..a28cbbb9ac1 100644
+--- a/firmware/config/boards/nossa_top6c/connectors/generated_ts_name_by_pin.cpp
++++ b/firmware/config/boards/nossa_top6c/connectors/generated_ts_name_by_pin.cpp
+@@ -33,7 +33,7 @@ const char* getBoardSpecificPinName(brain_pin_e brainPin) {
+ 		case Gpio::B15:
+ 			return "Lowside 3";
+ 		case Gpio::C0:
+-			return "Analog Volt 1";
++			return "Analog In 14 MAP";
+ 		case Gpio::C1:
+ 			return "Analog Volt 2";
+ 		case Gpio::C2:
+@@ -93,7 +93,7 @@ const char* getBoardSpecificPinName(brain_pin_e brainPin) {
+ 		case Gpio::F1:
+ 			return "Switch 2";
+ 		case Gpio::F10:
+-			return "Analog In 14 MAP";
++			return "Analog Volt 1";
+ 		case Gpio::F11:
+ 			return "Switch 4";
+ 		case Gpio::F2:
+diff --git a/firmware/config/boards/nossa_top6c/connectors/main.yaml b/firmware/config/boards/nossa_top6c/connectors/main.yaml
+index b774589fd0c..b3ec55cbb04 100644
+--- a/firmware/config/boards/nossa_top6c/connectors/main.yaml
++++ b/firmware/config/boards/nossa_top6c/connectors/main.yaml
+@@ -299,10 +299,10 @@ pins:
+     function: "5V supply 2 OK"
+     type: din
+ 
+-  - id: [C0, EFI_ADC_10]
++  - id: [F10, EFI_ADC_36]
+     class: [switch_inputs, analog_inputs]
+     ts_name: Analog Volt 1
+-    function: "Analog Volt 1 (PC0)"
++    function: "Analog Volt 1 (PF10)"
+     type: av
+ 
+   - id: [C1, EFI_ADC_11]
+@@ -395,10 +395,10 @@ pins:
+     function: "Analog In 13 (PF3)"
+     type: av
+ 
+-  - id: [F10, EFI_ADC_36]
++  - id: [C0, EFI_ADC_10]
+     class: [switch_inputs, analog_inputs]
+     ts_name: Analog In 14 MAP
+-    function: "Analog In 14 MAP (PF10)"
++    function: "Analog In 14 MAP (PC0)"
+     type: av
+ 
+   - id: [A7, EFI_ADC_7]
+diff --git a/firmware/config/boards/nossa_top6c/nossa_top6c_meta.h b/firmware/config/boards/nossa_top6c/nossa_top6c_meta.h
+index 4a9badbe4db..3a86f09faec 100644
+--- a/firmware/config/boards/nossa_top6c/nossa_top6c_meta.h
++++ b/firmware/config/boards/nossa_top6c/nossa_top6c_meta.h
+@@ -83,7 +83,7 @@
+ #define TOP6C_ESP_IO0 I5
+ 
+ // Analog inputs
+-#define TOP6C_IN_AV_1 EFI_ADC_10   // PC0
++#define TOP6C_IN_AV_1 EFI_ADC_36   // PF10, ADC3 only (connector B1), PCB rascunho 7
+ #define TOP6C_IN_AV_2 EFI_ADC_11   // PC1
+ #define TOP6C_IN_AV_3 EFI_ADC_12   // PC2
+ #define TOP6C_IN_AV_4 EFI_ADC_13   // PC3
+@@ -99,17 +99,18 @@
+ #define TOP6C_IN_AT_3 EFI_ADC_8    // PB0
+ #define TOP6C_IN_AT_4 EFI_ADC_9    // PB1
+ #define TOP6C_IN_AIN_13 EFI_ADC_37 // PF3, ADC3 only
+-#define TOP6C_IN_AIN_14 EFI_ADC_36 // PF10, ADC3 only: internal MAP MPXH6400A (or external MAP)
++#define TOP6C_IN_AIN_14 EFI_ADC_10 // PC0, ADC1/2: internal MAP MPXH6400A or external MAP (connector B17), PCB rascunho 7
+ #define TOP6C_IN_VBATT EFI_ADC_7   // PA7, divider 82k/10k
+ 
+ // Suggested defaults
+ #define TOP6C_IN_MAP TOP6C_IN_AIN_14
+ #define TOP6C_IN_CLT TOP6C_IN_AT_1
+ #define TOP6C_IN_IAT TOP6C_IN_AT_2
+-#define TOP6C_IN_TPS TOP6C_IN_AV_1
+-#define TOP6C_IN_TPS1_2 TOP6C_IN_AV_2
+-#define TOP6C_IN_PPS TOP6C_IN_AV_3
+-#define TOP6C_IN_PPS2 TOP6C_IN_AV_4
++// TPS/PPS kept off AV1: AV1 is ADC3 slow, shared with knock (stale reads during knock windows).
++#define TOP6C_IN_TPS TOP6C_IN_AV_2
++#define TOP6C_IN_TPS1_2 TOP6C_IN_AV_3
++#define TOP6C_IN_PPS TOP6C_IN_AV_4
++#define TOP6C_IN_PPS2 TOP6C_IN_AV_5
+ 
+ // Thermistor pull-up, copied from Proteus. CHECK against the PCB.
+ #define TOP6C_DEFAULT_AT_PULLUP 2700
+-- 
+2.39.5 (Apple Git-154)
+

@@ -1,0 +1,159 @@
+From 2cb968d26f6269aa08ca35f92083325f53d2bf66 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:19:36 +0000
+Subject: [PATCH] Cranking timing by coolant temperature (pro-style)
+
+New curve crankingAdvanceCltBins/crankingAdvanceCltAdder adds degrees to the cranking
+timing (table or fixed angle) by coolant temperature. Default is all zeros, so no change;
+a failed CLT sensor adds nothing.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../algo/defaults/default_cranking.cpp        |  4 +++
+ .../algo/ignition/ignition_state.cpp          | 15 +++++++--
+ firmware/integration/rusefi_config.txt        |  2 ++
+ firmware/tunerstudio/tunerstudio.template.ini |  9 +++++
+ .../test_ignition_state.cpp                   | 33 +++++++++++++++++++
+ 5 files changed, 61 insertions(+), 2 deletions(-)
+
+diff --git a/firmware/controllers/algo/defaults/default_cranking.cpp b/firmware/controllers/algo/defaults/default_cranking.cpp
+index aa5fa75..5f06725 100644
+--- a/firmware/controllers/algo/defaults/default_cranking.cpp
++++ b/firmware/controllers/algo/defaults/default_cranking.cpp
+@@ -35,6 +35,10 @@ void setDefaultCranking() {
+ 	setLinearCurve(config->cltCrankingCorrBins, CLT_CURVE_RANGE_FROM, 100, 1);
+ 	setLinearCurve(config->cltCrankingCorr, 50, 50, 1); // now as % of idle valve/etb
+ 
++	// cranking timing by CLT: no change by default
++	setLinearCurve(config->crankingAdvanceCltBins, -40, 100, 1);
++	setArrayValues(config->crankingAdvanceCltAdder, 0);
++
+ #if CRANKING_CURVE_SIZE == 8
+ 	// Cranking temperature compensation
+ 	static const float crankingCoef[] = {
+diff --git a/firmware/controllers/algo/ignition/ignition_state.cpp b/firmware/controllers/algo/ignition/ignition_state.cpp
+index 07bd730..d964085 100644
+--- a/firmware/controllers/algo/ignition/ignition_state.cpp
++++ b/firmware/controllers/algo/ignition/ignition_state.cpp
+@@ -234,16 +234,27 @@ angle_t getAdvanceCorrections(float engineLoad) {
+ /**
+  * @return ignition timing angle advance before TDC for Cranking
+  */
++static angle_t getCrankingAdvanceCltAdder() {
++	// pro-style cranking timing by coolant temperature, 0 = no change
++	auto clt = Sensor::get(SensorType::Clt);
++	if (!clt.Valid) {
++		return 0;
++	}
++	return interpolate2d(clt.Value, config->crankingAdvanceCltBins, config->crankingAdvanceCltAdder);
++}
++
+ angle_t getCrankingAdvance(float rpm, float engineLoad) {
++	angle_t cltAdder = getCrankingAdvanceCltAdder();
++
+ 	// get advance from the separate table for Cranking
+ 	if (engineConfiguration->useSeparateAdvanceForCranking) {
+-		return interpolate2d(rpm, config->crankingAdvanceBins, config->crankingAdvance);
++		return interpolate2d(rpm, config->crankingAdvanceBins, config->crankingAdvance) + cltAdder;
+ 	}
+ 
+ 	// Interpolate the cranking timing angle to the earlier running angle for faster engine start
+ 	angle_t crankingToRunningTransitionAngle = getRunningAdvance(engineConfiguration->cranking.rpm, engineLoad);
+ 	// interpolate not from zero, but starting from min. possible rpm detected
+-	return interpolateClamped(engine->rpmCalculator.getMinCrankingRpm(), engineConfiguration->crankingTimingAngle, engineConfiguration->cranking.rpm, crankingToRunningTransitionAngle, rpm);
++	return interpolateClamped(engine->rpmCalculator.getMinCrankingRpm(), engineConfiguration->crankingTimingAngle + cltAdder, engineConfiguration->cranking.rpm, crankingToRunningTransitionAngle, rpm);
+ }
+ #endif // EFI_ENGINE_CONTROL && EFI_SHAFT_POSITION_INPUT
+ 
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 63a3d0f..f9e05f2 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2182,6 +2182,8 @@ float[TMF_RATIO_SIZE x TMF_SIZE] tmfTable;;"", 1, 0, 0, 255, 2
+ 
+ uint16_t[CRANKING_ADVANCE_CURVE_SIZE] crankingAdvanceBins;Optional timing advance table for Cranking (see useSeparateAdvanceForCranking);"RPM", 1, 0, 0, 25000, 0
+ int16_t[CRANKING_ADVANCE_CURVE_SIZE] autoscale crankingAdvance;Optional timing advance table for Cranking (see useSeparateAdvanceForCranking);"deg", 0.01, 0, -20, 90, 2
++int8_t[CLT_CRANKING_CURVE_SIZE] crankingAdvanceCltBins;pro-style cranking timing by coolant temperature;"C", 1, 0, -40, 120, 0
++int8_t[CLT_CRANKING_CURVE_SIZE] autoscale crankingAdvanceCltAdder;Added to the cranking timing, by coolant temperature. 0 = no change.;"deg", 0.5, 0, -20, 20, 1
+ uint8_t[CLT_CURVE_SIZE] autoscale iacCoastingRpmBins;RPM-based idle position for coasting;"RPM", @@RPM_AS_BYTE_SCALE@@, 0, 0, @@RPM_AS_BYTE_LIMIT@@, 0
+ uint8_t[CLT_CURVE_SIZE] autoscale iacCoasting;    RPM-based idle position for coasting;"%", 0.5, 0, 0, 100, 1
+ 
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 7ed0ac9..d0d21d1 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -955,6 +955,14 @@ include_file controllers/actuators/boost_control.curves.ini
+ 		yBins		= crankingAdvance
+ 		gauge		= RPMGauge
+ 
++	curve = crankingAdvanceCltCurve, "Cranking timing by CLT"
++		columnLabel = "Coolant", "degrees"
++		xAxis		= -40, 120, 9
++		yAxis		= -20, 20, 9
++		xBins		= crankingAdvanceCltBins, coolantTemperature
++		yBins		= crankingAdvanceCltAdder
++		gauge		= CLTGauge
++
+ 	curve = fuelLevelCurve, "Fuel Level"
+ 		columnLabel = "Voltage", "%"
+ 		xAxis		= 0, 5, 6
+@@ -5298,6 +5306,7 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "Timing Advance mode",	useSeparateAdvanceForCranking
+ 		field = "Fixed cranking advance",	crankingTimingAngle, {useSeparateAdvanceForCranking == 0}
+ 		field = "Fixed Cranking Dwell",						ignitionDwellForCrankingMs
++		panel = crankingAdvanceCltCurve
+ 
+ 	dialog = primingFuelPulsePanel, "Priming fuel pulse"
+ 		topicHelp = "primingFuelPulsePanelHelp"
+diff --git a/unit_tests/tests/ignition_injection/test_ignition_state.cpp b/unit_tests/tests/ignition_injection/test_ignition_state.cpp
+index 373647b..b3d47e3 100644
+--- a/unit_tests/tests/ignition_injection/test_ignition_state.cpp
++++ b/unit_tests/tests/ignition_injection/test_ignition_state.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include "pch.h"
+ #include "ignition_state.h"
++#include "advance_map.h"
+ 
+ using ::testing::_;
+ 
+@@ -339,3 +340,35 @@ TEST(ignition_state, getSparkDwellTableAndVoltageCorrection) {
+   engine->ignitionState.updateDwell(3000, false);
+   EXPECT_NEAR(10, engine->ignitionState.getDwell(), EPS2D);
+ }
++
++// pro-style cranking timing by coolant temperature
++TEST(ignition_state, crankingAdvanceByClt) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->useSeparateAdvanceForCranking = true;
++	setArrayValues(config->crankingAdvance, 10);
++
++	// default curve changes nothing
++	Sensor::setMockValue(SensorType::Clt, 20);
++	EXPECT_NEAR(10, getCrankingAdvance(200, 50), EPS2D);
++
++	// cold engine gets more timing, hot engine less
++	static const int8_t bins[] = { -20, 0, 20, 40, 60, 80, 100, 120 };
++	static const float adder[] = { 6, 4, 2, 0, 0, -2, -4, -4 };
++	copyArray(config->crankingAdvanceCltBins, bins);
++	copyArray(config->crankingAdvanceCltAdder, adder);
++
++	Sensor::setMockValue(SensorType::Clt, 0);
++	EXPECT_NEAR(14, getCrankingAdvance(200, 50), EPS2D);
++	Sensor::setMockValue(SensorType::Clt, 90);
++	EXPECT_NEAR(7, getCrankingAdvance(200, 50), EPS2D);
++
++	// failed CLT sensor: no adder
++	Sensor::setInvalidMockValue(SensorType::Clt);
++	EXPECT_NEAR(10, getCrankingAdvance(200, 50), EPS2D);
++
++	// also applies to the fixed cranking angle, at the bottom of the taper
++	engineConfiguration->useSeparateAdvanceForCranking = false;
++	engineConfiguration->crankingTimingAngle = 8;
++	Sensor::setMockValue(SensorType::Clt, 0);
++	EXPECT_NEAR(12, getCrankingAdvance(engine->rpmCalculator.getMinCrankingRpm(), 50), EPS2D);
++}
+-- 
+2.43.0
+

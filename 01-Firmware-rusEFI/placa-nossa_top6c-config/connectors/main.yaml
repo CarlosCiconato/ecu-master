@@ -1,0 +1,413 @@
+pins:
+  - id: H6
+    class: outputs
+    ts_name: Lowside 1
+    function: "Injector 1 / Lowside 1"
+    type: inj
+
+  - id: B14
+    class: outputs
+    ts_name: Lowside 2
+    function: "Injector 2 / Lowside 2"
+    type: inj
+
+  - id: B15
+    class: outputs
+    ts_name: Lowside 3
+    function: "Injector 3 / Lowside 3"
+    type: inj
+
+  - id: D9
+    class: outputs
+    ts_name: Lowside 4
+    function: "Injector 4 / Lowside 4"
+    type: inj
+
+  - id: G3
+    class: outputs
+    ts_name: Lowside 5
+    function: "Injector 5 / Lowside 5"
+    type: inj
+
+  - id: G4
+    class: outputs
+    ts_name: Lowside 6
+    function: "Injector 6 / Lowside 6"
+    type: inj
+
+  - id: G5
+    class: outputs
+    ts_name: Lowside 7
+    function: "Injector 7 / Lowside 7"
+    type: inj
+
+  - id: G6
+    class: outputs
+    ts_name: Lowside 8
+    function: "Injector 8 / Lowside 8"
+    type: inj
+
+  - id: G8
+    class: outputs
+    ts_name: Lowside 9
+    function: "Lowside 9"
+    type: ls
+
+  - id: C7
+    class: outputs
+    ts_name: Lowside 10
+    function: "Lowside 10"
+    type: ls
+
+  - id: C8
+    class: outputs
+    ts_name: Lowside 11
+    function: "Lowside 11"
+    type: ls
+
+  - id: A8
+    class: outputs
+    ts_name: Lowside 12
+    function: "Lowside 12"
+    type: ls
+
+  - id: D10
+    class: outputs
+    ts_name: Lowside 13
+    function: "Lowside 13"
+    type: ls
+
+  - id: D11
+    class: outputs
+    ts_name: Lowside 14
+    function: "Lowside 14"
+    type: ls
+
+  - id: D15
+    class: outputs
+    ts_name: Lowside 15
+    function: "Lowside 15"
+    type: ls
+
+  - id: G2
+    class: outputs
+    ts_name: Lowside 16
+    function: "Lowside 16"
+    type: ls
+
+  - id: E2
+    class: outputs
+    ts_name: Lowside 17
+    function: "Lowside 17"
+    type: ls
+
+  - id: E3
+    class: outputs
+    ts_name: Lowside 18
+    function: "Lowside 18"
+    type: ls
+
+  - id: E4
+    class: outputs
+    ts_name: Lowside 19
+    function: "Lowside 19"
+    type: ls
+
+  - id: E5
+    class: outputs
+    ts_name: Lowside 20
+    function: "Lowside 20"
+    type: ls
+
+  - id: D14
+    class: outputs
+    ts_name: Ignition 1
+    function: "Ignition 1 (logic level, smart coil)"
+    type: ign
+
+  - id: H8
+    class: outputs
+    ts_name: Ignition 2
+    function: "Ignition 2 (logic level, smart coil)"
+    type: ign
+
+  - id: H10
+    class: outputs
+    ts_name: Ignition 3
+    function: "Ignition 3 (logic level, smart coil)"
+    type: ign
+
+  - id: H11
+    class: outputs
+    ts_name: Ignition 4
+    function: "Ignition 4 (logic level, smart coil)"
+    type: ign
+
+  - id: D3
+    class: outputs
+    ts_name: Ignition 5
+    function: "Ignition 5 (logic level, smart coil)"
+    type: ign
+
+  - id: I0
+    class: outputs
+    ts_name: Ignition 6
+    function: "Ignition 6 (logic level, smart coil)"
+    type: ign
+
+  - id: H15
+    class: outputs
+    ts_name: Ignition 7
+    function: "Ignition 7 (logic level, smart coil)"
+    type: ign
+
+  - id: G7
+    class: outputs
+    ts_name: Ignition 8
+    function: "Ignition 8 (logic level, smart coil)"
+    type: ign
+
+  - id: H9
+    class: outputs
+    ts_name: Highside 1
+    function: "Highside 1 12V"
+    type: hs
+
+  - id: H7
+    class: outputs
+    ts_name: Highside 2
+    function: "Highside 2 12V"
+    type: hs
+
+  - id: H12
+    class: outputs
+    ts_name: Highside 3
+    function: "Highside 3 12V"
+    type: hs
+
+  - id: D8
+    class: outputs
+    ts_name: Highside 4
+    function: "Highside 4 12V"
+    type: hs
+
+  - id: G9
+    class: outputs
+    ts_name: VR1 Hall pullup
+    function: "Hall pull-up enable for VR1 input"
+    type: ls
+
+  - id: G14
+    class: outputs
+    ts_name: VR2 Hall pullup
+    function: "Hall pull-up enable for VR2 input"
+    type: ls
+
+  - id: D6
+    class: outputs
+    ts_name: VR3 Hall pullup
+    function: "Hall pull-up enable for VR3 input"
+    type: ls
+
+  - id: E7
+    class: event_inputs
+    ts_name: VR 1
+    function: "VR1 trigger input (crank)"
+    type: vr
+
+  - id: E8
+    class: event_inputs
+    ts_name: VR 2
+    function: "VR2 trigger input (cam)"
+    type: vr
+
+  - id: A10
+    class: event_inputs
+    ts_name: VR 3
+    function: "VR3 trigger input"
+    type: vr
+
+  - id: [C6, C6]
+    class: [event_inputs, switch_inputs]
+    ts_name: Digital 1
+    function: "Digital input 1"
+    type: din
+
+  - id: [E11, E11]
+    class: [event_inputs, switch_inputs]
+    ts_name: Digital 2
+    function: "Digital input 2"
+    type: din
+
+  - id: [E12, E12]
+    class: [event_inputs, switch_inputs]
+    ts_name: Digital 3
+    function: "Digital input 3"
+    type: din
+
+  - id: [E14, E14]
+    class: [event_inputs, switch_inputs]
+    ts_name: Digital 4
+    function: "Digital input 4"
+    type: din
+
+  - id: [E13, E13]
+    class: [event_inputs, switch_inputs]
+    ts_name: Digital 5
+    function: "Digital input 5"
+    type: din
+
+  - id: [E15, E15]
+    class: [event_inputs, switch_inputs]
+    ts_name: Digital 6
+    function: "Digital input 6"
+    type: din
+
+  - id: F0
+    class: switch_inputs
+    ts_name: Switch 1
+    function: "Switch 1"
+    type: din
+
+  - id: F1
+    class: switch_inputs
+    ts_name: Switch 2
+    function: "Switch 2"
+    type: din
+
+  - id: F2
+    class: switch_inputs
+    ts_name: Switch 3
+    function: "Switch 3"
+    type: din
+
+  - id: F11
+    class: switch_inputs
+    ts_name: Switch 4
+    function: "Switch 4"
+    type: din
+
+  - id: H2
+    class: switch_inputs
+    ts_name: 5V supply 1 OK
+    function: "5V supply 1 OK"
+    type: din
+
+  - id: H3
+    class: switch_inputs
+    ts_name: 5V supply 2 OK
+    function: "5V supply 2 OK"
+    type: din
+
+  - id: [F10, EFI_ADC_36]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 1
+    function: "Analog Volt 1 (PF10)"
+    type: av
+
+  - id: [C1, EFI_ADC_11]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 2
+    function: "Analog Volt 2 (PC1)"
+    type: av
+
+  - id: [C2, EFI_ADC_12]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 3
+    function: "Analog Volt 3 (PC2)"
+    type: av
+
+  - id: [C3, EFI_ADC_13]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 4
+    function: "Analog Volt 4 (PC3)"
+    type: av
+
+  - id: [A0, EFI_ADC_0]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 5
+    function: "Analog Volt 5 (PA0)"
+    type: av
+
+  - id: [A1, EFI_ADC_1]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 6
+    function: "Analog Volt 6 (PA1)"
+    type: av
+
+  - id: [A2, EFI_ADC_2]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 7
+    function: "Analog Volt 7 (PA2)"
+    type: av
+
+  - id: [A3, EFI_ADC_3]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 8
+    function: "Analog Volt 8 (PA3)"
+    type: av
+
+  - id: [A4, EFI_ADC_4]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 9
+    function: "Analog Volt 9 (PA4)"
+    type: av
+
+  - id: [A5, EFI_ADC_5]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 10
+    function: "Analog Volt 10 (PA5)"
+    type: av
+
+  - id: [F9, EFI_ADC_35]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Volt 11
+    function: "Analog Volt 11 (PF9)"
+    type: av
+
+  - id: [C4, EFI_ADC_14]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Temp 1
+    function: "Analog Temp 1 (PC4)"
+    type: at
+
+  - id: [C5, EFI_ADC_15]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Temp 2
+    function: "Analog Temp 2 (PC5)"
+    type: at
+
+  - id: [B0, EFI_ADC_8]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Temp 3
+    function: "Analog Temp 3 (PB0)"
+    type: at
+
+  - id: [B1, EFI_ADC_9]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog Temp 4
+    function: "Analog Temp 4 (PB1)"
+    type: at
+
+  - id: [F3, EFI_ADC_37]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog In 13
+    function: "Analog In 13 (PF3)"
+    type: av
+
+  - id: [C0, EFI_ADC_10]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Analog In 14 MAP
+    function: "Analog In 14 MAP (PC0)"
+    type: av
+
+  - id: [A7, EFI_ADC_7]
+    class: [switch_inputs, analog_inputs]
+    ts_name: Battery Sense
+    function: "Battery Sense (PA7)"
+    type: av
+
+info:
+  title: Nossa Top 6C
+  name: Main
+  cid: main

@@ -1,0 +1,156 @@
+From c55f52e146ca9707f360ffe53d1b1fdcd63dc765 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 09:51:51 +0000
+Subject: [PATCH] Closed loop only between a minimum and a maximum RPM
+ (pro-style)
+
+New stft.minRpm / stft.maxRpm (0 = no limit). Outside the window the short term trim
+is off (state stftDisabledRpmWindow), so the engine runs on the base map.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../algo/auto_generated_commonenum.cpp        |  2 +
+ firmware/controllers/algo/rusefi_enums.h      |  4 +-
+ .../controllers/math/closed_loop_fuel.cpp     |  6 +++
+ firmware/integration/rusefi_config.txt        |  2 +
+ firmware/tunerstudio/secondary_panels.ini     |  2 +
+ firmware/tunerstudio/tunerstudio.template.ini |  2 +-
+ unit_tests/tests/test_stft.cpp                | 40 +++++++++++++++++++
+ 7 files changed, 56 insertions(+), 2 deletions(-)
+
+diff --git a/firmware/controllers/algo/auto_generated_commonenum.cpp b/firmware/controllers/algo/auto_generated_commonenum.cpp
+index 48bf9cd..e513e5d 100644
+--- a/firmware/controllers/algo/auto_generated_commonenum.cpp
++++ b/firmware/controllers/algo/auto_generated_commonenum.cpp
+@@ -1125,6 +1125,8 @@ const char *getStft_state_e(stft_state_e value) {
+ 			return "stftDisabledLaunch";
+ 		case stftDisabledRPM:
+ 			return "stftDisabledRPM";
++		case stftDisabledRpmWindow:
++			return "stftDisabledRpmWindow";
+ 		case stftDisabledSettings:
+ 			return "stftDisabledSettings";
+ 		case stftDisabledTpsAccel:
+diff --git a/firmware/controllers/algo/rusefi_enums.h b/firmware/controllers/algo/rusefi_enums.h
+index 8bb3e94..d8e8757 100644
+--- a/firmware/controllers/algo/rusefi_enums.h
++++ b/firmware/controllers/algo/rusefi_enums.h
+@@ -962,7 +962,9 @@ typedef enum __attribute__ ((__packed__)) {
+ 	stftDisabledDFCO = 7,
+ 	stftDisabledTpsAccel = 8,
+ 	stftDisabledFuelCut = 9,
+-	stftDisabledLaunch = 10
++	stftDisabledLaunch = 10,
++	// outside the closed loop RPM window (correction state)
++	stftDisabledRpmWindow = 11
+ } stft_state_e;
+ 
+ typedef enum __attribute__((__packed__)) {
+diff --git a/firmware/controllers/math/closed_loop_fuel.cpp b/firmware/controllers/math/closed_loop_fuel.cpp
+index c233738..2a08f9e 100644
+--- a/firmware/controllers/math/closed_loop_fuel.cpp
++++ b/firmware/controllers/math/closed_loop_fuel.cpp
+@@ -84,6 +84,12 @@ stft_state_e ShortTermFuelTrim::getCorrectionState() {
+ 		return stftDisabledRPM;
+ 	}
+ 
++	// pro-style closed loop RPM window, 0 = no limit
++	float rpm = Sensor::getOrZero(SensorType::Rpm);
++	if ((cfg.minRpm != 0 && rpm < cfg.minRpm) || (cfg.maxRpm != 0 && rpm > cfg.maxRpm)) {
++		return stftDisabledRpmWindow;
++	}
++
+ 	// Startup delay - allow O2 sensor to warm up, etc
+ 	if (cfg.startupDelay > engine->fuelComputer.running.timeSinceCrankingInSecs) {
+ 		return stftDisabledCrankingDelay;
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index ca95a77..f4aaa2c 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -378,6 +378,8 @@ struct stft_s
+ 	uint8_t autoscale minAfr;Below this AFR, correction is paused;"afr", 0.1, 0, 10, 20, 1
+ 	uint8_t autoscale maxAfr;Above this AFR, correction is paused;"afr", 0.1, 0, 10, 20, 1
+ 	uint8_t startupDelay;Time after startup before closed loop operation is allowed.;"seconds", 1, 0, 0, 250, 0
++	uint16_t minRpm;Closed loop runs only above this RPM. 0 = no limit.;"RPM", 1, 0, 0, 20000, 0
++	uint16_t maxRpm;Closed loop runs only below this RPM. 0 = no limit.;"RPM", 1, 0, 0, 20000, 0
+ 
+ 	stft_cell_cfg_s[STFT_CELL_COUNT iterate] cellCfgs;
+ end_struct
+diff --git a/firmware/tunerstudio/secondary_panels.ini b/firmware/tunerstudio/secondary_panels.ini
+index fee12ae..4ba19c8 100644
+--- a/firmware/tunerstudio/secondary_panels.ini
++++ b/firmware/tunerstudio/secondary_panels.ini
+@@ -301,6 +301,8 @@
+ 		field = "Settings used for both correction and learning:"
+ 		field = "Minimum CLT",							stft_minClt, { isSTFT }
+ 		field = "Startup delay"							stft_startupDelay, { isSTFT }
++		field = "Minimum RPM (0 = no limit)",			stft_minRpm, { isSTFT }
++		field = "Maximum RPM (0 = no limit)",			stft_maxRpm, { isSTFT }
+ 		field = "After DFCO delay",						noFuelTrimAfterDfcoTime, { isSTFT }
+ 		field = "Detect Tuning and Suspend",			isTuningDetectorEnabled, { isSTFT }
+ 		field = "Settings used for learning only:"
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index b420f37..c3999d5 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -467,7 +467,7 @@ include_file @@TUNING_SECTION_FILE@@
+ 	; keep in sync with ft_region_e in rusefi_enums.h
+ 	stftBinIdxList = bits, U08, [0:1], "Idle", "Overrun", "Power", "Normal"
+ 	; keep in sync with stft_state_e in rusefi_enums.h
+-	stftStateList = bits, U08, [0:3], "Enabled", "Settings", "Tuning", "RPM", "Cranking Delay", "Clt", "AFR out of range", "DFCO", "TPS Accel", "Fuel Cut", "Launch"
++	stftStateList = bits, U08, [0:3], "Enabled", "Settings", "Tuning", "RPM", "Cranking Delay", "Clt", "AFR out of range", "DFCO", "TPS Accel", "Fuel Cut", "Launch", "RPM window"
+ 
+ 	unitsLabels = bits, U08, [0:2], @@UNITS_FAHRENHEIT@@ , @@UNITS_CELSIUS@@
+ 	pressureUnitsLabels = bits, U08, [0:2], @@UNITS_PSI@@, @@UNITS_KPA@@
+diff --git a/unit_tests/tests/test_stft.cpp b/unit_tests/tests/test_stft.cpp
+index e495825..932e6aa 100644
+--- a/unit_tests/tests/test_stft.cpp
++++ b/unit_tests/tests/test_stft.cpp
+@@ -496,3 +496,43 @@ TEST_F(ShortTermFuelTrimBehavior, IntegrationUsesTargetLambdaAndClampsTimeConsta
+ }
+ 
+ } // namespace
++
++// pro-style: closed loop only between a minimum and a maximum RPM
++TEST(ClosedLoopFuel, RpmWindow) {
++	ShortTermFuelTrim stft;
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++
++	engineConfiguration->fuelClosedLoopCorrectionEnabled = true;
++	engineConfiguration->stft.minClt = -40;
++	engineConfiguration->stft.startupDelay = 0;
++	Sensor::setMockValue(SensorType::Clt, 80);
++	engine->rpmCalculator.setRpmValue(3000);
++	Sensor::setMockValue(SensorType::Rpm, 3000);
++	ASSERT_TRUE(engine->rpmCalculator.isRunning());
++
++	// 0 = no limit
++	engineConfiguration->stft.minRpm = 0;
++	engineConfiguration->stft.maxRpm = 0;
++	EXPECT_EQ(stftEnabled, stft.getCorrectionState());
++
++	engineConfiguration->stft.minRpm = 1500;
++	engineConfiguration->stft.maxRpm = 5000;
++	EXPECT_EQ(stftEnabled, stft.getCorrectionState());
++
++	Sensor::setMockValue(SensorType::Rpm, 1200);
++	EXPECT_EQ(stftDisabledRpmWindow, stft.getCorrectionState());
++
++	Sensor::setMockValue(SensorType::Rpm, 6000);
++	EXPECT_EQ(stftDisabledRpmWindow, stft.getCorrectionState());
++
++	// only the maximum set
++	engineConfiguration->stft.minRpm = 0;
++	Sensor::setMockValue(SensorType::Rpm, 800);
++	EXPECT_EQ(stftEnabled, stft.getCorrectionState());
++
++	// outside the window there is no correction
++	Sensor::setMockValue(SensorType::Rpm, 6000);
++	auto result = stft.getCorrection(6000, 50);
++	EXPECT_EQ(stftDisabledRpmWindow, stft.stftCorrectionState);
++	EXPECT_FLOAT_EQ(1, result.banks[0]);
++}
+-- 
+2.43.0
+

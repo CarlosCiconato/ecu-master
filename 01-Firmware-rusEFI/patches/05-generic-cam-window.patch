@@ -1,0 +1,475 @@
+From 99923ee225b6123cb0e0c239bd2d00afb1083d2e Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 18:08:33 +0000
+Subject: [PATCH] Generic cam decoder with detection window and tooth count
+ check (pro-style)
+
+New vvtMode "Generic window": a cam with any number of teeth syncs only on the
+tooth inside a configurable crank-degree window, and can refuse sync when the
+teeth counted per cam turn do not match.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../algo/auto_generated_commonenum.cpp        |   2 +
+ .../algo/defaults/default_base_engine.cpp     |   5 +
+ firmware/controllers/algo/engine.cpp          |   1 +
+ firmware/controllers/algo/rusefi_enums.h      |   6 +
+ .../controllers/trigger/trigger_central.cpp   |  50 +++++
+ .../controllers/trigger/trigger_central.h     |  11 ++
+ .../controllers/trigger/trigger_central.txt   |   2 +
+ firmware/integration/rusefi_config.txt        |   7 +-
+ firmware/tunerstudio/tunerstudio.template.ini |  12 ++
+ unit_tests/tests/tests.mk                     |   1 +
+ .../tests/trigger/test_generic_cam_window.cpp | 175 ++++++++++++++++++
+ 11 files changed, 271 insertions(+), 1 deletion(-)
+ create mode 100644 unit_tests/tests/trigger/test_generic_cam_window.cpp
+
+diff --git a/firmware/controllers/algo/auto_generated_commonenum.cpp b/firmware/controllers/algo/auto_generated_commonenum.cpp
+index 106aa13..48bf9cd 100644
+--- a/firmware/controllers/algo/auto_generated_commonenum.cpp
++++ b/firmware/controllers/algo/auto_generated_commonenum.cpp
+@@ -1238,6 +1238,8 @@ const char *getVvt_mode_e(vvt_mode_e value) {
+ 			return "VVT_FORD_COYOTE";
+ 		case VVT_FORD_ST170:
+ 			return "VVT_FORD_ST170";
++		case VVT_GENERIC_WINDOW:
++			return "VVT_GENERIC_WINDOW";
+ 		case VVT_HONDA_CBR_600:
+ 			return "VVT_HONDA_CBR_600";
+ 		case VVT_HONDA_K_EXHAUST:
+diff --git a/firmware/controllers/algo/defaults/default_base_engine.cpp b/firmware/controllers/algo/defaults/default_base_engine.cpp
+index 49ac582..7d6c319 100644
+--- a/firmware/controllers/algo/defaults/default_base_engine.cpp
++++ b/firmware/controllers/algo/defaults/default_base_engine.cpp
+@@ -472,6 +472,11 @@ void setDefaultBaseEngine() {
+ 	// Trigger
+ 	engineConfiguration->trigger.type = trigger_type_e::TT_TOOTHED_WHEEL_60_2;
+ 
++	// Generic cam decoder: a 20 degree detection window, no tooth count check
++	for (size_t i = 0; i < CAM_INPUTS_COUNT; i++) {
++		config->camSyncWindowWidth[i] = 20;
++	}
++
+ #if EFI_SIMULATOR
+ 	engineConfiguration->vvtMode[0] = VVT_SINGLE_TOOTH;
+ 	engineConfiguration->vvtOffsets[0] = 450;
+diff --git a/firmware/controllers/algo/engine.cpp b/firmware/controllers/algo/engine.cpp
+index 2527526..626dbb7 100644
+--- a/firmware/controllers/algo/engine.cpp
++++ b/firmware/controllers/algo/engine.cpp
+@@ -89,6 +89,7 @@ trigger_type_e getVvtTriggerType(vvt_mode_e vvtMode) {
+ 	case VVT_HONDA_K_INTAKE:
+ 	case VVT_SINGLE_TOOTH:
+ 	case VVT_MAP_V_TWIN:
++	case VVT_GENERIC_WINDOW:
+ 		return trigger_type_e::TT_HALF_MOON;
+ 	case VVT_FORD_ST170:
+ 		return trigger_type_e::TT_FORD_ST170;
+diff --git a/firmware/controllers/algo/rusefi_enums.h b/firmware/controllers/algo/rusefi_enums.h
+index 81f136e..08a7da4 100644
+--- a/firmware/controllers/algo/rusefi_enums.h
++++ b/firmware/controllers/algo/rusefi_enums.h
+@@ -148,6 +148,12 @@ typedef enum  __attribute__ ((__packed__)) {
+ 
+   VVT_NISSAN_VK56DE = 35,
+ 
++  /**
++   * pro-style generic cam decoder: any number of teeth, only the tooth inside
++   * a configurable detection window is used for sync, see camSyncWindowStart
++   */
++  VVT_GENERIC_WINDOW = 36,
++
+ } vvt_mode_e;
+ 
+ typedef enum __attribute__ ((__packed__)) {
+diff --git a/firmware/controllers/trigger/trigger_central.cpp b/firmware/controllers/trigger/trigger_central.cpp
+index 2a3d00a..94772ac 100644
+--- a/firmware/controllers/trigger/trigger_central.cpp
++++ b/firmware/controllers/trigger/trigger_central.cpp
+@@ -137,6 +137,7 @@ static bool vvtWithRealDecoder(vvt_mode_e vvtMode) {
+ 			&& vvtMode != VVT_TOYOTA_3_TOOTH /* VVT_2JZ is an unusual 3/0 missed tooth symmetrical wheel */
+ 			&& vvtMode != VVT_HONDA_K_INTAKE
+ 			&& vvtMode != VVT_MAP_V_TWIN
++			&& vvtMode != VVT_GENERIC_WINDOW
+ 			&& !boardIsSpecialVvtDecoder(vvtMode)
+ 			&& vvtMode != VVT_SINGLE_TOOTH;
+ }
+@@ -203,6 +204,7 @@ static angle_t adjustCrankPhase(int camIndex) {
+ 	case VVT_MITSUBISHI_4G63:
+ 		return tc->syncEnginePhaseAndReport(crankDivider, 1);
+ 	case VVT_SINGLE_TOOTH:
++	case VVT_GENERIC_WINDOW:
+ 	case VVT_NISSAN_VQ:
+ 	case VVT_BOSCH_QUICK_START:
+ 	case VVT_BMW_VANOS_RELUCTOR:
+@@ -325,6 +327,47 @@ void hwHandleVvtCamSignal(TriggerValue front, efitick_t nowNt, int index) {
+ /**
+  * @returns true if tooth should be ignored
+  */
++bool isInCamSyncWindow(angle_t position, float windowStart, float windowWidth) {
++	// The window is given in crank degrees, so it matches in both crank turns of the engine cycle
++	float fromStart = fmodf(position - windowStart, 360);
++	if (fromStart < 0) {
++		fromStart += 360;
++	}
++	return fromStart < windowWidth;
++}
++
++void TriggerCentral::resetCamWindow(int index) {
++	m_camWindowToothCount[index] = 0;
++	m_camWindowSeen[index] = false;
++}
++
++void TriggerCentral::countCamWindowTooth(int index) {
++	if (m_camWindowToothCount[index] < UINT8_MAX) {
++		m_camWindowToothCount[index]++;
++	}
++}
++
++bool TriggerCentral::acceptCamWindowTooth(int index, angle_t currentPosition) {
++	if (!isInCamSyncWindow(currentPosition, config->camSyncWindowStart[index], config->camSyncWindowWidth[index])) {
++		// not the sync tooth
++		return false;
++	}
++
++	// teeth seen since the previous sync tooth, this one included
++	uint8_t counted = m_camWindowToothCount[index];
++	bool hadPrevious = m_camWindowSeen[index];
++	m_camWindowToothCount[index] = 0;
++	m_camWindowSeen[index] = true;
++
++	uint8_t expected = config->camSyncToothCount[index];
++	if (expected != 0 && hadPrevious && counted != expected) {
++		// missing or extra teeth (noise, or a window that also catches a tooth on the other crank turn)
++		camWindowToothErrors++;
++		return false;
++	}
++	return true;
++}
++
+ PUBLIC_API_WEAK bool skipToothSpecialShape(size_t index, vvt_mode_e vvtMode, angle_t currentPosition) {
+ 	UNUSED(index);
+ 
+@@ -389,6 +432,7 @@ void handleVvtCamSignal(TriggerValue front, efitick_t nowNt, int index) {
+ 
+ 	// If the main trigger is not synchronized, don't decode VVT yet
+ 	if (!tc->triggerState.getShaftSynchronized()) {
++		tc->resetCamWindow(index);
+ 		return;
+ 	}
+ 
+@@ -406,6 +450,7 @@ void handleVvtCamSignal(TriggerValue front, efitick_t nowNt, int index) {
+ 
+     // here we count all cams together
+ 	tc->vvtCamCounter++;
++	tc->countCamWindowTooth(index);
+ 
+ 	auto currentPhase = tc->getCurrentEnginePhase(nowNt);
+ 	if (!currentPhase) {
+@@ -433,6 +478,11 @@ void handleVvtCamSignal(TriggerValue front, efitick_t nowNt, int index) {
+ 	auto vvtPosition = engineConfiguration->vvtOffsets[bankIndex * CAMS_PER_BANK + camIndex] - currentPosition;
+ 	tc->triggerState.vvtToothPosition[index] = vvtPosition;
+ 
++	if (engineConfiguration->vvtMode[camIndex] == VVT_GENERIC_WINDOW
++			&& !tc->acceptCamWindowTooth(index, currentPosition)) {
++		return;
++	}
++
+   bool skipTooth = skipToothSpecialShape(index, engineConfiguration->vvtMode[camIndex], currentPosition);
+   if (skipTooth) {
+ 			return;
+diff --git a/firmware/controllers/trigger/trigger_central.h b/firmware/controllers/trigger/trigger_central.h
+index eb28d0d..0555d7f 100644
+--- a/firmware/controllers/trigger/trigger_central.h
++++ b/firmware/controllers/trigger/trigger_central.h
+@@ -208,6 +208,12 @@ public:
+ 
+ 	void applyCamGapOverride();
+ 	bool isMapCamSync(efitick_t nowNt, float currentPhase);
++
++	// Generic cam decoder (VVT_GENERIC_WINDOW)
++	void resetCamWindow(int index);
++	void countCamWindowTooth(int index);
++	// true if this tooth is the sync tooth: inside the detection window, with the expected tooth count
++	bool acceptCamWindowTooth(int index, angle_t currentPosition);
+ private:
+ 	void decodeMapCam(int triggerIndexForListeners, efitick_t nowNt, float currentPhase);
+ 	void applyTriggerGapOverride();
+@@ -222,8 +228,13 @@ private:
+ 	// At what engine phase do we expect the next tooth to arrive?
+ 	// Used for checking whether your trigger pattern is correct.
+ 	expected<float> expectedNextPhase = unexpected;
++
++	uint8_t m_camWindowToothCount[CAM_INPUTS_COUNT] = {};
++	bool m_camWindowSeen[CAM_INPUTS_COUNT] = {};
+ };
+ 
++bool isInCamSyncWindow(angle_t position, float windowStart, float windowWidth);
++
+ void triggerInfo(void);
+ void hwHandleShaftSignal(int signalIndex, bool isRising, efitick_t timestamp);
+ void handleShaftSignal(int signalIndex, bool isRising, efitick_t timestamp);
+diff --git a/firmware/controllers/trigger/trigger_central.txt b/firmware/controllers/trigger/trigger_central.txt
+index 281cb27..dfc7597 100644
+--- a/firmware/controllers/trigger/trigger_central.txt
++++ b/firmware/controllers/trigger/trigger_central.txt
+@@ -25,4 +25,6 @@ struct_no_prefix trigger_central_s
+ 
+ 	uint32_t triggerElapsedUs
+ 
++	uint16_t camWindowToothErrors;Sync: generic cam tooth count errors
++
+ end_struct
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index c78cd1d..131e1f2 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -441,7 +441,7 @@ custom debug_mode_e 1 bits, U08, @OFFSET@, [0:5], @@debug_mode_e_enum@@
+ #define canReWidebandHwIndex_enum "Idx 0", "Idx 1", "Idx 2", "Idx 3", "Idx 4", "Idx 5", "Idx 6", "Idx 7", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID"
+ 
+ !                       0                                                                                                                                         9                                                                                                                                    17 unused  18                 19             20            21           22         23                                                                          28                29         30                          32
+-#define vvt_mode_e_enum "Inactive", "Single Tooth", "Toyota 3 Tooth Even/2JZ", "Miata NB2", "Mitsu 4G69", "Bosch Quick Start", "4/1", "ST 170", "Ford Barra 3+1", "Nissan VQ", "Honda K Intake", "Nissan MR18", "Mitsu 3A92", "Sync by MAP", "not working 7736 Chrysler Phaser", "Mazda Skyactiv", "Honda K Exhaust", "BMW VANOS Reluctor", "Mitsubishi 4G63", "Ford Coyote", "Mitsu 6G72", "Honda 600", "Mazda L", "Dev", "HR12DDR In", @@VVT_25_NAME@@, @@VVT_26_NAME@@, "Toyota 3 Tooth UZ", "Subaru 3-1-2-1", "INVALID", "INVALID", "Mitsu 6G75", "INVALID", "INVALID", "INVALID", "Nissan VK56DE PHASE"
++#define vvt_mode_e_enum "Inactive", "Single Tooth", "Toyota 3 Tooth Even/2JZ", "Miata NB2", "Mitsu 4G69", "Bosch Quick Start", "4/1", "ST 170", "Ford Barra 3+1", "Nissan VQ", "Honda K Intake", "Nissan MR18", "Mitsu 3A92", "Sync by MAP", "not working 7736 Chrysler Phaser", "Mazda Skyactiv", "Honda K Exhaust", "BMW VANOS Reluctor", "Mitsubishi 4G63", "Ford Coyote", "Mitsu 6G72", "Honda 600", "Mazda L", "Dev", "HR12DDR In", @@VVT_25_NAME@@, @@VVT_26_NAME@@, "Toyota 3 Tooth UZ", "Subaru 3-1-2-1", "INVALID", "INVALID", "Mitsu 6G75", "INVALID", "INVALID", "INVALID", "Nissan VK56DE PHASE", "Generic window"
+ custom vvt_mode_e 1 bits, U08, @OFFSET@, [0:6], @@vvt_mode_e_enum@@
+ 
+ ! At the moment TIM1, TIM2, TIM3 and TIM9 are configured as ICU
+@@ -2639,6 +2639,11 @@ alert_s[ALERT_COUNT iterate] alerts;
+ int16_t[ETB_SPEED_CURVE_SIZE] etbSpeedCltBins;;"C", 1, 0, -40, 150, 0
+ uint16_t[ETB_SPEED_CURVE_SIZE] etbOpenSpeed;Maximum throttle opening speed. 0 means no limit.;"%/s", 1, 0, 0, 5000, 0
+ uint16_t[ETB_SPEED_CURVE_SIZE] etbCloseSpeed;Maximum throttle closing speed. 0 means no limit.;"%/s", 1, 0, 0, 5000, 0
++
++! Generic cam decoder, used by cams with vvtMode "Generic window"
++int16_t[CAM_INPUTS_COUNT iterate] camSyncWindowStart;Start of the window where the sync tooth must show up, in crank degrees (0 to 360) as shown by "Primary Position". Teeth outside the window are ignored for sync.;"deg", 1, 0, 0, 360, 0
++uint8_t[CAM_INPUTS_COUNT iterate] camSyncWindowWidth;Width of the detection window. This is the tolerance for the sync tooth position.;"deg", 1, 0, 1, 180, 0
++uint8_t[CAM_INPUTS_COUNT iterate] camSyncToothCount;Cam teeth per cam turn (two crank turns). Sync is refused when the teeth counted between two sync teeth do not match. 0 means no check.;"teeth", 1, 0, 0, 60, 0
+ end_struct
+ 
+ #define PPS_OK_INDICATOR "Pedal OK"
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 48f881b..2d6981c 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -2681,7 +2681,13 @@ cmd_set_engine_type_default					= "@@TS_IO_TEST_COMMAND_char@@@@ts_command_e_TS_
+ 		field = @@CAM_1_MODE_NAME@@,				vvtMode1, {trigger_type != @@trigger_type_e_TT_MAZDA_MIATA_NA@@}
+ 		field = "2JZ Tooth Detection Position",                     camDecoder2jzPosition, 1, {vvtMode1 == @@vvt_mode_e_VVT_TOYOTA_3_TOOTH@@}
+ 		field = "2JZ Detection Precision",                    camDecoder2jzPrecision, 1, {vvtMode1 == @@vvt_mode_e_VVT_TOYOTA_3_TOOTH@@}
++		field = "Generic: intake window start",		camSyncWindowStart1, {vvtMode1 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@}
++		field = "Generic: intake window width",		camSyncWindowWidth1, {vvtMode1 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@}
++		field = "Generic: intake teeth per cam turn",	camSyncToothCount1, {vvtMode1 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@}
+ 		field = @@CAM_2_MODE_NAME@@,				vvtMode2, {trigger_type != @@trigger_type_e_TT_MAZDA_MIATA_NA@@}@@if_ts_show_cam2
++		field = "Generic: exhaust window start",		camSyncWindowStart2, {vvtMode2 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@}@@if_ts_show_cam2
++		field = "Generic: exhaust window width",		camSyncWindowWidth2, {vvtMode2 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@}@@if_ts_show_cam2
++		field = "Generic: exhaust teeth per cam turn",	camSyncToothCount2, {vvtMode2 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@}@@if_ts_show_cam2
+ 		field = ""
+ 		field = @@CAM_INPUT_1_1_NAME@@,			camInputs1, { camInputs1 != 0 || (vvtMode1 != @@vvt_mode_e_VVT_INACTIVE@@ ) }@@if_ts_show_cam1
+ 		field = "Cam sensor bank 1 exhaust",		camInputs2, { camInputs2 != 0 || (vvtMode2 != @@vvt_mode_e_VVT_INACTIVE@@ && camInputs1 != 0 ) }@@if_ts_show_cam2
+@@ -2696,6 +2702,12 @@ cmd_set_engine_type_default					= "@@TS_IO_TEST_COMMAND_char@@@@ts_command_e_TS_
+ 		field = "VVT offset bank 1 exhaust",			vvtOffsets2, { camInputs2 != 0 }@@if_ts_show_cam2
+ 		field = "VVT offset bank 2 intake",				vvtOffsets3, { camInputs3 != 0 }@@if_ts_show_bank2_cam1
+ 		field = "VVT offset bank 2 exhaust",			vvtOffsets4, { camInputs4 != 0 }@@if_ts_show_bank2_cam2
++		field = "Generic: bank 2 intake window start",	camSyncWindowStart3, { camInputs3 != 0 && vvtMode1 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@ }@@if_ts_show_bank2_cam1
++		field = "Generic: bank 2 intake window width",	camSyncWindowWidth3, { camInputs3 != 0 && vvtMode1 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@ }@@if_ts_show_bank2_cam1
++		field = "Generic: bank 2 intake teeth",		camSyncToothCount3, { camInputs3 != 0 && vvtMode1 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@ }@@if_ts_show_bank2_cam1
++		field = "Generic: bank 2 exhaust window start",	camSyncWindowStart4, { camInputs4 != 0 && vvtMode2 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@ }@@if_ts_show_bank2_cam2
++		field = "Generic: bank 2 exhaust window width",	camSyncWindowWidth4, { camInputs4 != 0 && vvtMode2 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@ }@@if_ts_show_bank2_cam2
++		field = "Generic: bank 2 exhaust teeth",		camSyncToothCount4, { camInputs4 != 0 && vvtMode2 == @@vvt_mode_e_VVT_GENERIC_WINDOW@@ }@@if_ts_show_bank2_cam2
+ 		field = ""@@if_ts_show_sync_cam
+ 		field = "Cam for engine sync resolution",		engineSyncCam, { vvtMode1 != @@vvt_mode_e_VVT_INACTIVE@@ || vvtMode2 != @@vvt_mode_e_VVT_INACTIVE@@ }@@if_ts_show_sync_cam
+ 
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 6d339eb..3969b1c 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -30,6 +30,7 @@ TESTS_SRC_CPP = \
+ 	tests/trigger/test_trigger_rpm_startup.cpp \
+ 	tests/trigger/test_miata_na_tdc.cpp \
+ 	tests/trigger/test_cam_vvt_input.cpp \
++	tests/trigger/test_generic_cam_window.cpp \
+ 	tests/trigger/test_2jz_vvt.cpp \
+ 	tests/trigger/test_toyota_3_tooth_cam.cpp \
+ 	tests/trigger/test_trigger_skipped_wheel.cpp \
+diff --git a/unit_tests/tests/trigger/test_generic_cam_window.cpp b/unit_tests/tests/trigger/test_generic_cam_window.cpp
+new file mode 100644
+index 0000000..3722db4
+--- /dev/null
++++ b/unit_tests/tests/trigger/test_generic_cam_window.cpp
+@@ -0,0 +1,175 @@
++/*
++ * test_generic_cam_window.cpp
++ *
++ * pro-style generic cam decoder: any number of cam teeth, only the tooth inside the
++ * detection window gives engine phase, with an optional tooth count check.
++ */
++
++#include "pch.h"
++
++// Engine cycle is 100ms at 1200 RPM: one crank tooth per turn (half moon) at 0 and 50ms.
++// The cam has 4 evenly spaced teeth plus one extra tooth on the first crank turn only.
++static const int evenTeethMs[] = { 5, 30, 55, 80 };
++static const int extraToothMs = 12;
++static const int noiseToothMs = 40;
++
++struct CamRun {
++	bool evenTeeth = true;
++	bool extraTooth = true;
++	// cycle with one extra noise tooth, -1 for none
++	int noiseCycle = -1;
++};
++
++static void setupCrankAndCam(EngineTestHelper& eth, vvt_mode_e mode) {
++	engineConfiguration->triggerInputPins[1] = Gpio::Unassigned;
++	setCrankOperationMode();
++	engineConfiguration->vvtMode[0] = mode;
++	engineConfiguration->vvtOffsets[0] = 0;
++	eth.setTriggerType(trigger_type_e::TT_HALF_MOON);
++	engineConfiguration->camInputs[0] = Gpio::A10;
++}
++
++static bool isEvenTooth(int ms) {
++	for (int tooth : evenTeethMs) {
++		if (tooth == ms) {
++			return true;
++		}
++	}
++	return false;
++}
++
++static void runCycles(EngineTestHelper& eth, const CamRun& run, int fromCycle, int cycles) {
++	for (int cycle = fromCycle; cycle < fromCycle + cycles; cycle++) {
++		for (int ms = 0; ms < 100; ms++) {
++			eth.moveTimeForwardUs(MS2US(1));
++
++			if (ms % 50 == 0) {
++				eth.firePrimaryTriggerRise();
++			} else if (ms % 50 == 25) {
++				eth.firePrimaryTriggerFall();
++			}
++
++			bool camTooth = (run.evenTeeth && isEvenTooth(ms))
++				|| (run.extraTooth && ms == extraToothMs)
++				|| (cycle == run.noiseCycle && ms == noiseToothMs);
++			if (camTooth) {
++				hwHandleVvtCamSignal(TriggerValue::RISE, getTimeNowNt(), 0);
++			}
++		}
++	}
++}
++
++// Single tooth decoder fed with just one tooth: gives the reference VVT position and the
++// position of that tooth, used to place the generic window
++static float referenceToothPosition(int toothMs, float* vvtPosition) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupCrankAndCam(eth, VVT_SINGLE_TOOTH);
++
++	float toothPosition = 0;
++	for (int cycle = 0; cycle < 20; cycle++) {
++		for (int ms = 0; ms < 100; ms++) {
++			eth.moveTimeForwardUs(MS2US(1));
++			if (ms % 50 == 0) {
++				eth.firePrimaryTriggerRise();
++			} else if (ms % 50 == 25) {
++				eth.firePrimaryTriggerFall();
++			}
++			if (ms == toothMs) {
++				hwHandleVvtCamSignal(TriggerValue::RISE, getTimeNowNt(), 0);
++				toothPosition = engine->triggerCentral.triggerState.vvtCurrentPosition;
++			}
++		}
++	}
++
++	EXPECT_TRUE(engine->triggerCentral.triggerState.hasSynchronizedPhase());
++	*vvtPosition = engine->triggerCentral.getVVTPosition(0, 0);
++	return toothPosition;
++}
++
++static void setWindowAround(float position, uint8_t toothCount) {
++	config->camSyncWindowStart[0] = position - 10;
++	config->camSyncWindowWidth[0] = 20;
++	config->camSyncToothCount[0] = toothCount;
++}
++
++TEST(GenericCamWindow, WindowMatchesBothCrankTurns) {
++	EXPECT_TRUE(isInCamSyncWindow(355, 350, 20));
++	EXPECT_TRUE(isInCamSyncWindow(5, 350, 20));
++	EXPECT_TRUE(isInCamSyncWindow(365, 0, 10));
++	EXPECT_TRUE(isInCamSyncWindow(725, 0, 10));
++	EXPECT_TRUE(isInCamSyncWindow(-10, 340, 30));
++	EXPECT_FALSE(isInCamSyncWindow(30, 0, 20));
++	EXPECT_FALSE(isInCamSyncWindow(200, 0, 20));
++	EXPECT_FALSE(isInCamSyncWindow(345, 350, 20));
++}
++
++TEST(GenericCamWindow, SyncsOnWindowToothAmongManyTeeth) {
++	float referenceVvt;
++	float extraPosition = referenceToothPosition(extraToothMs, &referenceVvt);
++
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupCrankAndCam(eth, VVT_GENERIC_WINDOW);
++	setWindowAround(extraPosition, 5);
++
++	CamRun run;
++	runCycles(eth, run, 0, 20);
++
++	EXPECT_TRUE(engine->triggerCentral.triggerState.hasSynchronizedPhase());
++	// same engine phase and VVT position as a cam with only the sync tooth
++	EXPECT_NEAR(referenceVvt, engine->triggerCentral.getVVTPosition(0, 0), 0.5);
++	EXPECT_EQ(0, engine->triggerCentral.camWindowToothErrors);
++
++	// stays put over more cycles
++	runCycles(eth, run, 20, 10);
++	EXPECT_NEAR(referenceVvt, engine->triggerCentral.getVVTPosition(0, 0), 0.5);
++}
++
++TEST(GenericCamWindow, NoiseToothRefusesOneSync) {
++	float referenceVvt;
++	float extraPosition = referenceToothPosition(extraToothMs, &referenceVvt);
++
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupCrankAndCam(eth, VVT_GENERIC_WINDOW);
++	setWindowAround(extraPosition, 5);
++
++	CamRun run;
++	run.noiseCycle = 15;
++	runCycles(eth, run, 0, 20);
++
++	// the noise tooth makes 6 teeth on one cam turn: that sync tooth is refused, once
++	EXPECT_EQ(1, engine->triggerCentral.camWindowToothErrors);
++	EXPECT_TRUE(engine->triggerCentral.triggerState.hasSynchronizedPhase());
++	EXPECT_NEAR(referenceVvt, engine->triggerCentral.getVVTPosition(0, 0), 0.5);
++}
++
++TEST(GenericCamWindow, WindowOnEvenToothIsRefused) {
++	float referenceVvt;
++	// tooth at 5ms has a twin at 55ms, exactly one crank turn later
++	float evenPosition = referenceToothPosition(evenTeethMs[0], &referenceVvt);
++
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupCrankAndCam(eth, VVT_GENERIC_WINDOW);
++	setWindowAround(evenPosition, 5);
++
++	CamRun run;
++	runCycles(eth, run, 0, 20);
++
++	// the window catches a tooth on both crank turns, so the tooth count never matches
++	EXPECT_GT(engine->triggerCentral.camWindowToothErrors, 30);
++}
++
++TEST(GenericCamWindow, NoToothCountCheckWhenZero) {
++	float referenceVvt;
++	float extraPosition = referenceToothPosition(extraToothMs, &referenceVvt);
++
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupCrankAndCam(eth, VVT_GENERIC_WINDOW);
++	setWindowAround(extraPosition, 0);
++
++	CamRun run;
++	run.noiseCycle = 15;
++	runCycles(eth, run, 0, 20);
++
++	EXPECT_EQ(0, engine->triggerCentral.camWindowToothErrors);
++	EXPECT_NEAR(referenceVvt, engine->triggerCentral.getVVTPosition(0, 0), 0.5);
++}
+-- 
+2.43.0
+

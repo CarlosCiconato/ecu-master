@@ -1,0 +1,22 @@
+#define ts_show_canbus_sniffer true
+
+#define LUA_SCRIPT_SIZE 48000
+
+! huge buffer for happier remote TCP/IP connector - see also 'blockingFactorOverride' in console source code
+#define CUSTOM_TS_BUFFER_SIZE 32000
+
+#define TMF_SIZE 8
+
+#define CLT_IDLE_TABLE_RPM_SIZE 6
+
+! pro-style bigger main tables on the F7 (more flash and RAM than the F4):
+! 24 RPM x 20 load points for VE, Injection time (ms), ignition and lambda tables.
+! The extra tunes and the LTFT tables follow the same sizes.
+#define VE_RPM_COUNT 24
+#define VE_LOAD_COUNT 20
+#define INJ_TIME_RPM_COUNT 24
+#define INJ_TIME_LOAD_COUNT 20
+#define IGN_RPM_COUNT 24
+#define IGN_LOAD_COUNT 20
+#define FUEL_RPM_COUNT 24
+#define FUEL_LOAD_COUNT 20

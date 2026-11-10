@@ -1,0 +1,307 @@
+From 20d6c38f905a96fd8135976551e2977d7fb11bc3 Mon Sep 17 00:00:00 2001
+From: Carlos Ciconato <354919267+CarlosCiconato@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 15:45:04 +0000
+Subject: [PATCH] Throttle speed limit by coolant temperature (pro-style)
+
+Optional opening and closing speed curves (%/s) by CLT for the
+electronic throttle target, applied before the ETB rev limiter so that
+one is never slowed down. 0 in a point means no limit.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../actuators/electronic_throttle.cpp         | 31 +++++++
+ .../actuators/electronic_throttle_impl.h      | 13 +++
+ .../algo/defaults/default_base_engine.cpp     |  2 +
+ firmware/integration/rusefi_config.txt        |  8 +-
+ firmware/tunerstudio/top_level_menu.ini       |  1 +
+ firmware/tunerstudio/tunerstudio.template.ini | 22 +++++
+ .../tests/actuators/test_etb_speed_limit.cpp  | 93 +++++++++++++++++++
+ unit_tests/tests/tests.mk                     |  1 +
+ 8 files changed, 170 insertions(+), 1 deletion(-)
+ create mode 100644 unit_tests/tests/actuators/test_etb_speed_limit.cpp
+
+diff --git a/firmware/controllers/actuators/electronic_throttle.cpp b/firmware/controllers/actuators/electronic_throttle.cpp
+index f361d01..925cd0d 100644
+--- a/firmware/controllers/actuators/electronic_throttle.cpp
++++ b/firmware/controllers/actuators/electronic_throttle.cpp
+@@ -358,6 +358,9 @@ expected<percent_t> EtbController::getSetpointEtb() {
+ 	// Clamp before rev limiter to avoid ineffective rev limit due to crazy out of range position target
+ 	targetPosition = clampPercentValue(targetPosition);
+ 
++	// Throttle speed limit by CLT, before the rev limiter so that one is never slowed down
++	targetPosition = m_speedLimiter.apply(targetPosition, Sensor::getOrZero(SensorType::Clt), getTimeNowNt());
++
+ 	// Lastly, apply ETB rev limiter
+ 	auto etbRpmLimit = engineConfiguration->etbRevLimitStart;
+ 	if (etbRpmLimit != 0) {
+@@ -384,6 +387,34 @@ expected<percent_t> EtbController::getSetpointEtb() {
+ 	return targetPosition;
+ }
+ 
++percent_t EtbSpeedLimiter::apply(percent_t target, float clt, efitick_t nowNt) {
++	if (!engineConfiguration->etbSpeedLimitEnabled || !m_hasPrevious) {
++		m_hasPrevious = true;
++		m_previous = target;
++		m_timer.reset(nowNt);
++		return target;
++	}
++
++	// Guard against a long gap (first call after a pause) allowing a jump
++	float dt = std::min(m_timer.getElapsedSecondsAndReset(nowNt), 0.1f);
++
++	float delta = target - m_previous;
++	if (delta > 0) {
++		float openSpeed = interpolate2d(clt, config->etbSpeedCltBins, config->etbOpenSpeed);
++		if (openSpeed > 0) {
++			delta = std::min(delta, openSpeed * dt);
++		}
++	} else if (delta < 0) {
++		float closeSpeed = interpolate2d(clt, config->etbSpeedCltBins, config->etbCloseSpeed);
++		if (closeSpeed > 0) {
++			delta = std::max(delta, -closeSpeed * dt);
++		}
++	}
++
++	m_previous += delta;
++	return m_previous;
++}
++
+ void EtbController::setLuaAdjustment(float adjustment) {
+ 	luaAdjustment = adjustment;
+ 	m_luaAdjustmentTimer.reset();
+diff --git a/firmware/controllers/actuators/electronic_throttle_impl.h b/firmware/controllers/actuators/electronic_throttle_impl.h
+index a9e0f05..1289790 100644
+--- a/firmware/controllers/actuators/electronic_throttle_impl.h
++++ b/firmware/controllers/actuators/electronic_throttle_impl.h
+@@ -130,12 +130,25 @@ private:
+ #endif
+ 
+ 	Timer m_luaAdjustmentTimer;
++	EtbSpeedLimiter m_speedLimiter;
+ 
+ 	efitimeus_t lastTickUs;
+ };
+ 
+ void etbPidReset();
+ 
++// pro-style throttle speed limit: opening and closing speed (%/s) by coolant temperature
++class EtbSpeedLimiter {
++public:
++	// Moves toward the requested target no faster than the configured speed
++	percent_t apply(percent_t target, float clt, efitick_t nowNt);
++
++private:
++	bool m_hasPrevious = false;
++	percent_t m_previous = 0;
++	Timer m_timer;
++};
++
+ class EtbController1 : public EtbController { };
+ 
+ class EtbController2 : public EtbController {
+diff --git a/firmware/controllers/algo/defaults/default_base_engine.cpp b/firmware/controllers/algo/defaults/default_base_engine.cpp
+index f432539..49ac582 100644
+--- a/firmware/controllers/algo/defaults/default_base_engine.cpp
++++ b/firmware/controllers/algo/defaults/default_base_engine.cpp
+@@ -437,6 +437,8 @@ void setDefaultBaseEngine() {
+ 	engineConfiguration->cutFuelOnHardLimit = true;
+ 	engineConfiguration->cutSparkOnHardLimit = true;
+ 	engineConfiguration->etbRevLimitRange = 250;
++	// Throttle speed limit by CLT is off by default; 0 means no limit
++	setLinearCurve(config->etbSpeedCltBins, -20, 100, 1);
+ 
+   engineConfiguration->tpsAccelFractionDivisor = 1;
+ 
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index eaa10ac..c78cd1d 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -1887,7 +1887,7 @@ uint8_t autoscale knockFuelTrim;Maximum Amount of Fuel trim when knock;"%", 1, 0
+ 	bit gearDetectionRpmSourceIsInputShaftSpeed,"Input Shaft Speed","Engine RPM";RPM source when Speed Source is Output Shaft Speed. Main Vehicle Speed retains automatic input-shaft selection when that sensor is registered.
+ 	bit injTimeUseTps,"TPS","MAP";Load axis of the Injection time (ms) table. MAP is in kPa, TPS in %.
+ 	bit progressiveRevLimitEnabled,"enabled","disabled";pro-style progressive rev limiter: spark cut ramps from the start cut % to 100% inside the window below the RPM limit.
+-	bit unusedBit_Fancy21
++	bit etbSpeedLimitEnabled,"enabled","disabled";pro-style throttle speed limit: maximum opening and closing speed of the electronic throttle by coolant temperature.
+ 	bit transmissionSlipDetectionEnabled,"enabled","disabled";Compare the selected Slip RPM Source with expected RPM for the detected gear. Requires Speed Source = Output Shaft Speed, a valid gear and the minimum vehicle speed. Wheel-based references cannot identify transmission slip.
+ 	bit transmissionSlipRpmSourceIsInputShaftSpeed,"Input Shaft Speed","Engine RPM";Input Shaft Speed measures internal gearbox slip. Engine RPM also includes clutch or torque-converter slip. Accurate gear ratios are required.
+ 	bit unusedBit_Fancy24
+@@ -2633,6 +2633,12 @@ end_struct
+ 
+ uint16_t[ALERT_CURVE_SIZE] alertRpmBins;;"RPM", 1, 0, 0, 18000, 0
+ alert_s[ALERT_COUNT iterate] alerts;
++
++! Throttle speed limit by coolant temperature, see etbSpeedLimitEnabled
++#define ETB_SPEED_CURVE_SIZE 8
++int16_t[ETB_SPEED_CURVE_SIZE] etbSpeedCltBins;;"C", 1, 0, -40, 150, 0
++uint16_t[ETB_SPEED_CURVE_SIZE] etbOpenSpeed;Maximum throttle opening speed. 0 means no limit.;"%/s", 1, 0, 0, 5000, 0
++uint16_t[ETB_SPEED_CURVE_SIZE] etbCloseSpeed;Maximum throttle closing speed. 0 means no limit.;"%/s", 1, 0, 0, 5000, 0
+ end_struct
+ 
+ #define PPS_OK_INDICATOR "Pedal OK"
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index c1cff91..7e5e9ac 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -219,6 +219,7 @@
+ 		subMenu = std_separator				@@if_ts_show_etb
+ 		subMenu = etbDialog,				"Electronic Throttle Body actuator"@@if_ts_show_etb
+ 		subMenu = etbTpsBiasCurve,			"ETB bias curve (feed forward)"@@if_ts_show_etb_bias_curve
++		subMenu = etbSpeedLimitSettings,	"Throttle speed by coolant temperature"@@if_ts_show_etb
+ 		subMenu = pedalToTpsTbl,			@@pedalToTpsTbl_NAME@@ @@if_ts_show_etb
+ 		subMenu = throttle2TrimTbl,			"ETB #2 Trim", { isTps2Primary } @@if_ts_show_tps2
+ 
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 9b9340f..48f881b 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -855,6 +855,22 @@ include_file controllers/actuators/boost_control.curves.ini
+ 		xBins		= alertRpmBins, RPMValue
+ 		yBins		= alerts8_curve
+ 
++	curve = etbOpenSpeedCurve, "Throttle opening speed by CLT"
++		columnLabel = "Coolant", "Speed"
++		xAxis		= -40, 120, 9
++		yAxis		= 0, 2000, 9
++		xBins		= etbSpeedCltBins, coolantTemperature
++		yBins		= etbOpenSpeed
++		gauge		= CLTGauge
++
++	curve = etbCloseSpeedCurve, "Throttle closing speed by CLT"
++		columnLabel = "Coolant", "Speed"
++		xAxis		= -40, 120, 9
++		yAxis		= 0, 2000, 9
++		xBins		= etbSpeedCltBins, coolantTemperature
++		yBins		= etbCloseSpeed
++		gauge		= CLTGauge
++
+ 	curve = cltRevLimitCurve, ""
+ 		columnLabel = "Coolant", "RPM Limit"
+ 		xAxis		= @@DEFAULT_CLT_AXIS_LOW_VALUE@@, { cltHighXaxis }, 9
+@@ -5062,6 +5078,12 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "High oil pressure protection timeout", maxOilPressureTimeout
+ 		panel = maximumOilPressure
+ 
++	dialog = etbSpeedLimitSettings, "Throttle speed by coolant temperature"
++		field = "Limit throttle speed",					etbSpeedLimitEnabled
++		field = "0 %/s in a point means no limit there."
++		panel = etbOpenSpeedCurve, { etbSpeedLimitEnabled }
++		panel = etbCloseSpeedCurve, { etbSpeedLimitEnabled }
++
+ 	dialog = etbLimits, "Electronic Throttle Limiting"
+ 		field = "Smoothly close the throttle to limit RPM."
+ 		field = "Soft limiter start",				etbRevLimitStart
+diff --git a/unit_tests/tests/actuators/test_etb_speed_limit.cpp b/unit_tests/tests/actuators/test_etb_speed_limit.cpp
+new file mode 100644
+index 0000000..f38c8e7
+--- /dev/null
++++ b/unit_tests/tests/actuators/test_etb_speed_limit.cpp
+@@ -0,0 +1,93 @@
++#include "pch.h"
++
++#include "electronic_throttle_impl.h"
++#include "mocks.h"
++
++using ::testing::_;
++using ::testing::StrictMock;
++
++// pro-style throttle speed limit: opening and closing speed (%/s) by coolant temperature
++
++class EtbSpeedLimit : public testing::Test {
++protected:
++	EngineTestHelper eth{engine_type_e::TEST_ENGINE};
++	EtbSpeedLimiter limiter;
++
++	void SetUp() override {
++		engineConfiguration->etbSpeedLimitEnabled = true;
++		setLinearCurve(config->etbSpeedCltBins, -20, 120, 1); // 20 C steps
++		setArrayValues(config->etbOpenSpeed, 100);
++		setArrayValues(config->etbCloseSpeed, 200);
++	}
++
++	percent_t step(percent_t target, float clt = 80) {
++		advanceTimeUs(50'000);
++		return limiter.apply(target, clt, getTimeNowNt());
++	}
++};
++
++TEST_F(EtbSpeedLimit, LimitsOpeningAndClosing) {
++	// First call takes the target as it is
++	EXPECT_FLOAT_EQ(10, limiter.apply(10, 80, getTimeNowNt()));
++
++	// 100 %/s opening: 5% per 50 ms
++	EXPECT_NEAR(15, step(60), EPS4D);
++	EXPECT_NEAR(20, step(60), EPS4D);
++
++	// 200 %/s closing: 10% per 50 ms
++	EXPECT_NEAR(10, step(0), EPS4D);
++	EXPECT_NEAR(0, step(0), EPS4D);
++	EXPECT_NEAR(0, step(0), EPS4D);
++}
++
++TEST_F(EtbSpeedLimit, SlowerWhenCold) {
++	config->etbOpenSpeed[0] = 20; // -20 C
++
++	limiter.apply(0, -20, getTimeNowNt());
++	EXPECT_NEAR(1, step(50, -20), EPS4D);
++
++	// Warm engine opens at the normal speed
++	EXPECT_NEAR(6, step(50, 80), EPS4D);
++}
++
++TEST_F(EtbSpeedLimit, ZeroMeansNoLimit) {
++	setArrayValues(config->etbOpenSpeed, 0);
++	limiter.apply(0, 80, getTimeNowNt());
++	EXPECT_FLOAT_EQ(80, step(80));
++}
++
++TEST_F(EtbSpeedLimit, DisabledPassesThrough) {
++	engineConfiguration->etbSpeedLimitEnabled = false;
++	limiter.apply(0, 80, getTimeNowNt());
++	EXPECT_FLOAT_EQ(80, step(80));
++	EXPECT_FLOAT_EQ(0, step(0));
++}
++
++TEST_F(EtbSpeedLimit, AppliedToEtbSetpoint) {
++	// Must have TPS & PPS initialized for ETB setup
++	Sensor::setMockValue(SensorType::Tps1Primary, 0);
++	Sensor::setMockValue(SensorType::Tps1, 0.0f, true);
++	Sensor::setMockValue(SensorType::AcceleratorPedal, 0.0f, true);
++	Sensor::setMockValue(SensorType::Clt, 80);
++	engineConfiguration->etbIdleThrottleRange = 0;
++	engineConfiguration->etbRevLimitStart = 0;
++
++	EtbController etb;
++	// Mock pedal map that's just passthru pedal -> target
++	StrictMock<MockVp3d> pedalMap;
++	EXPECT_CALL(pedalMap, getValue(_, _))
++		.WillRepeatedly([](float xRpm, float y) {
++			return y;
++		});
++	etb.init(DC_Throttle1, nullptr, nullptr, &pedalMap);
++
++	// Closed pedal gives the 1% minimum position
++	EXPECT_NEAR(1, etb.getSetpoint().value_or(-1), EPS4D);
++
++	// Pedal floored: the target only rises 5% per 50 ms (the limiter runs before the min/max clamp)
++	Sensor::setMockValue(SensorType::AcceleratorPedal, 100.0f, true);
++	advanceTimeUs(50'000);
++	EXPECT_NEAR(5, etb.getSetpoint().value_or(-1), EPS4D);
++	advanceTimeUs(50'000);
++	EXPECT_NEAR(10, etb.getSetpoint().value_or(-1), EPS4D);
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 1d0a229..6d339eb 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -242,6 +242,7 @@ TESTS_SRC_CPP = \
+ 	tests/actuators/test_dc_hardware_pool.cpp \
+ 	tests/actuators/test_dc_motor.cpp \
+ 	tests/actuators/test_etb.cpp \
++	tests/actuators/test_etb_speed_limit.cpp \
+ 	tests/actuators/test_etb_integrated.cpp \
+ 	tests/actuators/test_fan_control.cpp \
+ 	tests/actuators/test_fuel_pump.cpp \
+-- 
+2.43.0
+

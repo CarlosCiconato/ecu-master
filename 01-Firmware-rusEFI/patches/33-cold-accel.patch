@@ -1,0 +1,227 @@
+From 9bfb641793af0911c52bf2902c980854b74c81d5 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:49:53 +0000
+Subject: [PATCH] Bigger TPS accel enrichment with a cold engine, coolant
+ temperature curve (pro-style)
+
+New curve tpsAccelCltBins/tpsAccelCltMult (default 1.0, no change) multiplies the
+additive TPS accel enrichment. Decel enleanment is not changed. Failed coolant sensor:
+no change. Also hide Fuel by gear when injection is off.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../controllers/algo/accel_enrichment.cpp     | 19 +++++++
+ firmware/controllers/algo/accel_enrichment.h  |  3 ++
+ .../algo/defaults/default_fuel.cpp            |  3 ++
+ firmware/controllers/algo/tps_accel_state.txt |  1 +
+ firmware/integration/rusefi_config.txt        |  5 ++
+ firmware/tunerstudio/top_level_menu.ini       |  2 +-
+ firmware/tunerstudio/transient_fueling.ini    |  6 ++-
+ firmware/tunerstudio/tunerstudio.template.ini |  8 +++
+ unit_tests/tests/test_accel_enrichment.cpp    | 51 +++++++++++++++++++
+ 9 files changed, 96 insertions(+), 2 deletions(-)
+
+diff --git a/firmware/controllers/algo/accel_enrichment.cpp b/firmware/controllers/algo/accel_enrichment.cpp
+index 1210a24..c89197d 100644
+--- a/firmware/controllers/algo/accel_enrichment.cpp
++++ b/firmware/controllers/algo/accel_enrichment.cpp
+@@ -25,6 +25,19 @@
+ #include "tunerstudio.h"
+ 
+ 
++float getAccelCltMult() {
++	auto clt = Sensor::get(SensorType::Clt);
++	if (!clt) {
++		return 1;
++	}
++	float mult = interpolate2d(clt.Value, config->tpsAccelCltBins, config->tpsAccelCltMult);
++	// 0 or nonsense in an old tune: no change
++	if (mult < 0.01f || mult > 100) {
++		return 1;
++	}
++	return mult;
++}
++
+ // on this level we do not distinguish between multiplier and 'ms adder' modes
+ float TpsAccelEnrichment::getTpsEnrichment() {
+ 	ScopePerf perf(PE::GetTpsEnrichment);
+@@ -87,6 +100,12 @@ float TpsAccelEnrichment::getTpsEnrichment() {
+ 		resetFractionValues();
+ 	}
+ 
++	// bigger accel enrichment with a cold engine, decel enleanment unchanged
++	cltMult = getAccelCltMult();
++	if (extraFuel > 0) {
++		extraFuel *= cltMult;
++	}
++
+ 	float mult = interpolate2d(rpm, config->tpsTspCorrValuesBins,
+ 						config->tpsTspCorrValues);
+ 	if (mult != 0 && (mult < 0.01 || mult > 100)) {
+diff --git a/firmware/controllers/algo/accel_enrichment.h b/firmware/controllers/algo/accel_enrichment.h
+index 048a07a..a8cfaf5 100644
+--- a/firmware/controllers/algo/accel_enrichment.h
++++ b/firmware/controllers/algo/accel_enrichment.h
+@@ -62,3 +62,6 @@ public:
+ };
+ 
+ void initAccelEnrichment();
++
++// accel enrichment multiplier from the coolant temperature curve, 1 = no change
++float getAccelCltMult();
+diff --git a/firmware/controllers/algo/defaults/default_fuel.cpp b/firmware/controllers/algo/defaults/default_fuel.cpp
+index 3f95bc9..8992487 100644
+--- a/firmware/controllers/algo/defaults/default_fuel.cpp
++++ b/firmware/controllers/algo/defaults/default_fuel.cpp
+@@ -403,6 +403,9 @@ void setDefaultFuel() {
+ 	setRpmTableBin(config->tpsTspCorrValuesBins);
+ 	setLinearCurve(config->tpsTspCorrValues, 1, 1);
+ 
++	setLinearCurve(config->tpsAccelCltBins, -40, 100, 1);
++	setLinearCurve(config->tpsAccelCltMult, 1, 1);
++
+ 	setRpmTableBin(config->predictiveMapBlendDurationBins);
+ 	setLinearCurve(config->predictiveMapBlendDurationValues, 1, 1);
+ 
+diff --git a/firmware/controllers/algo/tps_accel_state.txt b/firmware/controllers/algo/tps_accel_state.txt
+index 8fe2030..0b1dace 100644
+--- a/firmware/controllers/algo/tps_accel_state.txt
++++ b/firmware/controllers/algo/tps_accel_state.txt
+@@ -19,6 +19,7 @@ struct_no_prefix tps_accel_state_s
+ 	bit tooShort;too short
+ 
+ 	float fractionalInjFuel;fractionalInjFuel
++	float cltMult;Cold engine multiplier
+ 
+ !	/**
+ !	 * Used for Fractional TPS enrichment.
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index c443f1f..1df2c40 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2508,6 +2508,11 @@ int8_t[ENGINE_NOISE_CURVE_SIZE] autoscale knockBaseNoise;Knock sensor output kno
+ uint8_t[TPS_TPS_ACCEL_CLT_CORR_TABLE] autoscale tpsTspCorrValuesBins;;"RPM", 50, 0, 0, 12500, 0
+ uint8_t[TPS_TPS_ACCEL_CLT_CORR_TABLE] autoscale tpsTspCorrValues;Multiplier applied to additive TPS enrichment at each RPM. 1.00 is neutral, 0.50 halves and 2.00 doubles. Ignored by MAP Prediction and Lua.;"multiplier", 0.02, 0, 0, 5, 2
+ 
++! pro-style bigger accel enrichment with a cold engine
++#define TPS_ACCEL_CLT_SIZE 8
++int8_t[TPS_ACCEL_CLT_SIZE] tpsAccelCltBins;;"C", 1, 0, -40, 120, 0
++uint8_t[TPS_ACCEL_CLT_SIZE] autoscale tpsAccelCltMult;Multiplier applied to TPS accel enrichment at each coolant temperature. 1.00 is neutral, 2.00 doubles it with a cold engine. Not applied to decel enleanment. Ignored by MAP Prediction and Lua.;"multiplier", 0.02, 0, 0, 5, 2
++
+ uint8_t[TPS_TPS_ACCEL_CLT_CORR_TABLE] autoscale predictiveMapBlendDurationBins;;"RPM", 50, 0, 0, 12500, 0
+ uint8_t[TPS_TPS_ACCEL_CLT_CORR_TABLE] autoscale predictiveMapBlendDurationValues;Transition duration and total event time limit from estimated MAP toward current measured MAP, interpolated at current RPM. Rising estimated MAP restarts blending without extending the event time limit. Prediction may exit earlier. The largest duration in this curve also sizes TPS history. Used only by MAP Prediction.;"second", 0.02, 0, 0, 5, 2
+ 
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index 6eda103..e9a56b1 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -88,7 +88,7 @@
+ 		subMenu = ignitionCltCorrTable,			"CLT timing correction", 0, {isIgnitionEnabled == 1}
+ 		subMenu = ignitionIatCorrTableTbl,	"IAT timing correction", 0, {isIgnitionEnabled == 1}
+ 		subMenu = gearTimingTableTbl,		"Timing by gear", 0, {isIgnitionEnabled == 1}
+-		subMenu = gearFuelTableTbl,			"Fuel by gear"
++		subMenu = gearFuelTableTbl,			"Fuel by gear", 0, {isInjectionEnabled == 1}
+ 		subMenu = dwellSettings,				"Dwell", 0, {isIgnitionEnabled == 1}
+ 		subMenu = std_separator
+ 
+diff --git a/firmware/tunerstudio/transient_fueling.ini b/firmware/tunerstudio/transient_fueling.ini
+index e086feb..007d641 100644
+--- a/firmware/tunerstudio/transient_fueling.ini
++++ b/firmware/tunerstudio/transient_fueling.ini
+@@ -108,9 +108,13 @@ dialog = aeAdderHeader, ""
+     field = "Table -> fractional pump -> RPM -> flex -> injection-mode scaling."
+     panel = aeAdderMonitor
+ 
++dialog = aeAdderCorrections, "", xAxis
++    panel = tpsTspRpmCorrection
++    panel = tpsAccelCltCurve
++
+ dialog = aeAdderEditors, "", border
+     panel = tpsTpsAccelTbl, Center
+-    panel = tpsTspRpmCorrection, South
++    panel = aeAdderCorrections, South
+ 
+ dialog = aeAdderCalibration, "", border
+     panel = aeAdderHeader, North
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 917a51a..a5a8d30 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -722,6 +722,14 @@ include_file @@TUNING_SECTION_FILE@@
+ 		xBins		= tpsTspCorrValuesBins, RPMValue
+ 		yBins		= tpsTspCorrValues
+ 
++	curve = tpsAccelCltCurve, "TPS AE cold engine multiplier"
++		size = 480, 220
++		columnLabel = "Coolant", "Multiplier"
++		xAxis		=  -40, 120, 9
++		yAxis		=  0, 3, 7
++		xBins		= tpsAccelCltBins, coolantTemperature
++		yBins		= tpsAccelCltMult
++
+ 	curve = predictiveMapBlendDuration, "Transition duration to measured MAP (s)"
+ 		size = 480, 220
+ 		columnLabel = "RPM", "Duration"
+diff --git a/unit_tests/tests/test_accel_enrichment.cpp b/unit_tests/tests/test_accel_enrichment.cpp
+index 37579d1..c8fd1a4 100644
+--- a/unit_tests/tests/test_accel_enrichment.cpp
++++ b/unit_tests/tests/test_accel_enrichment.cpp
+@@ -490,3 +490,54 @@ TEST(fuel, StoppedTpsResetDoesNotInventAccelerationFromHeldThrottle) {
+ 	engine->rpmCalculator.setRpmValue(1200);
+ 	EXPECT_NEAR(0, ae.getTpsEnrichment(), 0.00001f);
+ }
++
++// pro-style bigger accel enrichment with a cold engine
++TEST(fuel, tpsAccelColdEngineMultiplier) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++
++	engineConfiguration->tpsAccelEnrichmentThreshold = 5;
++	engineConfiguration->tpsAccelLookback = 2;
++	engineConfiguration->tpsAccelFractionPeriod = 1;
++	engineConfiguration->tpsAccelFractionDivisor = 1;
++	engineConfiguration->tpsDecelEnleanmentThreshold = 5;
++	engineConfiguration->tpsDecelEnleanmentMultiplier = 0.1;
++
++	setTable(config->tpsTpsAccelTable, 1.0f);
++	setRpmTableBin(config->tpsTspCorrValuesBins);
++	setLinearCurve(config->tpsTspCorrValues, 1, 1);
++
++	// 2.0 at -40 C going down to 1.0 at 60 C and above
++	copyArray(config->tpsAccelCltBins, { -40, -20, 0, 20, 40, 60, 80, 100 });
++	copyArray(config->tpsAccelCltMult, { 2.0f, 1.8f, 1.6f, 1.4f, 1.2f, 1.0f, 1.0f, 1.0f });
++
++	initAccelEnrichment();
++	engine->rpmCalculator.setRpmValue(600);
++	engine->periodicFastCallback();
++
++	auto ae = engine->module<TpsAccelEnrichment>();
++	ae->setLength(2);
++
++	auto trigger = [&](float from, float to) {
++		ae->resetAE();
++		ae->onNewValue(from);
++		ae->onNewValue(to);
++		return ae->getTpsEnrichment();
++	};
++
++	// warm engine: no change
++	Sensor::setMockValue(SensorType::Clt, 90);
++	EXPECT_NEAR(1.0f, trigger(0, 10), EPS4D);
++
++	// cold engine: bigger accel enrichment
++	Sensor::setMockValue(SensorType::Clt, 0);
++	EXPECT_NEAR(1.6f, trigger(0, 10), EPS4D);
++	Sensor::setMockValue(SensorType::Clt, 10);
++	EXPECT_NEAR(1.5f, trigger(0, 10), EPS4D);
++
++	// decel enleanment is not made bigger
++	EXPECT_NEAR(-1.0f, trigger(10, 0), EPS4D);
++
++	// failed coolant sensor: no change
++	Sensor::setInvalidMockValue(SensorType::Clt);
++	EXPECT_NEAR(1.0f, trigger(0, 10), EPS4D);
++}
+-- 
+2.43.0
+

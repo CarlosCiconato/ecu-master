@@ -1,0 +1,766 @@
+From 0c4ed416c00e498d742ac20abff9622390086b2b Mon Sep 17 00:00:00 2001
+From: Carlos Ciconato <354919267+CarlosCiconato@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:31:14 +0000
+Subject: [PATCH] Generic alert engine (pro-style) with 3 actions and
+ alert output
+
+8 alerts, each: sensor (GPPWM channel list), above/below a fixed limit
+or an RPM curve, minimum time, minimum RPM to arm, and action: warn only,
+safe mode (fuel cut above alertSafeModeRpm) or engine off. A tripped
+alert stays latched, with the alert output on, until the next start.
+Live data: active/latched masks and level. TunerStudio: Advanced > Alerts.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ firmware/console/binary/output_channels.txt   |   6 +
+ firmware/controllers/algo/engine.h            |   2 +
+ firmware/controllers/algo/rusefi_enums.h      |   8 +
+ firmware/controllers/limp_manager.cpp         |   9 +
+ firmware/controllers/limp_manager.h           |   2 +
+ .../modules/alerts/alert_manager.cpp          |  94 +++++++++
+ .../modules/alerts/alert_manager.h            |  37 ++++
+ firmware/controllers/modules/alerts/alerts.mk |   3 +
+ firmware/controllers/modules/modules.mk       |   1 +
+ firmware/controllers/system/efi_gpio.cpp      |   1 +
+ firmware/controllers/system/efi_gpio.h        |   1 +
+ firmware/integration/rusefi_config.txt        |  23 +++
+ firmware/tunerstudio/top_level_menu.ini       |  10 +
+ firmware/tunerstudio/tunerstudio.template.ini | 168 ++++++++++++++++-
+ .../tests/controllers/test_alert_manager.cpp  | 178 ++++++++++++++++++
+ unit_tests/tests/tests.mk                     |   1 +
+ 16 files changed, 543 insertions(+), 1 deletion(-)
+ create mode 100644 firmware/controllers/modules/alerts/alert_manager.cpp
+ create mode 100644 firmware/controllers/modules/alerts/alert_manager.h
+ create mode 100644 firmware/controllers/modules/alerts/alerts.mk
+ create mode 100644 unit_tests/tests/controllers/test_alert_manager.cpp
+
+diff --git a/firmware/console/binary/output_channels.txt b/firmware/console/binary/output_channels.txt
+index 86993ec..68abbd4 100644
+--- a/firmware/console/binary/output_channels.txt
++++ b/firmware/console/binary/output_channels.txt
+@@ -500,4 +500,10 @@ float mapFast
+ 
+ 	float outputShaftSpeed;Output Shaft Speed;"RPM", 1, 0, 0, 30000, 0
+ 	float transmissionSlipPercent;@@GAUGE_NAME_TRANS_SLIP@@;"%", 1, 0, -100, 1000, 1
++
++! Alert engine, bit N is alert N+1
++	uint8_t alertActiveMask;Alerts: active now;"", 1, 0, 0, 255, 0
++	uint8_t alertLatchedMask;Alerts: tripped since start;"", 1, 0, 0, 255, 0
++	uint8_t alertLevel;Alerts: level (0 off, 1 warn, 2 safe mode, 3 engine off);"", 1, 0, 0, 3, 0
++	uint8_t alertUnused;;"", 1, 0, 0, 0, 0
+ end_struct
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index ca1feb9..0483789 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -33,6 +33,7 @@
+ #include "injector_model.h"
+ #include "launch_control.h"
+ #include "rolling_launch.h"
++#include "alert_manager.h"
+ #include "shift_torque_reduction_controller.h"
+ #include "nitrous_controller.h"
+ #include "antilag_system.h"
+@@ -197,6 +198,7 @@ public:
+         BoostController,
+ #endif // EFI_BOOST_CONTROL
+         TpsAccelEnrichment,
++        AlertManager,
+ #if EFI_LAUNCH_CONTROL
+ #if EFI_ENGINE_CONTROL
+         NitrousController,
+diff --git a/firmware/controllers/algo/rusefi_enums.h b/firmware/controllers/algo/rusefi_enums.h
+index 3580ace..81f136e 100644
+--- a/firmware/controllers/algo/rusefi_enums.h
++++ b/firmware/controllers/algo/rusefi_enums.h
+@@ -376,6 +376,14 @@ typedef enum __attribute__ ((__packed__)) {
+ 	UART_DEVICE_4 = 4,
+ } uart_device_e;
+ 
++// Action of a tripped alert, in order of severity, see AlertManager
++typedef enum __attribute__ ((__packed__)) {
++	ALERT_OFF = 0,
++	ALERT_WARN = 1,
++	ALERT_SAFE_MODE = 2,
++	ALERT_ENGINE_OFF = 3,
++} alert_action_e;
++
+ /**
+  * See spi3mosiPin
+  * See spi2MisoMode
+diff --git a/firmware/controllers/limp_manager.cpp b/firmware/controllers/limp_manager.cpp
+index b23d5d1..b61f4a8 100644
+--- a/firmware/controllers/limp_manager.cpp
++++ b/firmware/controllers/limp_manager.cpp
+@@ -171,6 +171,15 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 		}
+ 	}
+ 
++	// Alert engine actions, latched until the next start
++	auto alertLevel = engine->module<AlertManager>()->getLevel();
++	if (alertLevel == ALERT_ENGINE_OFF) {
++		allowFuel.clear(ClearReason::AlertEngineOff);
++		allowSpark.clear(ClearReason::AlertEngineOff);
++	} else if (alertLevel == ALERT_SAFE_MODE && rpm > engineConfiguration->alertSafeModeRpm) {
++		allowFuel.clear(ClearReason::AlertSafeMode);
++	}
++
+ 	// Force fuel limiting on the fault rev limit
+ 	if (rpm > m_faultRevLimit) {
+ 		allowFuel.clear(m_rpmLimitReason);
+diff --git a/firmware/controllers/limp_manager.h b/firmware/controllers/limp_manager.h
+index 81e3a96..e8f8a05 100644
+--- a/firmware/controllers/limp_manager.h
++++ b/firmware/controllers/limp_manager.h
+@@ -34,6 +34,8 @@ enum class ClearReason : uint8_t {
+ 	FatalErrorRevLimit, // 20
+ 	GdiLimits, // 21
+ 	GdiPumpLimit, // 22
++	AlertEngineOff, // 23
++	AlertSafeMode, // 24
+ 
+ 	// Keep this list in sync with fuelIgnCutCodeList in tunerstudio.template.ini!
+ 	// todo: add a code generator between ClearReason and fuelIgnCutCodeList in tunerstudio.template.ini
+diff --git a/firmware/controllers/modules/alerts/alert_manager.cpp b/firmware/controllers/modules/alerts/alert_manager.cpp
+new file mode 100644
+index 0000000..0f378cd
+--- /dev/null
++++ b/firmware/controllers/modules/alerts/alert_manager.cpp
+@@ -0,0 +1,94 @@
++#include "pch.h"
++
++#include "alert_manager.h"
++#include "gppwm_channel_reader.h"
++
++static_assert(ALERT_COUNT <= 8, "alert masks are 8 bit");
++
++void AlertManager::setDefaultConfiguration() {
++	engineConfiguration->alertSafeModeRpm = 3000;
++	setLinearCurve(config->alertRpmBins, 1000, 8000, 1);
++	for (size_t i = 0; i < ALERT_COUNT; i++) {
++		config->alerts[i].action = ALERT_OFF;
++	}
++}
++
++float AlertManager::getThreshold(size_t index, float rpm) const {
++	const auto& alert = config->alerts[index];
++	if (alert.useRpmCurve) {
++		return interpolate2d(rpm, config->alertRpmBins, alert.curve);
++	}
++	return alert.threshold;
++}
++
++bool AlertManager::isConditionMet(size_t index, float rpm) const {
++	const auto& alert = config->alerts[index];
++	if (alert.action == ALERT_OFF) {
++		return false;
++	}
++
++	if (alert.minRpm > 0 && rpm < alert.minRpm) {
++		return false;
++	}
++
++	auto value = readGppwmChannel(alert.sensor);
++	if (!value) {
++		// A failed sensor is reported by its own diagnostics, not by the alert
++		return false;
++	}
++
++	float threshold = getThreshold(index, rpm);
++	return alert.triggerBelow ? value.Value < threshold : value.Value > threshold;
++}
++
++void AlertManager::update(efitick_t nowNt) {
++	// Latches hold until the next start
++	bool isCranking = engine->rpmCalculator.isCranking();
++	if (isCranking && !m_wasCranking) {
++		clearLatches();
++	}
++	m_wasCranking = isCranking;
++
++	float rpm = Sensor::getOrZero(SensorType::Rpm);
++
++	m_activeMask = 0;
++	for (size_t i = 0; i < ALERT_COUNT; i++) {
++		if (!isConditionMet(i, rpm)) {
++			m_conditionTimer[i].reset(nowNt);
++			continue;
++		}
++
++		if (m_conditionTimer[i].getElapsedSeconds(nowNt) >= config->alerts[i].delay) {
++			m_activeMask |= 1 << i;
++			m_latchedMask |= 1 << i;
++		}
++	}
++
++	engine->outputChannels.alertActiveMask = m_activeMask;
++	engine->outputChannels.alertLatchedMask = m_latchedMask;
++	engine->outputChannels.alertLevel = getLevel();
++
++	enginePins.alertOutput.setValue(m_latchedMask != 0);
++}
++
++void AlertManager::onFastCallback() {
++	update(getTimeNowNt());
++}
++
++alert_action_e AlertManager::getLevel() const {
++	alert_action_e level = ALERT_OFF;
++	for (size_t i = 0; i < ALERT_COUNT; i++) {
++		if ((m_latchedMask & (1 << i)) && config->alerts[i].action > level) {
++			level = config->alerts[i].action;
++		}
++	}
++	return level;
++}
++
++bool AlertManager::isTripped(size_t index) const {
++	return m_latchedMask & (1 << index);
++}
++
++void AlertManager::clearLatches() {
++	m_latchedMask = 0;
++}
+diff --git a/firmware/controllers/modules/alerts/alert_manager.h b/firmware/controllers/modules/alerts/alert_manager.h
+new file mode 100644
+index 0000000..9fabc05
+--- /dev/null
++++ b/firmware/controllers/modules/alerts/alert_manager.h
+@@ -0,0 +1,37 @@
++/*
++ * @file alert_manager.h
++ *
++ * Generic alert engine, pro-style: each alert watches one sensor against a fixed
++ * limit or an RPM curve, must stay out of range for a minimum time, and then runs its
++ * action (warn only, safe mode RPM limit, or engine off). A tripped alert stays latched,
++ * with the alert output on, until the next engine start.
++ */
++
++#pragma once
++
++#include <rusefi/timer.h>
++
++class AlertManager : public EngineModule {
++public:
++	using interface_t = AlertManager;
++
++	void setDefaultConfiguration() override;
++	void onFastCallback() override;
++
++	void update(efitick_t nowNt);
++
++	// Most severe action among latched alerts
++	alert_action_e getLevel() const;
++	bool isTripped(size_t index) const;
++	// Threshold in use right now (fixed value or RPM curve)
++	float getThreshold(size_t index, float rpm) const;
++	void clearLatches();
++
++private:
++	bool isConditionMet(size_t index, float rpm) const;
++
++	Timer m_conditionTimer[ALERT_COUNT];
++	uint8_t m_activeMask = 0;
++	uint8_t m_latchedMask = 0;
++	bool m_wasCranking = false;
++};
+diff --git a/firmware/controllers/modules/alerts/alerts.mk b/firmware/controllers/modules/alerts/alerts.mk
+new file mode 100644
+index 0000000..d426fe7
+--- /dev/null
++++ b/firmware/controllers/modules/alerts/alerts.mk
+@@ -0,0 +1,3 @@
++# pro-style alert engine: sensor + limit + delay + action
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/alerts
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/alerts/alert_manager.cpp
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index f1f5c29..e74a6fd 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -19,6 +19,7 @@ include $(PROJECT_DIR)/controllers/modules/tachometer/tachometer.mk
+ include $(PROJECT_DIR)/controllers/modules/fuel_pump/fuel_pump.mk
+ include $(PROJECT_DIR)/controllers/modules/gear_detector/gear_detector.mk
+ include $(PROJECT_DIR)/controllers/modules/rolling_launch/rolling_launch.mk
++include $(PROJECT_DIR)/controllers/modules/alerts/alerts.mk
+ include $(PROJECT_DIR)/controllers/modules/burst_knock/burst_knock.mk
+ include $(PROJECT_DIR)/controllers/modules/engine_state_machine/engine_state_machine.mk
+ include $(PROJECT_DIR)/controllers/modules/wot_enrichment/wot_enrichment.mk
+diff --git a/firmware/controllers/system/efi_gpio.cpp b/firmware/controllers/system/efi_gpio.cpp
+index 8596073..f178410 100644
+--- a/firmware/controllers/system/efi_gpio.cpp
++++ b/firmware/controllers/system/efi_gpio.cpp
+@@ -152,6 +152,7 @@ EnginePins::EnginePins() :
+ 		fuelPumpRelay2("Fuel pump Relay 2", CONFIG_PIN_OFFSETS(fuelPump2)),
+ 		nitrousRelay("Nitrous Relay", CONFIG_PIN_OFFSETS(nitrousRelay)),
+ 		vvlRelay("VVL Relay", CONFIG_PIN_OFFSETS(vvlRelay)),
++		alertOutput("Alert Output", CONFIG_PIN_OFFSETS(alertOutput)),
+ #if EFI_HD_ACR
+ 		harleyAcr("Harley ACR", CONFIG_OFFSET(acrPin)),
+ 		harleyAcr2("Harley ACR 2", CONFIG_OFFSET(acrPin2)),
+diff --git a/firmware/controllers/system/efi_gpio.h b/firmware/controllers/system/efi_gpio.h
+index 16b8eaa..92564d8 100644
+--- a/firmware/controllers/system/efi_gpio.h
++++ b/firmware/controllers/system/efi_gpio.h
+@@ -92,6 +92,7 @@ public:
+ 	RegisteredOutputPin fuelPumpRelay2;
+ 	RegisteredOutputPin nitrousRelay;
+ 	RegisteredOutputPin vvlRelay;
++	RegisteredOutputPin alertOutput;
+ #if EFI_HD_ACR
+ 	RegisteredNamedOutputPin harleyAcr;
+ 	RegisteredOutputPin harleyAcr2;
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 44d4f16..eaa10ac 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -1979,6 +1979,10 @@ end_struct
+ 	output_pin_e vvlRelayPin;
+ 	pin_output_mode_e vvlRelayPinMode;
+ 
++	output_pin_e alertOutputPin;Alert lamp or buzzer. Turns on when any alert trips and stays on until the next engine start.
++	pin_output_mode_e alertOutputPinMode;
++	uint16_t alertSafeModeRpm;RPM limit (fuel cut) while an alert with the Safe mode action is tripped.;"RPM", 1, 0, 0, 15000, 0
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+@@ -2610,6 +2614,25 @@ uint16_t[INJ_TIME_RPM_COUNT] injTimeRpmBins;;"RPM", 1, 0, 0, 18000, 0
+ ! Progressive rev limiter, see progressiveRevLimitEnabled
+ uint16_t progressiveRevLimitWindow;RPM below the rev limit where the progressive spark cut starts.;"RPM", 1, 0, 0, 3000, 0
+ uint8_t progressiveRevLimitStartCut;Spark cut at the start of the window. It rises linearly to 100% at the rev limit.;"%", 1, 0, 0, 100, 0
++
++! pro-style alert engine, see AlertManager
++#define ALERT_COUNT 8
++#define ALERT_CURVE_SIZE 8
++custom alert_action_e 1 bits, U08, @OFFSET@, [0:1], "Off", "Warn only", "Safe mode", "Engine off"
++
++struct alert_s
++	gppwm_channel_e sensor;Sensor watched by this alert.;
++	alert_action_e action;What happens when the alert trips. Every action also turns on the alert output until the next start.;
++	uint8_t autoscale delay;The condition must last this long before the alert trips.;"s", 0.1, 0, 0, 25, 1
++	bit triggerBelow,"below","above";Trip when the sensor goes below the limit (for example low oil pressure) or above it (for example high temperature).
++	bit useRpmCurve,"RPM curve","fixed";Use a limit that changes with RPM instead of a single value.
++	int16_t autoscale threshold;Fixed limit.;"", 0.1, 0, -3000, 3000, 1
++	uint16_t minRpm;The alert is only armed above this RPM. 0 means always armed.;"RPM", 1, 0, 0, 15000, 0
++	int16_t[ALERT_CURVE_SIZE] autoscale curve;Limit by RPM.;"", 0.1, 0, -3000, 3000, 1
++end_struct
++
++uint16_t[ALERT_CURVE_SIZE] alertRpmBins;;"RPM", 1, 0, 0, 18000, 0
++alert_s[ALERT_COUNT iterate] alerts;
+ end_struct
+ 
+ #define PPS_OK_INDICATOR "Pedal OK"
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index 470acc5..c1cff91 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -196,6 +196,16 @@
+ 			groupChildMenu = boostClosedBlend2Cfg, "Closed Loop Blend 2", { isBoostControlEnabled && boostType == 1 }
+ 
+ 		subMenu = std_separator
++		groupMenu = "Alerts"
++			groupChildMenu = alertSettings, "Alert output and safe mode"
++			groupChildMenu = alert1, "Alert 1"
++			groupChildMenu = alert2, "Alert 2"
++			groupChildMenu = alert3, "Alert 3"
++			groupChildMenu = alert4, "Alert 4"
++			groupChildMenu = alert5, "Alert 5"
++			groupChildMenu = alert6, "Alert 6"
++			groupChildMenu = alert7, "Alert 7"
++			groupChildMenu = alert8, "Alert 8"
+ 		groupMenu = "Generic PWM", { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }@@if_ts_show_gppwm_1
+ 			groupChildMenu = gppwm1, @@GPPWM_1_NAME@@, { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }@@if_ts_show_gppwm_1
+ 			groupChildMenu = gppwm2, @@GPPWM_2_NAME@@, { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }@@if_ts_show_gppwm_2
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 4159707..9b9340f 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -449,7 +449,7 @@ include_file @@TUNING_SECTION_FILE@@
+ 	ignModeList = bits, U08, [0:3], "Single Coil", "Sequential", "Wasted", "Two Coils"
+ 
+ ; ClearReason
+-	fuelIgnCutCodeList = bits, U08, [0:7], "None", "fatal error", "setting disabled", "RPM limit", "ETB RPM limit", "boost cut", "oil pressure", "stop requested", "ETB problem", "launch control", "max injector duty", "flood clear", "engine sync", "kickstart", "ign off", "Lua", "ACR", "Lambda Prot", "GDI Comms", "Brake", "Fatal", "GDI limits", "Pump limit"
++	fuelIgnCutCodeList = bits, U08, [0:7], "None", "fatal error", "setting disabled", "RPM limit", "ETB RPM limit", "boost cut", "oil pressure", "stop requested", "ETB problem", "launch control", "max injector duty", "flood clear", "engine sync", "kickstart", "ign off", "Lua", "ACR", "Lambda Prot", "GDI Comms", "Brake", "Fatal", "GDI limits", "Pump limit", "Alert engine off", "Alert safe mode"
+ 
+ ; TpsState
+ 	etbCutCodeList = bits, U08, [0:7], "None", "engine stopped", "TPS error", "PPS error", "TPS noise", "Autotune", "Lua", "TPS Calib", "N/A", "Redundancy", "PPS noise", "Jam"
+@@ -799,6 +799,62 @@ include_file controllers/actuators/boost_control.curves.ini
+ 		yBins		= crankingFuelCoef
+ 		gauge		= CLTGauge
+ 
++	curve = alert1Curve, "Alert 1 limit by RPM"
++		columnLabel = "RPM", "Limit"
++		xAxis		= 0, 8000, 9
++		yAxis		= -100, 1000, 9
++		xBins		= alertRpmBins, RPMValue
++		yBins		= alerts1_curve
++
++	curve = alert2Curve, "Alert 2 limit by RPM"
++		columnLabel = "RPM", "Limit"
++		xAxis		= 0, 8000, 9
++		yAxis		= -100, 1000, 9
++		xBins		= alertRpmBins, RPMValue
++		yBins		= alerts2_curve
++
++	curve = alert3Curve, "Alert 3 limit by RPM"
++		columnLabel = "RPM", "Limit"
++		xAxis		= 0, 8000, 9
++		yAxis		= -100, 1000, 9
++		xBins		= alertRpmBins, RPMValue
++		yBins		= alerts3_curve
++
++	curve = alert4Curve, "Alert 4 limit by RPM"
++		columnLabel = "RPM", "Limit"
++		xAxis		= 0, 8000, 9
++		yAxis		= -100, 1000, 9
++		xBins		= alertRpmBins, RPMValue
++		yBins		= alerts4_curve
++
++	curve = alert5Curve, "Alert 5 limit by RPM"
++		columnLabel = "RPM", "Limit"
++		xAxis		= 0, 8000, 9
++		yAxis		= -100, 1000, 9
++		xBins		= alertRpmBins, RPMValue
++		yBins		= alerts5_curve
++
++	curve = alert6Curve, "Alert 6 limit by RPM"
++		columnLabel = "RPM", "Limit"
++		xAxis		= 0, 8000, 9
++		yAxis		= -100, 1000, 9
++		xBins		= alertRpmBins, RPMValue
++		yBins		= alerts6_curve
++
++	curve = alert7Curve, "Alert 7 limit by RPM"
++		columnLabel = "RPM", "Limit"
++		xAxis		= 0, 8000, 9
++		yAxis		= -100, 1000, 9
++		xBins		= alertRpmBins, RPMValue
++		yBins		= alerts7_curve
++
++	curve = alert8Curve, "Alert 8 limit by RPM"
++		columnLabel = "RPM", "Limit"
++		xAxis		= 0, 8000, 9
++		yAxis		= -100, 1000, 9
++		xBins		= alertRpmBins, RPMValue
++		yBins		= alerts8_curve
++
+ 	curve = cltRevLimitCurve, ""
+ 		columnLabel = "Coolant", "RPM Limit"
+ 		xAxis		= @@DEFAULT_CLT_AXIS_LOW_VALUE@@, { cltHighXaxis }, 9
+@@ -4867,6 +4923,116 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "Sustained injector duty cycle limit",	maxInjectorDutySustained, {isInjectionEnabled}
+ 		field = "Sustained injector duty cycle delay",	maxInjectorDutySustainedTimeout, {isInjectionEnabled}
+ 
++	dialog = alertSettings, "Alerts"
++		field = "Each alert watches one sensor. When it stays past its limit for the delay, the action runs and the alert output stays on until the next start."
++		field = "Alert output",						alertOutputPin
++		field = "Alert output mode",				alertOutputPinMode
++		field = "Safe mode RPM limit",				alertSafeModeRpm
++
++	dialog = alert1Fields, "Alert 1"
++		field = "Action",							alerts1_action
++		field = "Sensor",							alerts1_sensor, { alerts1_action != 0 }
++		field = "Trip when sensor is",				alerts1_triggerBelow, { alerts1_action != 0 }
++		field = "Limit type",						alerts1_useRpmCurve, { alerts1_action != 0 }
++		field = "Limit",							alerts1_threshold, { alerts1_action != 0 && !alerts1_useRpmCurve }
++		field = "Minimum time",						alerts1_delay, { alerts1_action != 0 }
++		field = "Armed above RPM",					alerts1_minRpm, { alerts1_action != 0 }
++
++	dialog = alert1, "Alert 1"
++		panel = alert1Fields, West
++		panel = alert1Curve, Center, { alerts1_action != 0 && alerts1_useRpmCurve }
++
++	dialog = alert2Fields, "Alert 2"
++		field = "Action",							alerts2_action
++		field = "Sensor",							alerts2_sensor, { alerts2_action != 0 }
++		field = "Trip when sensor is",				alerts2_triggerBelow, { alerts2_action != 0 }
++		field = "Limit type",						alerts2_useRpmCurve, { alerts2_action != 0 }
++		field = "Limit",							alerts2_threshold, { alerts2_action != 0 && !alerts2_useRpmCurve }
++		field = "Minimum time",						alerts2_delay, { alerts2_action != 0 }
++		field = "Armed above RPM",					alerts2_minRpm, { alerts2_action != 0 }
++
++	dialog = alert2, "Alert 2"
++		panel = alert2Fields, West
++		panel = alert2Curve, Center, { alerts2_action != 0 && alerts2_useRpmCurve }
++
++	dialog = alert3Fields, "Alert 3"
++		field = "Action",							alerts3_action
++		field = "Sensor",							alerts3_sensor, { alerts3_action != 0 }
++		field = "Trip when sensor is",				alerts3_triggerBelow, { alerts3_action != 0 }
++		field = "Limit type",						alerts3_useRpmCurve, { alerts3_action != 0 }
++		field = "Limit",							alerts3_threshold, { alerts3_action != 0 && !alerts3_useRpmCurve }
++		field = "Minimum time",						alerts3_delay, { alerts3_action != 0 }
++		field = "Armed above RPM",					alerts3_minRpm, { alerts3_action != 0 }
++
++	dialog = alert3, "Alert 3"
++		panel = alert3Fields, West
++		panel = alert3Curve, Center, { alerts3_action != 0 && alerts3_useRpmCurve }
++
++	dialog = alert4Fields, "Alert 4"
++		field = "Action",							alerts4_action
++		field = "Sensor",							alerts4_sensor, { alerts4_action != 0 }
++		field = "Trip when sensor is",				alerts4_triggerBelow, { alerts4_action != 0 }
++		field = "Limit type",						alerts4_useRpmCurve, { alerts4_action != 0 }
++		field = "Limit",							alerts4_threshold, { alerts4_action != 0 && !alerts4_useRpmCurve }
++		field = "Minimum time",						alerts4_delay, { alerts4_action != 0 }
++		field = "Armed above RPM",					alerts4_minRpm, { alerts4_action != 0 }
++
++	dialog = alert4, "Alert 4"
++		panel = alert4Fields, West
++		panel = alert4Curve, Center, { alerts4_action != 0 && alerts4_useRpmCurve }
++
++	dialog = alert5Fields, "Alert 5"
++		field = "Action",							alerts5_action
++		field = "Sensor",							alerts5_sensor, { alerts5_action != 0 }
++		field = "Trip when sensor is",				alerts5_triggerBelow, { alerts5_action != 0 }
++		field = "Limit type",						alerts5_useRpmCurve, { alerts5_action != 0 }
++		field = "Limit",							alerts5_threshold, { alerts5_action != 0 && !alerts5_useRpmCurve }
++		field = "Minimum time",						alerts5_delay, { alerts5_action != 0 }
++		field = "Armed above RPM",					alerts5_minRpm, { alerts5_action != 0 }
++
++	dialog = alert5, "Alert 5"
++		panel = alert5Fields, West
++		panel = alert5Curve, Center, { alerts5_action != 0 && alerts5_useRpmCurve }
++
++	dialog = alert6Fields, "Alert 6"
++		field = "Action",							alerts6_action
++		field = "Sensor",							alerts6_sensor, { alerts6_action != 0 }
++		field = "Trip when sensor is",				alerts6_triggerBelow, { alerts6_action != 0 }
++		field = "Limit type",						alerts6_useRpmCurve, { alerts6_action != 0 }
++		field = "Limit",							alerts6_threshold, { alerts6_action != 0 && !alerts6_useRpmCurve }
++		field = "Minimum time",						alerts6_delay, { alerts6_action != 0 }
++		field = "Armed above RPM",					alerts6_minRpm, { alerts6_action != 0 }
++
++	dialog = alert6, "Alert 6"
++		panel = alert6Fields, West
++		panel = alert6Curve, Center, { alerts6_action != 0 && alerts6_useRpmCurve }
++
++	dialog = alert7Fields, "Alert 7"
++		field = "Action",							alerts7_action
++		field = "Sensor",							alerts7_sensor, { alerts7_action != 0 }
++		field = "Trip when sensor is",				alerts7_triggerBelow, { alerts7_action != 0 }
++		field = "Limit type",						alerts7_useRpmCurve, { alerts7_action != 0 }
++		field = "Limit",							alerts7_threshold, { alerts7_action != 0 && !alerts7_useRpmCurve }
++		field = "Minimum time",						alerts7_delay, { alerts7_action != 0 }
++		field = "Armed above RPM",					alerts7_minRpm, { alerts7_action != 0 }
++
++	dialog = alert7, "Alert 7"
++		panel = alert7Fields, West
++		panel = alert7Curve, Center, { alerts7_action != 0 && alerts7_useRpmCurve }
++
++	dialog = alert8Fields, "Alert 8"
++		field = "Action",							alerts8_action
++		field = "Sensor",							alerts8_sensor, { alerts8_action != 0 }
++		field = "Trip when sensor is",				alerts8_triggerBelow, { alerts8_action != 0 }
++		field = "Limit type",						alerts8_useRpmCurve, { alerts8_action != 0 }
++		field = "Limit",							alerts8_threshold, { alerts8_action != 0 && !alerts8_useRpmCurve }
++		field = "Minimum time",						alerts8_delay, { alerts8_action != 0 }
++		field = "Armed above RPM",					alerts8_minRpm, { alerts8_action != 0 }
++
++	dialog = alert8, "Alert 8"
++		panel = alert8Fields, West
++		panel = alert8Curve, Center, { alerts8_action != 0 && alerts8_useRpmCurve }
++
+ 	dialog = limitsSettings, "Limits"
+ 		field = "Cut fuel on RPM limit",				cutFuelOnHardLimit
+ 		field = "Cut spark on RPM limit",				cutSparkOnHardLimit
+diff --git a/unit_tests/tests/controllers/test_alert_manager.cpp b/unit_tests/tests/controllers/test_alert_manager.cpp
+new file mode 100644
+index 0000000..fd46f94
+--- /dev/null
++++ b/unit_tests/tests/controllers/test_alert_manager.cpp
+@@ -0,0 +1,178 @@
++#include "pch.h"
++
++#include "alert_manager.h"
++#include "limp_manager.h"
++
++// pro-style alert engine: sensor + limit (fixed or RPM curve) + minimum time + action,
++// latched with the alert output until the next engine start.
++
++class AlertManagerTest : public testing::Test {
++protected:
++	EngineTestHelper eth{engine_type_e::TEST_ENGINE};
++
++	AlertManager& alerts() {
++		return engine->module<AlertManager>().unmock();
++	}
++
++	void setRpm(float rpm) {
++		engine->rpmCalculator.setRpmValue(rpm);
++		Sensor::setMockValue(SensorType::Rpm, rpm);
++	}
++
++	void update() {
++		alerts().update(getTimeNowNt());
++	}
++
++	void SetUp() override {
++		engineConfiguration->cranking.rpm = 400;
++		setRpm(3000);
++
++		// Alert 1: low oil pressure, engine off after 0.5 s
++		auto& oil = config->alerts[0];
++		oil.sensor = GPPWM_OilPressure;
++		oil.action = ALERT_ENGINE_OFF;
++		oil.triggerBelow = true;
++		oil.useRpmCurve = false;
++		oil.threshold = 100; // kPa
++		oil.delay = 0.5f;
++		oil.minRpm = 0;
++		Sensor::setMockValue(SensorType::OilPressure, 300);
++	}
++};
++
++TEST_F(AlertManagerTest, TripsOnlyAfterMinimumTime) {
++	update();
++	EXPECT_FALSE(alerts().isTripped(0));
++
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	update();
++	advanceTimeUs(400'000);
++	update();
++	EXPECT_FALSE(alerts().isTripped(0));
++	EXPECT_EQ(ALERT_OFF, alerts().getLevel());
++
++	advanceTimeUs(200'000);
++	update();
++	EXPECT_TRUE(alerts().isTripped(0));
++	EXPECT_EQ(ALERT_ENGINE_OFF, alerts().getLevel());
++	EXPECT_EQ(1, engine->outputChannels.alertActiveMask);
++	EXPECT_EQ(1, engine->outputChannels.alertLatchedMask);
++	EXPECT_EQ(ALERT_ENGINE_OFF, engine->outputChannels.alertLevel);
++}
++
++TEST_F(AlertManagerTest, ShortGlitchDoesNotTrip) {
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	update();
++	advanceTimeUs(400'000);
++	update();
++
++	// Back to normal before the delay: the timer restarts
++	Sensor::setMockValue(SensorType::OilPressure, 300);
++	update();
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	advanceTimeUs(400'000);
++	update();
++	EXPECT_FALSE(alerts().isTripped(0));
++}
++
++TEST_F(AlertManagerTest, LatchedUntilNextStart) {
++	config->alerts[0].delay = 0;
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	update();
++	ASSERT_TRUE(alerts().isTripped(0));
++
++	// Pressure comes back but the alert stays latched
++	Sensor::setMockValue(SensorType::OilPressure, 300);
++	update();
++	EXPECT_TRUE(alerts().isTripped(0));
++	EXPECT_EQ(0, engine->outputChannels.alertActiveMask);
++	EXPECT_EQ(1, engine->outputChannels.alertLatchedMask);
++
++	// Engine stops: still latched
++	setRpm(0);
++	update();
++	EXPECT_TRUE(alerts().isTripped(0));
++
++	// Next start clears it
++	setRpm(200);
++	ASSERT_TRUE(engine->rpmCalculator.isCranking());
++	update();
++	EXPECT_FALSE(alerts().isTripped(0));
++	EXPECT_EQ(ALERT_OFF, alerts().getLevel());
++}
++
++TEST_F(AlertManagerTest, ArmedOnlyAboveMinRpm) {
++	config->alerts[0].delay = 0;
++	config->alerts[0].minRpm = 1000;
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++
++	setRpm(800);
++	update();
++	EXPECT_FALSE(alerts().isTripped(0));
++
++	setRpm(1500);
++	update();
++	EXPECT_TRUE(alerts().isTripped(0));
++}
++
++TEST_F(AlertManagerTest, LimitByRpmCurve) {
++	config->alerts[0].action = ALERT_OFF;
++
++	// Alert 2: coolant above an RPM dependent limit, warn only
++	auto& clt = config->alerts[1];
++	clt.sensor = GPPWM_Clt;
++	clt.action = ALERT_WARN;
++	clt.triggerBelow = false;
++	clt.useRpmCurve = true;
++	clt.delay = 0;
++	clt.minRpm = 0;
++	setLinearCurve(config->alertRpmBins, 1000, 8000, 1);
++	setArrayValues(clt.curve, 100);
++	clt.curve[2] = 90; // 3000 RPM
++
++	EXPECT_NEAR(90, alerts().getThreshold(1, 3000), EPS4D);
++	EXPECT_NEAR(100, alerts().getThreshold(1, 1000), EPS4D);
++
++	Sensor::setMockValue(SensorType::Clt, 95);
++	setRpm(1000);
++	update();
++	EXPECT_FALSE(alerts().isTripped(1));
++
++	setRpm(3000);
++	update();
++	EXPECT_TRUE(alerts().isTripped(1));
++	EXPECT_EQ(ALERT_WARN, alerts().getLevel());
++	EXPECT_EQ(2, engine->outputChannels.alertLatchedMask);
++}
++
++TEST_F(AlertManagerTest, EngineOffCutsFuelAndSpark) {
++	config->alerts[0].delay = 0;
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	update();
++
++	getLimpManager()->updateState(3000, getTimeNowNt());
++	auto fuel = getLimpManager()->allowInjection();
++	auto spark = getLimpManager()->allowIgnition();
++	EXPECT_FALSE(fuel.value);
++	EXPECT_EQ(ClearReason::AlertEngineOff, fuel.reason);
++	EXPECT_FALSE(spark.value);
++	EXPECT_EQ(ClearReason::AlertEngineOff, spark.reason);
++}
++
++TEST_F(AlertManagerTest, SafeModeLimitsRpm) {
++	config->alerts[0].delay = 0;
++	config->alerts[0].action = ALERT_SAFE_MODE;
++	engineConfiguration->alertSafeModeRpm = 3000;
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	update();
++	ASSERT_EQ(ALERT_SAFE_MODE, alerts().getLevel());
++
++	getLimpManager()->updateState(3500, getTimeNowNt());
++	auto fuel = getLimpManager()->allowInjection();
++	EXPECT_FALSE(fuel.value);
++	EXPECT_EQ(ClearReason::AlertSafeMode, fuel.reason);
++	EXPECT_TRUE(getLimpManager()->allowIgnition().value);
++
++	getLimpManager()->updateState(2500, getTimeNowNt());
++	EXPECT_TRUE(getLimpManager()->allowInjection().value);
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index fa2534e..1d0a229 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -266,6 +266,7 @@ TESTS_SRC_CPP = \
+ 	tests/controllers/can/test_uds.cpp \
+ 	tests/controllers/test_long_term_fuel_trim.cpp \
+ 	tests/controllers/test_ltft_injection_time.cpp \
++	tests/controllers/test_alert_manager.cpp \
+ 	tests/ignition_injection/test_ignition_state.cpp \
+ 	tests/core/test_main_loop.cpp \
+ 	tests/test_trip_odometer.cpp \
+-- 
+2.43.0
+

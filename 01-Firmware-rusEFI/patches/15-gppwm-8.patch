@@ -1,0 +1,385 @@
+From 8629e6d0409555c796a67dfd7bacc40d9700b58c Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 20:32:21 +0000
+Subject: [PATCH] 8 general purpose PWM outputs instead of 4 (pro-style)
+
+GPPWM_CHANNELS goes from 4 to 8, with TunerStudio dialogs, tables, menu entries and
+gauges for channels 5 to 8. Live data gppwmOutput/XAxis/YAxis grow to 8.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ firmware/console/binary/output_channels.txt   |   6 +-
+ .../controllers/actuators/gppwm/gppwm.cpp     |  14 +-
+ firmware/integration/rusefi_config.txt        |  14 +-
+ firmware/tunerstudio/gauge_declarations.ini   |   4 +
+ firmware/tunerstudio/top_level_menu.ini       |   4 +
+ firmware/tunerstudio/tunerstudio.template.ini | 160 ++++++++++++++++++
+ unit_tests/tests/actuators/test_gppwm.cpp     |  26 +++
+ 7 files changed, 223 insertions(+), 5 deletions(-)
+
+diff --git a/firmware/console/binary/output_channels.txt b/firmware/console/binary/output_channels.txt
+index e33954a..c516729 100644
+--- a/firmware/console/binary/output_channels.txt
++++ b/firmware/console/binary/output_channels.txt
+@@ -303,9 +303,9 @@ int16_t rpmAcceleration;dRPM;"RPM acceleration/Rate of Change/ROC",1, 0, 0, 5, 2
+ 	uint16_t ISSValue;@@GAUGE_NAME_ISS@@;"RPM",1, 0, 0, 8000, 0
+ 
+ 	int16_t[LUA_ANALOG_INPUT_COUNT iterate] autoscale rawAnalogInput;;"V",{1/@@PACK_MULT_VOLTAGE@@}, 0, 0, 5, 3
+-	uint8_t[4 iterate] autoscale gppwmOutput;GPPWM Output;"%", 0.5, 0, 0, 100, 2
+-	int16_t[4 iterate] autoscale gppwmXAxis;;"", 1, 0, -30000, 30000, 0
+-	int16_t[4 iterate] autoscale gppwmYAxis;;"", 0.1, 0, -1000, 1000, 1
++	uint8_t[8 iterate] autoscale gppwmOutput;GPPWM Output;"%", 0.5, 0, 0, 100, 2
++	int16_t[8 iterate] autoscale gppwmXAxis;;"", 1, 0, -30000, 30000, 0
++	int16_t[8 iterate] autoscale gppwmYAxis;;"", 0.1, 0, -1000, 1000, 1
+ 
+ 	int16_t autoscale rawBattery;;"V",{1/@@PACK_MULT_VOLTAGE@@}, 0, 0, 5, 3
+ 
+diff --git a/firmware/controllers/actuators/gppwm/gppwm.cpp b/firmware/controllers/actuators/gppwm/gppwm.cpp
+index fddd1e0..fd24ad8 100644
+--- a/firmware/controllers/actuators/gppwm/gppwm.cpp
++++ b/firmware/controllers/actuators/gppwm/gppwm.cpp
+@@ -22,18 +22,30 @@ static gppwm_Map3D_t table1{"gppwm1"};
+ static gppwm_Map3D_t table2{"gppwm2"};
+ static gppwm_Map3D_t table3{"gppwm3"};
+ static gppwm_Map3D_t table4{"gppwm4"};
++static gppwm_Map3D_t table5{"gppwm5"};
++static gppwm_Map3D_t table6{"gppwm6"};
++static gppwm_Map3D_t table7{"gppwm7"};
++static gppwm_Map3D_t table8{"gppwm8"};
+ 
+-static gppwm_Map3D_t* const tables[] = {
++static gppwm_Map3D_t* const tables[GPPWM_CHANNELS] = {
+ 	&table1,
+ 	&table2,
+ 	&table3,
+ 	&table4,
++	&table5,
++	&table6,
++	&table7,
++	&table8,
+ };
+ 
+ static const char *channelNames[GPPWM_CHANNELS] = { "GPPWM#1",
+ "GPPWM#2",
+ "GPPWM#3",
+ "GPPWM#4",
++"GPPWM#5",
++"GPPWM#6",
++"GPPWM#7",
++"GPPWM#8",
+  };
+ 
+ 
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index d9100cb..ca95a77 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -265,6 +265,10 @@ struct_no_prefix engine_configuration_s
+ #define ts_show_gppwm_2 true
+ #define ts_show_gppwm_3 true
+ #define ts_show_gppwm_4 true
++#define ts_show_gppwm_5 true
++#define ts_show_gppwm_6 true
++#define ts_show_gppwm_7 true
++#define ts_show_gppwm_8 true
+ #define ts_show_ve_table_map true
+ #define VVT_OUTPUTS_NAME "VVT outputs and PID"
+ #define VVT1_TARGET_NAME "VVT intake target"
+@@ -273,6 +277,10 @@ struct_no_prefix engine_configuration_s
+ #define GPPWM_2_NAME "General Purpose PWM 2"
+ #define GPPWM_3_NAME "General Purpose PWM 3"
+ #define GPPWM_4_NAME "General Purpose PWM 4"
++#define GPPWM_5_NAME "General Purpose PWM 5"
++#define GPPWM_6_NAME "General Purpose PWM 6"
++#define GPPWM_7_NAME "General Purpose PWM 7"
++#define GPPWM_8_NAME "General Purpose PWM 8"
+ 
+ #define ppsExpAverageAlpha_NAME "Accelerator Exp Average"
+ #define IGN_TRIM_1_NAME "Ignition trim cyl 1"
+@@ -342,7 +350,7 @@ struct_no_prefix engine_configuration_s
+ 
+ #define GPPWM_LOAD_COUNT 8
+ #define GPPWM_RPM_COUNT 8
+-#define GPPWM_CHANNELS 4
++#define GPPWM_CHANNELS 8
+ #define GPPWM_NOTE_SIZE 16
+ 
+ #define CAN_WBO_COUNT 2
+@@ -713,6 +721,10 @@ uint32_t cylindersCount;Number of cylinder the engine has.;"", 1, 0, 1, @@MAX_CY
+ #define ts_show_gppwm3_error_value true
+ 
+ #define ts_show_gppwm4_pin true
++#define ts_show_gppwm5_pin true
++#define ts_show_gppwm6_pin true
++#define ts_show_gppwm7_pin true
++#define ts_show_gppwm8_pin true
+ 
+ #define ts_show_exhaust_vvt true
+ #define ts_show_second_bank true
+diff --git a/firmware/tunerstudio/gauge_declarations.ini b/firmware/tunerstudio/gauge_declarations.ini
+index c6c8488..26da9af 100644
+--- a/firmware/tunerstudio/gauge_declarations.ini
++++ b/firmware/tunerstudio/gauge_declarations.ini
+@@ -370,6 +370,10 @@ gaugeCategory = GPPWM Outputs
+ 	gppwmGauge2 = gppwmOutput2, { stringValue(gpPwmNote2) }, "%", 0, 100, 0, 0, 100, 100, 1, 1
+ 	gppwmGauge3 = gppwmOutput3, { stringValue(gpPwmNote3) }, "%", 0, 100, 0, 0, 100, 100, 1, 1
+ 	gppwmGauge4 = gppwmOutput4, { stringValue(gpPwmNote4) }, "%", 0, 100, 0, 0, 100, 100, 1, 1
++	gppwmGauge5 = gppwmOutput5, { stringValue(gpPwmNote5) }, "%", 0, 100, 0, 0, 100, 100, 1, 1
++	gppwmGauge6 = gppwmOutput6, { stringValue(gpPwmNote6) }, "%", 0, 100, 0, 0, 100, 100, 1, 1
++	gppwmGauge7 = gppwmOutput7, { stringValue(gpPwmNote7) }, "%", 0, 100, 0, 0, 100, 100, 1, 1
++	gppwmGauge8 = gppwmOutput8, { stringValue(gpPwmNote8) }, "%", 0, 100, 0, 0, 100, 100, 1, 1
+ 
+ gaugeCategory = Cooling Fans
+ 	fan1SpeedTargetGauge = fan1fanSpeedTarget, "Fan 1 Demand target", "%", 0, 100, -1, -1, 101, 101, 1, 1@@if_ts_show_fan_settings
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index 6acf115..15b1d3b 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -227,6 +227,10 @@
+ 			groupChildMenu = gppwm2, @@GPPWM_2_NAME@@, { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }@@if_ts_show_gppwm_2
+ 			groupChildMenu = gppwm3, @@GPPWM_3_NAME@@, { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }@@if_ts_show_gppwm_3
+ 			groupChildMenu = gppwm4, @@GPPWM_4_NAME@@, { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }@@if_ts_show_gppwm_4
++			groupChildMenu = gppwm5, @@GPPWM_5_NAME@@, { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }@@if_ts_show_gppwm_5
++			groupChildMenu = gppwm6, @@GPPWM_6_NAME@@, { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }@@if_ts_show_gppwm_6
++			groupChildMenu = gppwm7, @@GPPWM_7_NAME@@, { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }@@if_ts_show_gppwm_7
++			groupChildMenu = gppwm8, @@GPPWM_8_NAME@@, { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ }@@if_ts_show_gppwm_8
+ 
+ 		subMenu = std_separator				@@if_ts_show_dc_hardware
+ 		subMenu = dcMotorActuatorFunction,	"DC motor actuator(s) function", { 1 }, { uiMode == @@UiMode_FULL@@ || uiMode == @@UiMode_INSTALLATION@@ } @@if_ts_show_hbridge_function
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index a6e9d39..b420f37 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -534,6 +534,10 @@ include_file @@TUNING_SECTION_FILE@@
+   requiresPowerCycle = gppwm2_pin
+   requiresPowerCycle = gppwm3_pin
+   requiresPowerCycle = gppwm4_pin
++  requiresPowerCycle = gppwm5_pin
++  requiresPowerCycle = gppwm6_pin
++  requiresPowerCycle = gppwm7_pin
++  requiresPowerCycle = gppwm8_pin
+   requiresPowerCycle = mc33816_cs@@if_ts_show_gdi_low_level
+   requiresPowerCycle = mc33816_rstb@@if_ts_show_gdi_low_level
+   requiresPowerCycle = mc33816spiDevice@@if_ts_show_gdi_low_level
+@@ -2043,6 +2047,30 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 		yBins = gppwm4_loadBins, gppwmYAxis4
+ 		zBins = gppwm4_table
+ 
++	table = gppwm5Tbl, gppwm5Map, "GP#5", 1
++    xyLabels = {bitStringValue(pwmAxisLabels, gppwm5_rpmAxis)}, {bitStringValue(pwmAxisLabels, gppwm5_loadAxis)}
++		xBins = gppwm5_rpmBins, gppwmXAxis5
++		yBins = gppwm5_loadBins, gppwmYAxis5
++		zBins = gppwm5_table
++
++	table = gppwm6Tbl, gppwm6Map, "GP#6", 1
++    xyLabels = {bitStringValue(pwmAxisLabels, gppwm6_rpmAxis)}, {bitStringValue(pwmAxisLabels, gppwm6_loadAxis)}
++		xBins = gppwm6_rpmBins, gppwmXAxis6
++		yBins = gppwm6_loadBins, gppwmYAxis6
++		zBins = gppwm6_table
++
++	table = gppwm7Tbl, gppwm7Map, "GP#7", 1
++    xyLabels = {bitStringValue(pwmAxisLabels, gppwm7_rpmAxis)}, {bitStringValue(pwmAxisLabels, gppwm7_loadAxis)}
++		xBins = gppwm7_rpmBins, gppwmXAxis7
++		yBins = gppwm7_loadBins, gppwmYAxis7
++		zBins = gppwm7_table
++
++	table = gppwm8Tbl, gppwm8Map, "GP#8", 1
++    xyLabels = {bitStringValue(pwmAxisLabels, gppwm8_rpmAxis)}, {bitStringValue(pwmAxisLabels, gppwm8_loadAxis)}
++		xBins = gppwm8_rpmBins, gppwmXAxis8
++		yBins = gppwm8_loadBins, gppwmYAxis8
++		zBins = gppwm8_table
++
+ 	table = stagedInjectionTbl, stagedInjectionMap, "Staged Injection %", 1
+ 		xyLabels = "RPM", ""
+ 		xBins = injectorStagingRpmBins, RPMValue
+@@ -3724,6 +3752,10 @@ cmd_set_engine_type_default					= "@@TS_IO_TEST_COMMAND_char@@@@ts_command_e_TS_
+ 		field = "GP PWM 2 Output", 					gppwm2_pin@@if_ts_show_gppwm2_pin
+ 		field = "GP PWM 3 Output", 					gppwm3_pin@@if_ts_show_gppwm3_pin
+ 		field = "GP PWM 4 Output", 					gppwm4_pin@@if_ts_show_gppwm4_pin
++		field = "GP PWM 5 Output", 					gppwm5_pin@@if_ts_show_gppwm5_pin
++		field = "GP PWM 6 Output", 					gppwm6_pin@@if_ts_show_gppwm6_pin
++		field = "GP PWM 7 Output", 					gppwm7_pin@@if_ts_show_gppwm7_pin
++		field = "GP PWM 8 Output", 					gppwm8_pin@@if_ts_show_gppwm8_pin
+ ;		field = "Aux Valve #1",						auxValves1
+ ;		field = "Aux Valve #2",						auxValves2
+ 
+@@ -6433,6 +6465,102 @@ dialog = tcuControls, "Transmission Settings"
+ 		panel = gppwm4left
+ 		panel = gppwm4Tbl, {gppwm4_pin != 0}
+ 
++	dialog = gppwm5left, ""
++		field = "Output", gppwm5_pin@@if_ts_show_gppwm5_pin
++		field = ""
++		field = "Set frequency to 0hz for on-off mode"
++		field = "Frequency", gppwm5_pwmFrequency, {gppwm5_pin != 0}
++		field = ""
++		field = "On above duty", gppwm5_onAboveDuty, {gppwm5_pin != 0 && gppwm5_pwmFrequency == 0}
++		field = "Off below duty", gppwm5_offBelowDuty, {gppwm5_pin != 0 && gppwm5_pwmFrequency == 0}
++		field = "Duty if error", gppwm5_dutyIfError, {gppwm5_pin != 0}
++		field = ""
++		field = "X Axis", gppwm5_rpmAxis, {gppwm5_pin != 0}
++		field = "Y Axis", gppwm5_loadAxis, {gppwm5_pin != 0}
++		field = "Note", gpPwmNote5
++		field = ""
++		field = ""
++		field = ""
++		field = ""
++		field = ""
++
++	dialog = gppwm5, @@GPPWM_5_NAME@@, xAxis
++		topicHelp = "gppwm5Help"
++		panel = gppwm5left
++		panel = gppwm5Tbl, {gppwm5_pin != 0}
++
++	dialog = gppwm6left, ""
++		field = "Output", gppwm6_pin@@if_ts_show_gppwm6_pin
++		field = ""
++		field = "Set frequency to 0hz for on-off mode"
++		field = "Frequency", gppwm6_pwmFrequency, {gppwm6_pin != 0}
++		field = ""
++		field = "On above duty", gppwm6_onAboveDuty, {gppwm6_pin != 0 && gppwm6_pwmFrequency == 0}
++		field = "Off below duty", gppwm6_offBelowDuty, {gppwm6_pin != 0 && gppwm6_pwmFrequency == 0}
++		field = "Duty if error", gppwm6_dutyIfError, {gppwm6_pin != 0}
++		field = ""
++		field = "X Axis", gppwm6_rpmAxis, {gppwm6_pin != 0}
++		field = "Y Axis", gppwm6_loadAxis, {gppwm6_pin != 0}
++		field = "Note", gpPwmNote6
++		field = ""
++		field = ""
++		field = ""
++		field = ""
++		field = ""
++
++	dialog = gppwm6, @@GPPWM_6_NAME@@, xAxis
++		topicHelp = "gppwm6Help"
++		panel = gppwm6left
++		panel = gppwm6Tbl, {gppwm6_pin != 0}
++
++	dialog = gppwm7left, ""
++		field = "Output", gppwm7_pin@@if_ts_show_gppwm7_pin
++		field = ""
++		field = "Set frequency to 0hz for on-off mode"
++		field = "Frequency", gppwm7_pwmFrequency, {gppwm7_pin != 0}
++		field = ""
++		field = "On above duty", gppwm7_onAboveDuty, {gppwm7_pin != 0 && gppwm7_pwmFrequency == 0}
++		field = "Off below duty", gppwm7_offBelowDuty, {gppwm7_pin != 0 && gppwm7_pwmFrequency == 0}
++		field = "Duty if error", gppwm7_dutyIfError, {gppwm7_pin != 0}
++		field = ""
++		field = "X Axis", gppwm7_rpmAxis, {gppwm7_pin != 0}
++		field = "Y Axis", gppwm7_loadAxis, {gppwm7_pin != 0}
++		field = "Note", gpPwmNote7
++		field = ""
++		field = ""
++		field = ""
++		field = ""
++		field = ""
++
++	dialog = gppwm7, @@GPPWM_7_NAME@@, xAxis
++		topicHelp = "gppwm7Help"
++		panel = gppwm7left
++		panel = gppwm7Tbl, {gppwm7_pin != 0}
++
++	dialog = gppwm8left, ""
++		field = "Output", gppwm8_pin@@if_ts_show_gppwm8_pin
++		field = ""
++		field = "Set frequency to 0hz for on-off mode"
++		field = "Frequency", gppwm8_pwmFrequency, {gppwm8_pin != 0}
++		field = ""
++		field = "On above duty", gppwm8_onAboveDuty, {gppwm8_pin != 0 && gppwm8_pwmFrequency == 0}
++		field = "Off below duty", gppwm8_offBelowDuty, {gppwm8_pin != 0 && gppwm8_pwmFrequency == 0}
++		field = "Duty if error", gppwm8_dutyIfError, {gppwm8_pin != 0}
++		field = ""
++		field = "X Axis", gppwm8_rpmAxis, {gppwm8_pin != 0}
++		field = "Y Axis", gppwm8_loadAxis, {gppwm8_pin != 0}
++		field = "Note", gpPwmNote8
++		field = ""
++		field = ""
++		field = ""
++		field = ""
++		field = ""
++
++	dialog = gppwm8, @@GPPWM_8_NAME@@, xAxis
++		topicHelp = "gppwm8Help"
++		panel = gppwm8left
++		panel = gppwm8Tbl, {gppwm8_pin != 0}
++
+ 	dialog = hpfpCamDialog, "HPFP Cam Configuration"
+ 		topicHelp = "hpfpCamDialogHelp"
+ 		field = "Number of lobes", hpfpCamLobes
+@@ -6789,6 +6917,38 @@ dialog = tcuControls, "Transmission Settings"
+ 		text = "Hysteresis: in on-off mode, turn the output off when the table value is below this duty.<br>"
+ 		text = "If an error (with a sensor, etc) is detected, this value is used instead of reading from the table. This should be a safe value for whatever hardware is connected to prevent damage.<br>"
+ 		text = "Selects the X axis to use for the table.<br>"
++	help = gppwm5Help, "General Purpose PWM 5"
++		text = "General Purpose PWM (GPPWM) outputs.<br>"
++		text = "Select a pin to use for PWM or on-off output.<br>"
++		text = "Select a frequency to run PWM at. Set this to 0hz to enable on-off mode.<br>"
++		text = "Hysteresis: in on-off mode, turn the output on when the table value is above this duty.<br>"
++		text = "Hysteresis: in on-off mode, turn the output off when the table value is below this duty.<br>"
++		text = "If an error (with a sensor, etc) is detected, this value is used instead of reading from the table. This should be a safe value for whatever hardware is connected to prevent damage.<br>"
++		text = "Selects the X axis to use for the table.<br>"
++	help = gppwm6Help, "General Purpose PWM 6"
++		text = "General Purpose PWM (GPPWM) outputs.<br>"
++		text = "Select a pin to use for PWM or on-off output.<br>"
++		text = "Select a frequency to run PWM at. Set this to 0hz to enable on-off mode.<br>"
++		text = "Hysteresis: in on-off mode, turn the output on when the table value is above this duty.<br>"
++		text = "Hysteresis: in on-off mode, turn the output off when the table value is below this duty.<br>"
++		text = "If an error (with a sensor, etc) is detected, this value is used instead of reading from the table. This should be a safe value for whatever hardware is connected to prevent damage.<br>"
++		text = "Selects the X axis to use for the table.<br>"
++	help = gppwm7Help, "General Purpose PWM 7"
++		text = "General Purpose PWM (GPPWM) outputs.<br>"
++		text = "Select a pin to use for PWM or on-off output.<br>"
++		text = "Select a frequency to run PWM at. Set this to 0hz to enable on-off mode.<br>"
++		text = "Hysteresis: in on-off mode, turn the output on when the table value is above this duty.<br>"
++		text = "Hysteresis: in on-off mode, turn the output off when the table value is below this duty.<br>"
++		text = "If an error (with a sensor, etc) is detected, this value is used instead of reading from the table. This should be a safe value for whatever hardware is connected to prevent damage.<br>"
++		text = "Selects the X axis to use for the table.<br>"
++	help = gppwm8Help, "General Purpose PWM 8"
++		text = "General Purpose PWM (GPPWM) outputs.<br>"
++		text = "Select a pin to use for PWM or on-off output.<br>"
++		text = "Select a frequency to run PWM at. Set this to 0hz to enable on-off mode.<br>"
++		text = "Hysteresis: in on-off mode, turn the output on when the table value is above this duty.<br>"
++		text = "Hysteresis: in on-off mode, turn the output off when the table value is below this duty.<br>"
++		text = "If an error (with a sensor, etc) is detected, this value is used instead of reading from the table. This should be a safe value for whatever hardware is connected to prevent damage.<br>"
++		text = "Selects the X axis to use for the table.<br>"
+ 	help = ewgDialogHelp, "Electronic Wastegate actuator"
+ 		text = "Output Min Duty Cycle<br>"
+ 		text = "Output Max Duty Cycle<br>"
+diff --git a/unit_tests/tests/actuators/test_gppwm.cpp b/unit_tests/tests/actuators/test_gppwm.cpp
+index 77f9a4c..7956b9f 100644
+--- a/unit_tests/tests/actuators/test_gppwm.cpp
++++ b/unit_tests/tests/actuators/test_gppwm.cpp
+@@ -218,3 +218,29 @@ TEST(GpPwmCoverage, NaNTableResultAppliesErrorDutyToSwitchHysteresis) {
+ 	EXPECT_FLOAT_EQ(0, ch.update(0).Result);
+ 	EXPECT_FLOAT_EQ(100, ch.update(0).Result);
+ }
++
++// pro-style: 8 general purpose PWM outputs instead of 4
++TEST(GpPwm, EightChannels) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++
++	EXPECT_EQ(8u, efi::size(engineConfiguration->gppwm));
++	EXPECT_EQ(8u, efi::size(engine->outputChannels.gppwmOutput));
++
++	auto& cfg = engineConfiguration->gppwm[7];
++	cfg.pin = Gpio::A7;
++	cfg.pwmFrequency = 0;
++	cfg.onAboveDuty = 60;
++	cfg.offBelowDuty = 50;
++	cfg.rpmAxis = GPPWM_Rpm;
++	cfg.loadAxis = GPPWM_Tps;
++	setTable(cfg.table, 80);
++	initGpPwm();
++
++	Sensor::setMockValue(SensorType::Rpm, 2000);
++	Sensor::setMockValue(SensorType::Tps1, 30);
++	updateGppwm();
++
++	EXPECT_NEAR(80, engine->outputChannels.gppwmOutput[7], 0.5);
++	EXPECT_NEAR(2000, engine->outputChannels.gppwmXAxis[7], 1);
++	EXPECT_NEAR(30, engine->outputChannels.gppwmYAxis[7], 0.1);
++}
+-- 
+2.43.0
+

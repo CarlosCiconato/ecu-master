@@ -1,0 +1,326 @@
+From 85ecee780fda32c290eae7aa98509ee85097f7be Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 11:38:33 +0000
+Subject: [PATCH] Electronic throttle turns back on by itself after a fault
+ (pro-style)
+
+New etbAutoRecoverEnabled (off by default), etbAutoRecoverDelay and
+etbAutoRecoverMaxTries. After a latched intermittent TPS or pedal error, or a jam,
+once both sensors read fine for the delay, the throttle is turned back on (jam rev
+limit lifted too), up to the max number of times per power up. Fatal errors are never
+cleared. Live data etbAutoRecoverCount. TS: in the ETB jam detection dialog.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../actuators/electronic_throttle.cpp         |  36 ++++++
+ .../actuators/electronic_throttle.txt         |   1 +
+ .../actuators/electronic_throttle_impl.h      |   4 +
+ firmware/controllers/limp_manager.cpp         |  11 ++
+ firmware/controllers/limp_manager.h           |  10 ++
+ firmware/integration/rusefi_config.txt        |   6 +-
+ firmware/tunerstudio/tunerstudio.template.ini |   4 +
+ .../tests/actuators/test_etb_integrated.cpp   | 108 ++++++++++++++++++
+ 8 files changed, 179 insertions(+), 1 deletion(-)
+
+diff --git a/firmware/controllers/actuators/electronic_throttle.cpp b/firmware/controllers/actuators/electronic_throttle.cpp
+index 925cd0d..5684feb 100644
+--- a/firmware/controllers/actuators/electronic_throttle.cpp
++++ b/firmware/controllers/actuators/electronic_throttle.cpp
+@@ -678,11 +678,43 @@ bool EtbController::checkStatus() {
+ 		localReason = EtbStatus::Redundancy;
+ 	}
+ 
++	tryAutoRecover(localReason);
++
+ 	etbErrorCode = (int8_t)localReason;
+ 
+ 	return localReason == EtbStatus::None;
+ }
+ 
++void EtbController::tryAutoRecover(EtbStatus reason) {
++	bool isLatchedFault = reason == EtbStatus::IntermittentTps
++		|| reason == EtbStatus::IntermittentPps
++		|| (reason == EtbStatus::JamDetected
++			&& getLimpManager()->getEtbClearReason() == ClearReason::EtbProblem);
++	bool sensorsFine = Sensor::get(m_positionSensor).Valid
++		&& Sensor::get(SensorType::AcceleratorPedal).Valid;
++	bool triesLeft = engineConfiguration->etbAutoRecoverMaxTries == 0
++		|| etbAutoRecoverCount < engineConfiguration->etbAutoRecoverMaxTries;
++
++	if (!engineConfiguration->etbAutoRecoverEnabled || !isLatchedFault || !sensorsFine || !triesLeft) {
++		m_autoRecoverTimer.reset();
++		return;
++	}
++
++	if (!m_autoRecoverTimer.hasElapsedSec(engineConfiguration->etbAutoRecoverDelay)) {
++		return;
++	}
++
++	// turn back on: the next error starts counting from zero again
++	etbTpsErrorCounter = 0;
++	etbPpsErrorCounter = 0;
++	jamDetected = false;
++	m_jamDetectTimer.reset();
++	getLimpManager()->clearEtbJam();
++	etbAutoRecoverCount++;
++	m_autoRecoverTimer.reset();
++	efiPrintf("ETB turned back on after a fault, %d time(s)", etbAutoRecoverCount);
++}
++
+ void EtbController::update() {
+ #if !EFI_UNIT_TEST
+ 	// If we didn't get initialized, fail fast
+@@ -880,6 +912,10 @@ void setBoschVNH2SP30Curve() {
+ void setDefaultEtbParameters() {
+ 	engineConfiguration->etbIdleThrottleRange = 15;
+ 
++	// auto recovery is off by default; when on, 2 s of good sensors and up to 3 times
++	engineConfiguration->etbAutoRecoverDelay = 2;
++	engineConfiguration->etbAutoRecoverMaxTries = 3;
++
+ 	setLinearCurve(config->pedalToTpsPedalBins, /*from*/0, /*to*/100, 1);
+ 	setRpmTableBin(config->pedalToTpsRpmBins);
+ 
+diff --git a/firmware/controllers/actuators/electronic_throttle.txt b/firmware/controllers/actuators/electronic_throttle.txt
+index b1645f0..bd43849 100644
+--- a/firmware/controllers/actuators/electronic_throttle.txt
++++ b/firmware/controllers/actuators/electronic_throttle.txt
+@@ -32,6 +32,7 @@ struct_no_prefix electronic_throttle_s
+ 	int8_t tcEtbDrop;traction control;"%", 1, 0, 0, 100, 0
+ 
+ 	uint16_t autoscale jamTimer;jam timer;"sec", 0.01, 0, 0, 100, 2
++	uint8_t etbAutoRecoverCount;auto recoveries;"count", 1, 0, 0, 100, 0
+ 	uint8_t state
+ 
+ end_struct
+diff --git a/firmware/controllers/actuators/electronic_throttle_impl.h b/firmware/controllers/actuators/electronic_throttle_impl.h
+index e2dea5a..f4a0f17 100644
+--- a/firmware/controllers/actuators/electronic_throttle_impl.h
++++ b/firmware/controllers/actuators/electronic_throttle_impl.h
+@@ -115,6 +115,10 @@ private:
+ 	 */
+ 	bool checkStatus();
+ 
++	// pro-style auto recovery after a sensor error or a jam
++	void tryAutoRecover(EtbStatus reason);
++	Timer m_autoRecoverTimer;
++
+ 	Timer m_jamDetectTimer;
+ 
+ 	// Pedal -> target map
+diff --git a/firmware/controllers/limp_manager.cpp b/firmware/controllers/limp_manager.cpp
+index b61f4a8..45aa5bd 100644
+--- a/firmware/controllers/limp_manager.cpp
++++ b/firmware/controllers/limp_manager.cpp
+@@ -373,6 +373,17 @@ void LimpManager::reportEtbJammed() {
+ 	setFaultRevLimit(/*rpm*/1500, ClearReason::EtbJammedRevLimit);
+ }
+ 
++void LimpManager::clearEtbJam() {
++	// a fatal error is never cleared
++	if (m_allowEtb.clearReason == ClearReason::EtbProblem) {
++		m_allowEtb.reset();
++	}
++	if (m_rpmLimitReason == ClearReason::EtbJammedRevLimit) {
++		m_faultRevLimit = INT32_MAX;
++		m_rpmLimitReason = ClearReason::None;
++	}
++}
++
+ void LimpManager::fatalError() {
+ 	m_allowEtb.clear(ClearReason::Fatal);
+ 	m_allowIgnition.clear(ClearReason::Fatal);
+diff --git a/firmware/controllers/limp_manager.h b/firmware/controllers/limp_manager.h
+index e8f8a05..5ee3c81 100644
+--- a/firmware/controllers/limp_manager.h
++++ b/firmware/controllers/limp_manager.h
+@@ -78,6 +78,11 @@ public:
+ 		return m_value;
+ 	}
+ 
++	void reset() {
++		m_value = true;
++		clearReason = ClearReason::None;
++	}
++
+ 	ClearReason clearReason = ClearReason::None;
+ private:
+ 	bool m_value = true;
+@@ -107,6 +112,9 @@ public:
+ 
+ 	// Other subsystems call these APIs to determine their behavior
+ 	bool allowElectronicThrottle() const;
++	ClearReason getEtbClearReason() const {
++		return m_allowEtb.clearReason;
++	}
+ 
+ 	LimpState allowInjection() const;
+ 	LimpState allowIgnition() const;
+@@ -123,6 +131,8 @@ public:
+ 
+ 	// Other subsystems call these APIs to indicate a problem has occurred
+ 	void reportEtbJammed();
++	// pro-style auto recovery: forget an ETB jam and its rev limit
++	void clearEtbJam();
+ 	void fatalError();
+ 	Timer externalGdiCanBusComms;
+ 
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 509429f..6ba4d9a 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -1904,7 +1904,7 @@ uint8_t autoscale knockFuelTrim;Maximum Amount of Fuel trim when knock;"%", 1, 0
+ 	bit etbSpeedLimitEnabled,"enabled","disabled";pro-style throttle speed limit: maximum opening and closing speed of the electronic throttle by coolant temperature.
+ 	bit transmissionSlipDetectionEnabled,"enabled","disabled";Compare the selected Slip RPM Source with expected RPM for the detected gear. Requires Speed Source = Output Shaft Speed, a valid gear and the minimum vehicle speed. Wheel-based references cannot identify transmission slip.
+ 	bit transmissionSlipRpmSourceIsInputShaftSpeed,"Input Shaft Speed","Engine RPM";Input Shaft Speed measures internal gearbox slip. Engine RPM also includes clutch or torque-converter slip. Accurate gear ratios are required.
+-	bit unusedBit_Fancy24
++	bit etbAutoRecoverEnabled,"enabled","disabled";pro-style: turn the electronic throttle back on by itself after a sensor error or a jam, once the sensors read fine again.
+ 	bit unusedBit_Fancy25
+ 	bit unusedBit_Fancy26
+ 	bit unusedBit_Fancy27
+@@ -2036,6 +2036,10 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ 	uint8_t autoscale coldStartInjectorAfterStart;Keep pulsing this long after the engine starts. 0 = only while cranking.;"s", 0.1, 0, 0, 25, 1
+ 	uint16_t coldStartInjectorPeriod;Time from the start of one pulse to the start of the next.;"ms", 1, 0, 20, 5000, 0
+ 
++! pro-style electronic throttle auto recovery, see etbAutoRecoverEnabled
++	uint8_t autoscale etbAutoRecoverDelay;The sensors must read fine for this long before the throttle is turned back on.;"s", 0.1, 0, 0.1, 25, 1
++	uint8_t etbAutoRecoverMaxTries;How many times the throttle is turned back on before it stays off until the next power up. 0 = no limit.;"", 1, 0, 0, 100, 0
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 0b67b4c..bbb42ba 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -5826,6 +5826,10 @@ dialog = tcuControls, "Transmission Settings"
+ 		field = "Jam detection timeout period",			etbJamTimeout, { etbJamDetectThreshold != 0 }
+ 		field = "Disables jam detection for testing until the next power cycle"
+ 		commandButton = "Temporarily disable jam detection", cmd_etb_disable_jam_detect
++		field = ""
++		field = "Turn back on by itself after a fault",	etbAutoRecoverEnabled
++		field = "Sensors fine for",						etbAutoRecoverDelay, { etbAutoRecoverEnabled }
++		field = "Max times (0 = no limit)",				etbAutoRecoverMaxTries, { etbAutoRecoverEnabled }
+ 
+ 	dialog = etbDialogLeft
+ 		panel = etbDialogBase
+diff --git a/unit_tests/tests/actuators/test_etb_integrated.cpp b/unit_tests/tests/actuators/test_etb_integrated.cpp
+index 74dc3d8..45420f9 100644
+--- a/unit_tests/tests/actuators/test_etb_integrated.cpp
++++ b/unit_tests/tests/actuators/test_etb_integrated.cpp
+@@ -303,3 +303,111 @@ TEST(etb, sentTpsIntegratedDecode) {
+ 	engineConfiguration->customSentTpsMax = 1000;
+ 	ASSERT_NEAR(75, decodeTpsSentValue(2000), EPS2D);
+ }
++
++// pro-style auto recovery: the throttle turns back on by itself after a latched fault
++static EtbController* initEtbAutoRecoverTest() {
++	Sensor::setMockValue(SensorType::AcceleratorPedal, 10, true);
++	EtbController *etb = initEtbIntegratedTest();
++	// ETB controllers are global, start from a clean state
++	etb->etbAutoRecoverCount = 0;
++	etb->etbTpsErrorCounter = 0;
++	etb->etbPpsErrorCounter = 0;
++
++	engine->module<SensorChecker>()->onIgnitionStateChanged(true);
++	engine->module<SensorChecker>()->onSlowCallback();
++	advanceTimeUs(MS2US(6000));
++	engine->module<SensorChecker>()->onSlowCallback();
++
++	engineConfiguration->etbAutoRecoverEnabled = true;
++	engineConfiguration->etbAutoRecoverDelay = 1;
++	engineConfiguration->etbAutoRecoverMaxTries = 2;
++	return etb;
++}
++
++static void makeTpsIntermittent(EtbController *etb) {
++	for (size_t i = 0; i < 51; i++) {
++		Sensor::setInvalidMockValue(SensorType::Tps1);
++		etb->update();
++		Sensor::setMockValue(SensorType::Tps1, 20);
++		etb->update();
++	}
++}
++
++TEST(etb, autoRecoverAfterIntermittentTps) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EtbController *etb = initEtbAutoRecoverTest();
++
++	makeTpsIntermittent(etb);
++	EXPECT_EQ((int)EtbStatus::IntermittentTps, etb->etbErrorCode);
++
++	// sensors fine, but not long enough yet
++	advanceTimeUs(MS2US(500));
++	etb->update();
++	EXPECT_EQ((int)EtbStatus::IntermittentTps, etb->etbErrorCode);
++	EXPECT_EQ(0, etb->etbAutoRecoverCount);
++
++	advanceTimeUs(MS2US(600));
++	etb->update();
++	EXPECT_EQ(1, etb->etbAutoRecoverCount);
++	EXPECT_EQ(0, etb->etbTpsErrorCounter);
++	etb->update();
++	EXPECT_EQ(0, etb->etbErrorCode);
++
++	// second fault, second recovery
++	makeTpsIntermittent(etb);
++	advanceTimeUs(MS2US(1100));
++	etb->update();
++	EXPECT_EQ(2, etb->etbAutoRecoverCount);
++	etb->update();
++	EXPECT_EQ(0, etb->etbErrorCode);
++
++	// out of tries: stays off
++	makeTpsIntermittent(etb);
++	advanceTimeUs(MS2US(5000));
++	etb->update();
++	etb->update();
++	EXPECT_EQ(2, etb->etbAutoRecoverCount);
++	EXPECT_EQ((int)EtbStatus::IntermittentTps, etb->etbErrorCode);
++}
++
++TEST(etb, noAutoRecoverWhileSensorStillBad) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EtbController *etb = initEtbAutoRecoverTest();
++
++	makeTpsIntermittent(etb);
++	Sensor::setInvalidMockValue(SensorType::Tps1);
++	advanceTimeUs(MS2US(5000));
++	etb->update();
++	EXPECT_EQ(0, etb->etbAutoRecoverCount);
++	EXPECT_NE(0, etb->etbErrorCode);
++}
++
++TEST(etb, autoRecoverOffKeepsFaultLatched) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EtbController *etb = initEtbAutoRecoverTest();
++	engineConfiguration->etbAutoRecoverEnabled = false;
++
++	makeTpsIntermittent(etb);
++	advanceTimeUs(MS2US(5000));
++	etb->update();
++	EXPECT_EQ(0, etb->etbAutoRecoverCount);
++	EXPECT_EQ((int)EtbStatus::IntermittentTps, etb->etbErrorCode);
++}
++
++TEST(etb, autoRecoverAfterJam) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EtbController *etb = initEtbAutoRecoverTest();
++
++	getLimpManager()->reportEtbJammed();
++	ASSERT_FALSE(getLimpManager()->allowElectronicThrottle());
++	etb->update();
++	EXPECT_EQ((int)EtbStatus::JamDetected, etb->etbErrorCode);
++
++	advanceTimeUs(MS2US(1100));
++	etb->update();
++	EXPECT_EQ(1, etb->etbAutoRecoverCount);
++	EXPECT_TRUE(getLimpManager()->allowElectronicThrottle());
++	EXPECT_EQ(ClearReason::None, getLimpManager()->getEtbClearReason());
++	etb->update();
++	EXPECT_EQ(0, etb->etbErrorCode);
++}
+-- 
+2.43.0
+

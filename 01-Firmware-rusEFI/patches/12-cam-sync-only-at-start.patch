@@ -1,0 +1,188 @@
+From df78ff984908d99473fa2ef7c06da10e8f9eb95f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 11:51:41 +0000
+Subject: [PATCH] Cam only for phase sync at start (pro-style)
+
+New bit camSyncOnlyAtStart (replaces unusedBit_Fancy25, off by default). Once the
+engine runs with phase sync, cam teeth no longer change the engine phase, so a bad cam
+signal while running cannot shift injection and spark; VVT position still works.
+The decision, together with maxCamPhaseResolveRpm, is in shouldUseCamForPhase().
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../controllers/trigger/trigger_central.cpp   | 20 ++++-
+ .../controllers/trigger/trigger_central.h     |  2 +
+ firmware/integration/rusefi_config.txt        |  2 +-
+ firmware/tunerstudio/tunerstudio.template.ini |  1 +
+ unit_tests/tests/tests.mk                     |  1 +
+ .../trigger/test_cam_sync_only_at_start.cpp   | 73 +++++++++++++++++++
+ 6 files changed, 95 insertions(+), 4 deletions(-)
+ create mode 100644 unit_tests/tests/trigger/test_cam_sync_only_at_start.cpp
+
+diff --git a/firmware/controllers/trigger/trigger_central.cpp b/firmware/controllers/trigger/trigger_central.cpp
+index 94772ac..9e31346 100644
+--- a/firmware/controllers/trigger/trigger_central.cpp
++++ b/firmware/controllers/trigger/trigger_central.cpp
+@@ -179,12 +179,26 @@ PUBLIC_API_WEAK angle_t customAdjustCustom(TriggerCentral *tc, vvt_mode_e vvtMod
+   return 0;
+ }
+ 
+-static angle_t adjustCrankPhase(int camIndex) {
++bool shouldUseCamForPhase(bool hasPhaseSync, bool isRunning, float rpm) {
+ 	float maxSyncThreshold = engineConfiguration->maxCamPhaseResolveRpm;
+-	if (maxSyncThreshold != 0 && Sensor::getOrZero(SensorType::Rpm) > maxSyncThreshold) {
++	if (maxSyncThreshold != 0 && rpm > maxSyncThreshold) {
+ 		// The user has elected to stop trying to resolve crank phase after some RPM.
+ 		// Maybe their cam sensor only works at low RPM or something.
+-		// Anyway, don't try to change crank phase at all, and return that we made no change.
++		return false;
++	}
++
++	// pro-style: phase found at start is kept while the engine runs
++	if (engineConfiguration->camSyncOnlyAtStart && hasPhaseSync && isRunning) {
++		return false;
++	}
++
++	return true;
++}
++
++static angle_t adjustCrankPhase(int camIndex) {
++	if (!shouldUseCamForPhase(getTriggerCentral()->triggerState.hasSynchronizedPhase(),
++			engine->rpmCalculator.isRunning(), Sensor::getOrZero(SensorType::Rpm))) {
++		// don't try to change crank phase at all, and return that we made no change.
+ 		return 0;
+ 	}
+ 
+diff --git a/firmware/controllers/trigger/trigger_central.h b/firmware/controllers/trigger/trigger_central.h
+index 0555d7f..99fd7d5 100644
+--- a/firmware/controllers/trigger/trigger_central.h
++++ b/firmware/controllers/trigger/trigger_central.h
+@@ -234,6 +234,8 @@ private:
+ };
+ 
+ bool isInCamSyncWindow(angle_t position, float windowStart, float windowWidth);
++// pro-style cam only for sync at start, together with maxCamPhaseResolveRpm
++bool shouldUseCamForPhase(bool hasPhaseSync, bool isRunning, float rpm);
+ 
+ void triggerInfo(void);
+ void hwHandleShaftSignal(int signalIndex, bool isRising, efitick_t timestamp);
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 6ba4d9a..eec3553 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -1905,7 +1905,7 @@ uint8_t autoscale knockFuelTrim;Maximum Amount of Fuel trim when knock;"%", 1, 0
+ 	bit transmissionSlipDetectionEnabled,"enabled","disabled";Compare the selected Slip RPM Source with expected RPM for the detected gear. Requires Speed Source = Output Shaft Speed, a valid gear and the minimum vehicle speed. Wheel-based references cannot identify transmission slip.
+ 	bit transmissionSlipRpmSourceIsInputShaftSpeed,"Input Shaft Speed","Engine RPM";Input Shaft Speed measures internal gearbox slip. Engine RPM also includes clutch or torque-converter slip. Accurate gear ratios are required.
+ 	bit etbAutoRecoverEnabled,"enabled","disabled";pro-style: turn the electronic throttle back on by itself after a sensor error or a jam, once the sensors read fine again.
+-	bit unusedBit_Fancy25
++	bit camSyncOnlyAtStart,"at start only","always";pro-style: use the cam only to find the engine phase at start. Once the engine runs with phase sync, cam teeth no longer change the phase (VVT position still works), so a bad cam signal while running cannot shift injection and spark.
+ 	bit unusedBit_Fancy26
+ 	bit unusedBit_Fancy27
+ 	bit unusedBit_Fancy28
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index bbb42ba..5622f09 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -2913,6 +2913,7 @@ cmd_set_engine_type_default					= "@@TS_IO_TEST_COMMAND_char@@@@ts_command_e_TS_
+ 		field = "Require cam/VVT sync for ignition",	isPhaseSyncRequiredForIgnition
+ 		field = "Cam sync crank revolution",      camSyncOnSecondCrankRevolution
+ 		field = "Maximum cam/VVT sync RPM",				maxCamPhaseResolveRpm
++		field = "Use cam for phase",					camSyncOnlyAtStart
+ 		field = "MAP readout angle",					mapCamDetectionAnglePosition, 1, { vvtMode1 == @@vvt_mode_e_VVT_MAP_V_TWIN@@ }
+ 		field = "MAP delta threshold",        mapSyncThreshold, 1, { vvtMode1 == @@vvt_mode_e_VVT_MAP_V_TWIN@@ }
+ 		field = "Enable noise filtering",				useNoiselessTriggerDecoder, {trigger_type == @@trigger_type_e_TT_TOOTHED_WHEEL_60_2@@ || trigger_type == @@trigger_type_e_TT_TOOTHED_WHEEL_36_1@@}@@if_ts_show_useNoiselessTriggerDecoder
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 93e6a6b..8274738 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -31,6 +31,7 @@ TESTS_SRC_CPP = \
+ 	tests/trigger/test_miata_na_tdc.cpp \
+ 	tests/trigger/test_cam_vvt_input.cpp \
+ 	tests/trigger/test_generic_cam_window.cpp \
++	tests/trigger/test_cam_sync_only_at_start.cpp \
+ 	tests/trigger/test_2jz_vvt.cpp \
+ 	tests/trigger/test_toyota_3_tooth_cam.cpp \
+ 	tests/trigger/test_trigger_skipped_wheel.cpp \
+diff --git a/unit_tests/tests/trigger/test_cam_sync_only_at_start.cpp b/unit_tests/tests/trigger/test_cam_sync_only_at_start.cpp
+new file mode 100644
+index 0000000..02f85cf
+--- /dev/null
++++ b/unit_tests/tests/trigger/test_cam_sync_only_at_start.cpp
+@@ -0,0 +1,73 @@
++/*
++ * pro-style cam only for sync at start: once the engine runs with phase sync, a cam
++ * tooth in the other crank turn no longer flips the engine phase.
++ */
++
++#include "pch.h"
++
++TEST(CamSyncOnlyAtStart, Decision) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->maxCamPhaseResolveRpm = 0;
++
++	engineConfiguration->camSyncOnlyAtStart = false;
++	EXPECT_TRUE(shouldUseCamForPhase(true, true, 3000));
++
++	engineConfiguration->camSyncOnlyAtStart = true;
++	// no phase yet, or still cranking: the cam is used
++	EXPECT_TRUE(shouldUseCamForPhase(false, true, 3000));
++	EXPECT_TRUE(shouldUseCamForPhase(true, false, 200));
++	// running with phase: kept
++	EXPECT_FALSE(shouldUseCamForPhase(true, true, 3000));
++
++	// the existing RPM limit still works
++	engineConfiguration->camSyncOnlyAtStart = false;
++	engineConfiguration->maxCamPhaseResolveRpm = 1500;
++	EXPECT_FALSE(shouldUseCamForPhase(false, false, 2000));
++	EXPECT_TRUE(shouldUseCamForPhase(false, false, 1000));
++}
++
++// one crank tooth per turn (half moon, 1200 RPM), single tooth cam at toothMs of each cycle
++static void runCycles(EngineTestHelper& eth, int toothMs, int cycles) {
++	for (int cycle = 0; cycle < cycles; cycle++) {
++		for (int ms = 0; ms < 100; ms++) {
++			eth.moveTimeForwardUs(MS2US(1));
++			if (ms % 50 == 0) {
++				eth.firePrimaryTriggerRise();
++			} else if (ms % 50 == 25) {
++				eth.firePrimaryTriggerFall();
++			}
++			if (ms == toothMs) {
++				hwHandleVvtCamSignal(TriggerValue::RISE, getTimeNowNt(), 0);
++			}
++		}
++	}
++}
++
++static int phaseFlipsAfterCamMoves(bool onlyAtStart) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->triggerInputPins[1] = Gpio::Unassigned;
++	setCrankOperationMode();
++	engineConfiguration->vvtMode[0] = VVT_SINGLE_TOOTH;
++	engineConfiguration->vvtOffsets[0] = 0;
++	eth.setTriggerType(trigger_type_e::TT_HALF_MOON);
++	engineConfiguration->camInputs[0] = Gpio::A10;
++	engineConfiguration->camSyncOnlyAtStart = onlyAtStart;
++
++	runCycles(eth, 12, 20);
++	EXPECT_TRUE(engine->triggerCentral.triggerState.hasSynchronizedPhase());
++	EXPECT_TRUE(engine->rpmCalculator.isRunning());
++	int before = engine->triggerCentral.triggerState.phaseResyncCounter;
++
++	// bad cam signal: the tooth now shows up one crank turn later
++	runCycles(eth, 62, 5);
++	EXPECT_TRUE(engine->triggerCentral.triggerState.hasSynchronizedPhase());
++	return engine->triggerCentral.triggerState.phaseResyncCounter - before;
++}
++
++TEST(CamSyncOnlyAtStart, CamKeepsResyncingByDefault) {
++	EXPECT_GT(phaseFlipsAfterCamMoves(false), 0);
++}
++
++TEST(CamSyncOnlyAtStart, PhaseKeptWhileRunning) {
++	EXPECT_EQ(0, phaseFlipsAfterCamMoves(true));
++}
+-- 
+2.43.0
+

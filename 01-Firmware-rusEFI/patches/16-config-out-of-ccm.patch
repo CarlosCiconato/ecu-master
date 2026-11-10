@@ -1,0 +1,29 @@
+From 13580493a68630c1fd27e8a884f1939903a0a905 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 09:38:25 +0000
+Subject: [PATCH] Proteus F4: keep settings in main SRAM instead of CCM
+
+The 64k CCM had only 180 bytes left with our bigger config. Same as microRusEFI.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ firmware/config/boards/proteus/board.mk | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/firmware/config/boards/proteus/board.mk b/firmware/config/boards/proteus/board.mk
+index 8592a68..9c6af55 100644
+--- a/firmware/config/boards/proteus/board.mk
++++ b/firmware/config/boards/proteus/board.mk
+@@ -28,6 +28,8 @@ endif
+ 
+ # serial ports only on F4
+ ifeq ($(PROJECT_CPU),ARCH_STM32F4)
++	# Main SRAM has room for settings; the 64k CCM is too small for our bigger config.
++	DDEFS += -DPERSISTENT_LOCATION=
+ 	# Hardware serial port on UART 2 -> PD5/PD6
+ 	DDEFS += -DSTM32_UART_USE_USART2=TRUE
+ 	DDEFS += -DTS_PRIMARY_UxART_PORT=UARTD2
+-- 
+2.43.0
+

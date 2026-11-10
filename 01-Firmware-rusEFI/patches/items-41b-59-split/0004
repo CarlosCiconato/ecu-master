@@ -1,0 +1,338 @@
+From f8ea536b9a1e991a191fb98f2be1024a66233e20 Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sat, 31 Oct 2026 22:21:58 +0000
+Subject: [PATCH] Throttle blip on downshift with the electronic throttle,
+ outra-ecu style
+
+Plan item 59 (from the outra-ecu T20K manual; pulled forward from phase 4,
+item 52, because it is useful on the street too).
+- new module DownshiftBlip: each press of the blip button (or a micro
+  switch on the clutch or the gear lever) adds blipThrottleAdd % to the
+  throttle target for blipDuration ms, only at or above blipMinRpm;
+  holding the button does not make the blip longer
+- added on top of the pedal target, before the throttle maximum position
+  and the throttle rev limiter
+- 0 % = off (default)
+- output channel / log: Downshift blip throttle add
+- TunerStudio: Throttle blip on downshift (electronic throttle menu)
+- 4 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ firmware/console/binary/output_channels.txt   |  1 +
+ .../actuators/electronic_throttle.cpp         |  3 +
+ firmware/controllers/algo/engine.h            |  2 +
+ .../modules/downshift_blip/downshift_blip.cpp | 35 ++++++++
+ .../modules/downshift_blip/downshift_blip.h   | 30 +++++++
+ .../modules/downshift_blip/downshift_blip.mk  |  3 +
+ firmware/controllers/modules/modules.mk       |  1 +
+ firmware/integration/rusefi_config.txt        |  7 ++
+ firmware/tunerstudio/top_level_menu.ini       |  1 +
+ firmware/tunerstudio/tunerstudio.template.ini |  8 ++
+ unit_tests/tests/test_downshift_blip.cpp      | 86 +++++++++++++++++++
+ unit_tests/tests/tests.mk                     |  1 +
+ 12 files changed, 178 insertions(+)
+ create mode 100644 firmware/controllers/modules/downshift_blip/downshift_blip.cpp
+ create mode 100644 firmware/controllers/modules/downshift_blip/downshift_blip.h
+ create mode 100644 firmware/controllers/modules/downshift_blip/downshift_blip.mk
+ create mode 100644 unit_tests/tests/test_downshift_blip.cpp
+
+diff --git a/firmware/console/binary/output_channels.txt b/firmware/console/binary/output_channels.txt
+index 62b13cc15b..a15326f2db 100644
+--- a/firmware/console/binary/output_channels.txt
++++ b/firmware/console/binary/output_channels.txt
+@@ -519,4 +519,5 @@ float mapFast
+ 	uint8_t pinLockoutLeft;Password: lockout left;"s", 1, 0, 0, 30, 0
+ 	int8_t[8 iterate] autoscale cylLambdaTrim;Lambda trim cyl;"%", 0.2, 0, -25, 25, 1
+ 	int16_t egtRiseRate;EGT rise rate (fastest);"C/s", 1, 0, -1000, 1000, 0
++	uint8_t blipThrottleAdd;Downshift blip throttle add;"%", 1, 0, 0, 100, 0
+ end_struct
+diff --git a/firmware/controllers/actuators/electronic_throttle.cpp b/firmware/controllers/actuators/electronic_throttle.cpp
+index 5684febc9c..e3744ae275 100644
+--- a/firmware/controllers/actuators/electronic_throttle.cpp
++++ b/firmware/controllers/actuators/electronic_throttle.cpp
+@@ -346,6 +346,9 @@ expected<percent_t> EtbController::getSetpointEtb() {
+ 	}
+ #endif /* EFI_ANTILAG_SYSTEM */
+ 
++	// outra-ecu-style throttle blip on downshift
++	targetPosition += engine->module<DownshiftBlip>()->getThrottleAdd(getTimeNowNt());
++
+   float vehicleSpeed = Sensor::getOrZero(SensorType::VehicleSpeed);
+   float wheelSlip = Sensor::getOrZero(SensorType::WheelSlipRatio);
+   tcEtbDrop = tcEtbDropTable.getValue(wheelSlip, vehicleSpeed);
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index 4944d021b4..b8dddafa7f 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -38,6 +38,7 @@
+ #include "rgb_status_led.h"
+ #include "cylinder_lambda_trim.h"
+ #include "egt_rise_monitor.h"
++#include "downshift_blip.h"
+ #include "ecu_passwords.h"
+ #include "hall_pullup.h"
+ #include "cold_start_injector.h"
+@@ -214,6 +215,7 @@ public:
+         RgbStatusLed,
+         CylinderLambdaTrim,
+         EgtRiseMonitor,
++        DownshiftBlip,
+         HallPullupController,
+         ColdStartInjector,
+         GearShiftDetector,
+diff --git a/firmware/controllers/modules/downshift_blip/downshift_blip.cpp b/firmware/controllers/modules/downshift_blip/downshift_blip.cpp
+new file mode 100644
+index 0000000000..d7f40328e4
+--- /dev/null
++++ b/firmware/controllers/modules/downshift_blip/downshift_blip.cpp
+@@ -0,0 +1,35 @@
++#include "pch.h"
++
++#include "downshift_blip.h"
++
++void DownshiftBlip::update(bool buttonPressed, float rpm, efitick_t nowNt) {
++	bool enabled = engineConfiguration->blipThrottleAdd > 0 && engineConfiguration->blipDuration > 0;
++
++	// a new press starts a blip; holding the button does not make it longer
++	if (enabled && buttonPressed && !m_wasPressed && rpm >= engineConfiguration->blipMinRpm) {
++		m_started = true;
++		m_blipTimer.reset(nowNt);
++	}
++	m_wasPressed = buttonPressed;
++
++	if (!enabled) {
++		m_started = false;
++	}
++}
++
++bool DownshiftBlip::isActive(efitick_t nowNt) const {
++	return m_started
++		&& m_blipTimer.getElapsedSeconds(nowNt) * 1000 < engineConfiguration->blipDuration;
++}
++
++float DownshiftBlip::getThrottleAdd(efitick_t nowNt) const {
++	return isActive(nowNt) ? engineConfiguration->blipThrottleAdd : 0;
++}
++
++void DownshiftBlip::onFastCallback() {
++	bool pressed = isBrainPinValid(engineConfiguration->blipButtonPin)
++		&& efiReadPin(engineConfiguration->blipButtonPin, engineConfiguration->blipButtonPinMode);
++	efitick_t nowNt = getTimeNowNt();
++	update(pressed, Sensor::getOrZero(SensorType::Rpm), nowNt);
++	engine->outputChannels.blipThrottleAdd = getThrottleAdd(nowNt);
++}
+diff --git a/firmware/controllers/modules/downshift_blip/downshift_blip.h b/firmware/controllers/modules/downshift_blip/downshift_blip.h
+new file mode 100644
+index 0000000000..2c1b802f26
+--- /dev/null
++++ b/firmware/controllers/modules/downshift_blip/downshift_blip.h
+@@ -0,0 +1,30 @@
++/*
++ * @file downshift_blip.h
++ *
++ * outra-ecu-style throttle blip on downshift ("punta-taco") with the electronic throttle:
++ * pressing the blip button (or a micro switch on the clutch or the gear lever) adds a
++ * throttle opening for a set time, only above a minimum RPM. The added opening goes on
++ * top of the pedal target, before the throttle maximum and the throttle rev limiter.
++ */
++
++#pragma once
++
++#include <rusefi/timer.h>
++
++class DownshiftBlip : public EngineModule {
++public:
++	using interface_t = DownshiftBlip;
++
++	void onFastCallback() override;
++
++	void update(bool buttonPressed, float rpm, efitick_t nowNt);
++
++	// throttle opening to add right now, in %
++	float getThrottleAdd(efitick_t nowNt) const;
++	bool isActive(efitick_t nowNt) const;
++
++private:
++	bool m_wasPressed = false;
++	bool m_started = false;
++	Timer m_blipTimer;
++};
+diff --git a/firmware/controllers/modules/downshift_blip/downshift_blip.mk b/firmware/controllers/modules/downshift_blip/downshift_blip.mk
+new file mode 100644
+index 0000000000..52cb0964ff
+--- /dev/null
++++ b/firmware/controllers/modules/downshift_blip/downshift_blip.mk
+@@ -0,0 +1,3 @@
++# outra-ecu-style throttle blip on downshift with the electronic throttle
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/downshift_blip
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/downshift_blip/downshift_blip.cpp
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index 5429bbd590..f253e92175 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -24,6 +24,7 @@ include $(PROJECT_DIR)/controllers/modules/tune_selector/tune_selector.mk
+ include $(PROJECT_DIR)/controllers/modules/rgb_status_led/rgb_status_led.mk
+ include $(PROJECT_DIR)/controllers/modules/cylinder_lambda_trim/cylinder_lambda_trim.mk
+ include $(PROJECT_DIR)/controllers/modules/egt_rise/egt_rise.mk
++include $(PROJECT_DIR)/controllers/modules/downshift_blip/downshift_blip.mk
+ include $(PROJECT_DIR)/controllers/modules/hall_pullup/hall_pullup.mk
+ include $(PROJECT_DIR)/controllers/modules/cold_start_injector/cold_start_injector.mk
+ include $(PROJECT_DIR)/controllers/modules/gear_shift/gear_shift.mk
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 197978980c..e97ab0cba7 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2074,6 +2074,13 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ ! outra-ecu-style tune selector switch on an analog input, see TuneSelector
+ 	adc_channel_e tuneSelectorChannel;Analog input of a tune selector switch: 0-5 V is split in equal bands, one per tune (3 tunes: below 1.67 V tune 1, up to 3.33 V tune 2, above tune 3). Moving the switch picks the tune, also with the engine running.
+ 
++! outra-ecu-style throttle blip on downshift, see DownshiftBlip
++	switch_input_pin_e blipButtonPin;Blip button, or a micro switch on the clutch or the gear lever: each press opens the electronic throttle a little for a short time, for downshifts.
++	pin_input_mode_e blipButtonPinMode;
++	uint8_t blipThrottleAdd;Throttle opening added during the blip. 0 = off.;"%", 1, 0, 0, 100, 0
++	uint16_t blipDuration;How long the blip lasts.;"ms", 1, 0, 0, 2000, 0
++	uint16_t blipMinRpm;No blip below this RPM.;"RPM", 1, 0, 0, 15000, 0
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index 064d2bcc79..f2122c0736 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -246,6 +246,7 @@
+ 		subMenu = etbDialog,				"Electronic Throttle Body actuator"@@if_ts_show_etb
+ 		subMenu = etbTpsBiasCurve,			"ETB bias curve (feed forward)"@@if_ts_show_etb_bias_curve
+ 		subMenu = etbSpeedLimitSettings,	"Throttle speed by coolant temperature"@@if_ts_show_etb
++		subMenu = downshiftBlipSettings,	"Throttle blip on downshift"@@if_ts_show_etb
+ 		subMenu = pedalToTpsTbl,			@@pedalToTpsTbl_NAME@@ @@if_ts_show_etb
+ 		subMenu = throttle2TrimTbl,			"ETB #2 Trim", { isTps2Primary } @@if_ts_show_tps2
+ 
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 1985ffd54c..6eefc4237a 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -5775,6 +5775,14 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		panel = etbOpenSpeedCurve, { etbSpeedLimitEnabled }
+ 		panel = etbCloseSpeedCurve, { etbSpeedLimitEnabled }
+ 
++	dialog = downshiftBlipSettings, "Throttle blip on downshift"
++		field = "Each press of the blip button opens the throttle a little for a short time, for downshifts."
++		field = "Throttle added (0 = off)",			blipThrottleAdd
++		field = "Blip time",						blipDuration, { blipThrottleAdd > 0 }
++		field = "Minimum RPM",						blipMinRpm, { blipThrottleAdd > 0 }
++		field = "Blip button",						blipButtonPin, { blipThrottleAdd > 0 }
++		field = "Blip button mode",					blipButtonPinMode, { blipThrottleAdd > 0 && blipButtonPin != 0 }
++
+ 	dialog = etbLimits, "Electronic Throttle Limiting"
+ 		field = "Smoothly close the throttle to limit RPM."
+ 		field = "Soft limiter start",				etbRevLimitStart
+diff --git a/unit_tests/tests/test_downshift_blip.cpp b/unit_tests/tests/test_downshift_blip.cpp
+new file mode 100644
+index 0000000000..df99b923a0
+--- /dev/null
++++ b/unit_tests/tests/test_downshift_blip.cpp
+@@ -0,0 +1,86 @@
++#include "pch.h"
++
++#include "downshift_blip.h"
++#include "electronic_throttle_impl.h"
++#include "mocks.h"
++
++using ::testing::_;
++using ::testing::StrictMock;
++
++// outra-ecu-style throttle blip on downshift
++
++static void setupBlip() {
++	engineConfiguration->blipThrottleAdd = 15;
++	engineConfiguration->blipDuration = 300;
++	engineConfiguration->blipMinRpm = 1500;
++}
++
++TEST(DownshiftBlip, offByDefault) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	DownshiftBlip blip;
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_EQ(0, blip.getThrottleAdd(getTimeNowNt()));
++}
++
++TEST(DownshiftBlip, pressGivesTimedBlip) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupBlip();
++	DownshiftBlip blip;
++
++	blip.update(false, 4000, getTimeNowNt());
++	EXPECT_EQ(0, blip.getThrottleAdd(getTimeNowNt()));
++
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_EQ(15, blip.getThrottleAdd(getTimeNowNt()));
++
++	// holding the button does not make it longer
++	advanceTimeUs(200e3);
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_EQ(15, blip.getThrottleAdd(getTimeNowNt()));
++	advanceTimeUs(150e3);
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_EQ(0, blip.getThrottleAdd(getTimeNowNt()));
++
++	// a new press gives a new blip
++	blip.update(false, 4000, getTimeNowNt());
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_EQ(15, blip.getThrottleAdd(getTimeNowNt()));
++}
++
++TEST(DownshiftBlip, noBlipBelowMinRpm) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupBlip();
++	DownshiftBlip blip;
++	blip.update(false, 1000, getTimeNowNt());
++	blip.update(true, 1000, getTimeNowNt());
++	EXPECT_EQ(0, blip.getThrottleAdd(getTimeNowNt()));
++}
++
++TEST(DownshiftBlip, addsToThrottleTarget) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupBlip();
++	engineConfiguration->etbIdleThrottleRange = 0;
++
++	Sensor::setMockValue(SensorType::Tps1Primary, 0);
++	Sensor::setMockValue(SensorType::Tps1, 0.0f, true);
++	Sensor::setMockValue(SensorType::AcceleratorPedal, 0.0f, true);
++
++	EtbController etb;
++	StrictMock<MockVp3d> pedalMap;
++	EXPECT_CALL(pedalMap, getValue(_, _))
++		.WillRepeatedly([](float xRpm, float y) {
++			return y;
++		});
++	etb.init(DC_Throttle1, nullptr, nullptr, &pedalMap);
++
++	Sensor::setMockValue(SensorType::AcceleratorPedal, 10.0f, true);
++	EXPECT_FLOAT_EQ(10, etb.getSetpoint().value_or(-1));
++
++	auto& blip = engine->module<DownshiftBlip>().unmock();
++	blip.update(false, 4000, getTimeNowNt());
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_FLOAT_EQ(25, etb.getSetpoint().value_or(-1));
++
++	advanceTimeUs(400e3);
++	EXPECT_FLOAT_EQ(10, etb.getSetpoint().value_or(-1));
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 36eb55a2ca..75cb3ea09c 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -283,6 +283,7 @@ TESTS_SRC_CPP = \
+ 	tests/test_cylinder_lambda_trim.cpp \
+ 	tests/test_egt_rise.cpp \
+ 	tests/test_oil_restart_lock.cpp \
++	tests/test_downshift_blip.cpp \
+ 	tests/controllers/modules/map_averaging/test_map_averaging.cpp \
+ 	tests/util/test_utils.cpp \
+ 	tests/controllers/algo/test_engine_cylinder.cpp \
+-- 
+2.43.0
+

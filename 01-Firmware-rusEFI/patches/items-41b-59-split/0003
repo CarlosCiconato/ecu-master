@@ -1,0 +1,227 @@
+From 61169cc2bfb5b1cbb221ee5bf61a639cb608a684 Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sat, 31 Oct 2026 22:15:49 +0000
+Subject: [PATCH] Tune selector switch on an analog input, outra-ecu style
+
+Plan item 58 (from the outra-ecu T20K manual, map selector by voltage).
+- tuneSelectorChannel: analog input of a tune selector switch; 0-5 V is
+  split in equal bands, one per tune (3 tunes: below 1.67 V tune 1, up to
+  3.33 V tune 2, above tune 3)
+- moving the switch picks its tune, also with the engine running; 0.1 V
+  hysteresis at the band edges; empty tunes are skipped as before; the
+  tune button and the app still work, the last change wins
+- TunerStudio: Tunes dialog
+- 5 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ .../modules/tune_selector/tune_selector.cpp   | 43 ++++++++++++-
+ .../modules/tune_selector/tune_selector.h     | 12 +++-
+ firmware/integration/rusefi_config.txt        |  3 +
+ firmware/tunerstudio/tunerstudio.template.ini |  1 +
+ .../tests/controllers/test_tune_selector.cpp  | 61 +++++++++++++++++++
+ 5 files changed, 117 insertions(+), 3 deletions(-)
+
+diff --git a/firmware/controllers/modules/tune_selector/tune_selector.cpp b/firmware/controllers/modules/tune_selector/tune_selector.cpp
+index 0f2c7c0b5d..00edf5b7ff 100644
+--- a/firmware/controllers/modules/tune_selector/tune_selector.cpp
++++ b/firmware/controllers/modules/tune_selector/tune_selector.cpp
+@@ -89,7 +89,29 @@ void TuneSelector::selectTune(uint8_t tune) {
+ 	}
+ }
+ 
++uint8_t TuneSelector::getSelectorPosition(float volts, uint8_t count) const {
++	if (count < 1) {
++		return 1;
++	}
++	float band = 5.0f / count;
++	int position = std::clamp<int>(static_cast<int>(volts / band) + 1, 1, count);
++
++	// stay where we are until the voltage is clearly in the next band
++	if (m_selectorPosition >= 1 && m_selectorPosition <= count && position != m_selectorPosition) {
++		float lower = (m_selectorPosition - 1) * band;
++		float upper = m_selectorPosition * band;
++		if (volts > lower - selectorHysteresis && volts < upper + selectorHysteresis) {
++			position = m_selectorPosition;
++		}
++	}
++	return position;
++}
++
+ void TuneSelector::update(bool buttonPressed) {
++	update(buttonPressed, unexpected);
++}
++
++void TuneSelector::update(bool buttonPressed, SensorResult selectorVoltage) {
+ 	uint8_t count = getTuneCount();
+ 
+ 	// The app (or TunerStudio) picks a tune by writing activeTune
+@@ -97,7 +119,20 @@ void TuneSelector::update(bool buttonPressed) {
+ 	if (configTune != m_lastConfigTune) {
+ 		m_lastConfigTune = configTune;
+ 		selectTune(configTune);
+-	} else if (buttonPressed && !m_wasPressed) {
++	}
++
++	// Selector switch by voltage: a new position picks its tune
++	if (selectorVoltage) {
++		uint8_t position = getSelectorPosition(selectorVoltage.Value, count);
++		if (position != m_selectorPosition) {
++			m_selectorPosition = position;
++			selectTune(position);
++		}
++	} else {
++		m_selectorPosition = 0;
++	}
++
++	if (buttonPressed && !m_wasPressed) {
+ 		// Next usable tune, skipping empty ones
+ 		uint8_t tune = m_activeTune;
+ 		for (uint8_t i = 0; i < count; i++) {
+@@ -126,5 +161,9 @@ void TuneSelector::update(bool buttonPressed) {
+ void TuneSelector::onSlowCallback() {
+ 	bool pressed = isBrainPinValid(engineConfiguration->tuneSwitchPin)
+ 		&& efiReadPin(engineConfiguration->tuneSwitchPin, engineConfiguration->tuneSwitchPinMode);
+-	update(pressed);
++	SensorResult selector = unexpected;
++	if (isAdcChannelValid(engineConfiguration->tuneSelectorChannel)) {
++		selector = adcGetScaledVoltage("tune", engineConfiguration->tuneSelectorChannel);
++	}
++	update(pressed, selector);
+ }
+diff --git a/firmware/controllers/modules/tune_selector/tune_selector.h b/firmware/controllers/modules/tune_selector/tune_selector.h
+index 83a9c72f79..484aaf1e22 100644
+--- a/firmware/controllers/modules/tune_selector/tune_selector.h
++++ b/firmware/controllers/modules/tune_selector/tune_selector.h
+@@ -4,7 +4,9 @@
+  * pro-style tunes ("ajustes"): tune 1 is the main tables, tunes 2 and 3 are
+  * config->extraTunes, each with its own main fuel (ms or VE), ignition, lambda and boost
+  * tables on the main tables axes. A button cycles through the tunes, and the app can pick
+- * one by writing activeTune, also with the engine running.
++ * one by writing activeTune, also with the engine running. A selector switch on an analog
++ * input (outra-ecu style) can also pick the tune by its voltage: 0-5 V split in equal bands,
++ * one per tune.
+  */
+ 
+ #pragma once
+@@ -23,6 +25,13 @@ public:
+ 	void onSlowCallback() override;
+ 
+ 	void update(bool buttonPressed);
++	// selectorVoltage: voltage of the tune selector switch, unexpected when not used
++	void update(bool buttonPressed, SensorResult selectorVoltage);
++
++	// Selector position (1..count) for a voltage, with a little hysteresis around the band
++	// edges so a switch sitting on an edge does not flicker; 0 = no selector
++	uint8_t getSelectorPosition(float volts, uint8_t count) const;
++	static constexpr float selectorHysteresis = 0.1f;
+ 
+ 	// 1 is the main tables, 2 and 3 are config->extraTunes
+ 	uint8_t getActiveTune() const {
+@@ -38,6 +47,7 @@ private:
+ 	uint8_t m_activeTune = 1;
+ 	uint8_t m_lastConfigTune = 0;
+ 	bool m_wasPressed = false;
++	uint8_t m_selectorPosition = 0;
+ };
+ 
+ // Tables of the tune in use
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 5ec2965f9c..197978980c 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2071,6 +2071,9 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ 	uint8_t oilPressureStartTimeout;Time after start for the oil pressure to reach 'After start minimum oil pressure', or the engine is shut off. 0 = 5 s.;"s", 1, 0, 0, 60, 0
+ 	uint8_t oilRestartLockTime;After the engine was shut off for low oil pressure (oil protection or an oil pressure alert with the Engine off action), a new start is blocked for this long. Turning the key off ends the lock. 0 = off.;"s", 1, 0, 0, 255, 0
+ 
++! outra-ecu-style tune selector switch on an analog input, see TuneSelector
++	adc_channel_e tuneSelectorChannel;Analog input of a tune selector switch: 0-5 V is split in equal bands, one per tune (3 tunes: below 1.67 V tune 1, up to 3.33 V tune 2, above tune 3). Moving the switch picks the tune, also with the engine running.
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 1bfd7705e3..1985ffd54c 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -5617,6 +5617,7 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "Tune in use at start-up",			activeTune
+ 		field = "Tune button",						tuneSwitchPin, { tuneCount > 1 }
+ 		field = "Tune button mode",					tuneSwitchPinMode, { tuneCount > 1 && tuneSwitchPin != 0 }
++		field = "Tune selector switch (by voltage)",	tuneSelectorChannel, { tuneCount > 1 }
+ 
+ 	dialog = alertSettings, "Alerts"
+ 		field = "Each alert watches one sensor. When it stays past its limit for the delay, the action runs and the alert output stays on until the next start."
+diff --git a/unit_tests/tests/controllers/test_tune_selector.cpp b/unit_tests/tests/controllers/test_tune_selector.cpp
+index 6157a2693c..948eb5773e 100644
+--- a/unit_tests/tests/controllers/test_tune_selector.cpp
++++ b/unit_tests/tests/controllers/test_tune_selector.cpp
+@@ -152,3 +152,64 @@ TEST_F(TuneSelectorTest, MsTableOfTheTuneIsUsed) {
+ 	float tune2Mass = getInjectionTimeTableFuelMass(3000);
+ 	EXPECT_GT(tune2Mass, mainMass);
+ }
++
++// outra-ecu-style selector switch: 0-5 V in equal bands, one per tune
++
++TEST_F(TuneSelectorTest, SelectorVoltagePicksTune) {
++	tunes().update(false, 0.5f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++	tunes().update(false, 2.5f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++	EXPECT_EQ(&config->extraTunes[0].veTable, &getActiveVeTable());
++	tunes().update(false, 4.5f);
++	EXPECT_EQ(3, tunes().getActiveTune());
++	tunes().update(false, 0.2f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, SelectorHysteresisAtBandEdge) {
++	// 3 tunes: edges at 1.67 V and 3.33 V
++	tunes().update(false, 1.0f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++	// just past the edge: stays on tune 1
++	tunes().update(false, 1.70f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++	// clearly in band 2
++	tunes().update(false, 1.80f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++	// back just under the edge: stays on tune 2
++	tunes().update(false, 1.62f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++	tunes().update(false, 1.5f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, SelectorSkipsEmptyTune) {
++	setTable(config->extraTunes[1].lambdaTable, 0);
++	tunes().update(false, 2.5f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++	// tune 3 is empty: stays on tune 2
++	tunes().update(false, 4.5f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, ButtonStillWorksWithSelector) {
++	tunes().update(false, 0.5f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++	// button moves on while the selector stays put
++	tunes().update(true, 0.5f);
++	tunes().update(false, 0.5f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++	// moving the selector picks its tune again
++	tunes().update(false, 4.5f);
++	EXPECT_EQ(3, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, SelectorFollowsTuneCount) {
++	engineConfiguration->tuneCount = 2;
++	// 2 tunes: one band each side of 2.5 V
++	tunes().update(false, 2.0f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++	tunes().update(false, 4.9f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++}
+-- 
+2.43.0
+

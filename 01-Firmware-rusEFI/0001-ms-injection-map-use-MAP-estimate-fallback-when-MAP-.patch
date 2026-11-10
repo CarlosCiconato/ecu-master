@@ -1,0 +1,117 @@
+From 425ba1791cf35a372bc0132ff1e3306d5c233c8f Mon Sep 17 00:00:00 2001
+From: Carlos Ciconato <354919267+CarlosCiconato@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 08:10:11 +0000
+Subject: [PATCH] ms injection map: use MAP estimate fallback when MAP sensor
+ fails
+
+With the Injection time (ms) strategy on MAP load, a failed MAP sensor
+read as 0 kPa and the table was looked up on its lowest-load row, giving
+a far too short (lean) pulse under load. Now, when MAP is invalid, the
+load comes from SpeedDensityAirmass::getMap(), the same mapEstimateTable
+(RPM x TPS) fallback that speed density uses. Healthy MAP and the TPS
+load variant are unchanged. No config or .ini change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ firmware/controllers/algo/fuel_math.cpp       | 15 ++++-
+ .../test_injection_time_map.cpp               | 61 +++++++++++++++++++
+ 2 files changed, 73 insertions(+), 3 deletions(-)
+
+diff --git a/firmware/controllers/algo/fuel_math.cpp b/firmware/controllers/algo/fuel_math.cpp
+index 590abfcf241..0fbd804c0df 100644
+--- a/firmware/controllers/algo/fuel_math.cpp
++++ b/firmware/controllers/algo/fuel_math.cpp
+@@ -247,9 +247,18 @@ mass_t convertInjectionTimeToFuelMass(floatms_t pulseMs) {
+ }
+ 
+ float getInjectionTimeTableLoad() {
+-	return engineConfiguration->injTimeUseTps
+-		? Sensor::getOrZero(SensorType::Tps1)
+-		: Sensor::getOrZero(SensorType::Map);
++	if (engineConfiguration->injTimeUseTps) {
++		return Sensor::getOrZero(SensorType::Tps1);
++	}
++
++	auto map = Sensor::get(SensorType::Map);
++	if (map) {
++		return map.Value;
++	}
++
++	// Failed MAP: same fallback as speed density (mapEstimateTable by RPM and TPS)
++	// instead of 0 kPa, which would pick the lowest-load row and run lean
++	return sdAirmass.getMap(Sensor::getOrZero(SensorType::Rpm), false);
+ }
+ 
+ // pro-style idle by TPS: only with the ms table on TPS, throttle below the idle threshold
+diff --git a/unit_tests/tests/ignition_injection/test_injection_time_map.cpp b/unit_tests/tests/ignition_injection/test_injection_time_map.cpp
+index 6c6cde2192d..127cdcb4512 100644
+--- a/unit_tests/tests/ignition_injection/test_injection_time_map.cpp
++++ b/unit_tests/tests/ignition_injection/test_injection_time_map.cpp
+@@ -150,3 +150,64 @@ TEST_F(InjectionTimeMap, LoadCompensationByOtherSensor) {
+ 	Sensor::setMockValue(SensorType::Map, 140);
+ 	EXPECT_NEAR(1.2f, getInjectionTimeLoadCompensation(), EPS4D);
+ }
++
++// Failed MAP: the ms table on MAP uses the speed-density fallback (mapEstimateTable by RPM and TPS), not 0 kPa
++class InjectionTimeMapFailedMap : public InjectionTimeMap {
++protected:
++	void SetUp() override {
++		InjectionTimeMap::SetUp();
++		setLinearCurve(config->injTimeLoadBins, 0, 150, 1);
++		setRpmTableBin(config->injTimeRpmBins);
++		for (size_t loadIndex = 0; loadIndex < INJ_TIME_LOAD_COUNT; loadIndex++) {
++			for (size_t rpmIndex = 0; rpmIndex < INJ_TIME_RPM_COUNT; rpmIndex++) {
++				// 0.05 ms per kPa (or % TPS), whatever the RPM
++				config->injTimeTable[loadIndex][rpmIndex] = 1.0f + config->injTimeLoadBins[loadIndex] * 0.05f;
++			}
++		}
++
++		// MAP estimate: 30 kPa + 1 kPa per % TPS, whatever the RPM
++		setLinearCurve(config->mapEstimateTpsBins, 0, 100, 1);
++		setRpmTableBin(config->mapEstimateRpmBins);
++		for (size_t tpsIndex = 0; tpsIndex < MAP_EST_LOAD_COUNT; tpsIndex++) {
++			for (size_t rpmIndex = 0; rpmIndex < MAP_EST_RPM_COUNT; rpmIndex++) {
++				config->mapEstimateTable[tpsIndex][rpmIndex] = 30 + config->mapEstimateTpsBins[tpsIndex];
++			}
++		}
++		Sensor::setMockValue(SensorType::Rpm, 3000);
++	}
++};
++
++TEST_F(InjectionTimeMapFailedMap, HealthyMapUnchanged) {
++	Sensor::setMockValue(SensorType::Tps1, 50);
++	Sensor::setMockValue(SensorType::Map, 100);
++	EXPECT_NEAR(100, getInjectionTimeTableLoad(), EPS4D);
++	EXPECT_NEAR(5.0f * flowGramPerMs(), getInjectionTimeTableFuelMass(3000), 1e-5f);
++}
++
++TEST_F(InjectionTimeMapFailedMap, FailedMapUsesMapEstimate) {
++	Sensor::setMockValue(SensorType::Tps1, 50);
++	Sensor::setInvalidMockValue(SensorType::Map);
++
++	// 30 + 50 = 80 kPa from the estimate, not 0
++	EXPECT_NEAR(80, getInjectionTimeTableLoad(), 1e-3f);
++	// 1 + 80 * 0.05 = 5 ms pulse, 4 ms after deadtime
++	EXPECT_NEAR(4.0f * flowGramPerMs(), getInjectionTimeTableFuelMass(3000), 1e-5f);
++
++	// follows TPS like speed density does
++	Sensor::setMockValue(SensorType::Tps1, 90);
++	EXPECT_NEAR(120, getInjectionTimeTableLoad(), 1e-3f);
++}
++
++TEST_F(InjectionTimeMapFailedMap, TpsLoadModeIgnoresMapFailure) {
++	engineConfiguration->injTimeUseTps = true;
++	Sensor::setMockValue(SensorType::Tps1, 40);
++
++	Sensor::setMockValue(SensorType::Map, 100);
++	EXPECT_NEAR(40, getInjectionTimeTableLoad(), EPS4D);
++	float healthy = getInjectionTimeTableFuelMass(3000);
++
++	Sensor::setInvalidMockValue(SensorType::Map);
++	EXPECT_NEAR(40, getInjectionTimeTableLoad(), EPS4D);
++	EXPECT_NEAR(healthy, getInjectionTimeTableFuelMass(3000), 1e-7f);
++	EXPECT_NEAR(2.0f * flowGramPerMs(), healthy, 1e-5f);
++}
+-- 
+2.39.5 (Apple Git-154)
+

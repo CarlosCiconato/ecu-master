@@ -1,0 +1,719 @@
+From c1e34ec220ee9cc1dff43a11dcb3cb4e7cfab01b Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sun, 1 Nov 2026 15:16:54 +0000
+Subject: [PATCH] Traction control wheel speeds from wired sensors or the CAN
+ network (ABS)
+
+Requested by Carlos (next firmware round, 01/11): wheel speeds by wire
+and, if possible, also from CAN (car ABS or a module).
+- new module TractionWheels, tcWheelSource:
+  - wired: aux speed input 1 = front wheel, 2 = rear wheel, km/h from
+    the tone ring teeth and the tire circumference
+  - CAN: new targets Wheel speed FL/FR/RL/RR (km/h) for the custom CAN
+    frames (any ABS whose frame layout is known) and the pro CAN
+    slots; ftcan_target_e now 4 bits
+  - axle speed = average of the wheels that work (CAN timeout 0.5 s)
+- slip = driven / free axle (rear or front drive), not below tcMinSpeed,
+  published as the WheelSlipRatio sensor that the existing traction
+  control tables use (timing drop, ignition skip, throttle drop by slip
+  x speed)
+- optional traction control switch (tcSwitchPin)
+- with no other speed sensor the free axle gives the vehicle speed
+- CAN VSS and aux speed slip now register only when the sensor is free
+  (no duplicate registration error)
+- new alert sensor 'Wheel slip %' (gppwm channel 49); blend label offset
+  49 -> 50
+- live data: Wheel speed front/rear, Wheel slip %
+- TunerStudio: Traction Control wheel speeds
+- 4 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ firmware/console/binary/output_channels.txt   |   3 +
+ .../actuators/gppwm_channel_reader.cpp        |   2 +
+ firmware/controllers/algo/engine.h            |   2 +
+ firmware/controllers/algo/rusefi_enums.h      |  14 ++
+ firmware/controllers/can/can_vss.cpp          |   9 +-
+ firmware/controllers/can/ftcan_receiver.cpp   |  12 ++
+ firmware/controllers/modules/modules.mk       |   1 +
+ .../traction_wheels/traction_wheels.cpp       | 162 ++++++++++++++++++
+ .../modules/traction_wheels/traction_wheels.h |  54 ++++++
+ .../traction_wheels/traction_wheels.mk        |   3 +
+ .../init/sensor/init_aux_speed_sensor.cpp     |   4 +-
+ firmware/init/sensor/init_sensors.cpp         |   3 +
+ firmware/integration/rusefi_config.txt        |  13 +-
+ firmware/tunerstudio/tunerstudio.template.ini |  32 +++-
+ unit_tests/tests/test_traction_wheels.cpp     |  87 ++++++++++
+ unit_tests/tests/tests.mk                     |   1 +
+ 16 files changed, 390 insertions(+), 12 deletions(-)
+ create mode 100644 firmware/controllers/modules/traction_wheels/traction_wheels.cpp
+ create mode 100644 firmware/controllers/modules/traction_wheels/traction_wheels.h
+ create mode 100644 firmware/controllers/modules/traction_wheels/traction_wheels.mk
+ create mode 100644 unit_tests/tests/test_traction_wheels.cpp
+
+diff --git a/firmware/console/binary/output_channels.txt b/firmware/console/binary/output_channels.txt
+index f47ff0d4c09..621cd7aa905 100644
+--- a/firmware/console/binary/output_channels.txt
++++ b/firmware/console/binary/output_channels.txt
+@@ -526,4 +526,7 @@ float mapFast
+ 	uint8_t wmiDuty;WMI duty;"%", 1, 0, 0, 100, 0
+ ! 0 off, 1 ready, 2 flowing, 3 tank low, 4 fault (asked with the tank low)
+ 	uint8_t wmiStatus;WMI status;"", 1, 0, 0, 4, 0
++	uint16_t autoscale wheelSpeedFront;Wheel speed front;"km/h", 0.1, 0, 0, 500, 1
++	uint16_t autoscale wheelSpeedRear;Wheel speed rear;"km/h", 0.1, 0, 0, 500, 1
++	int16_t autoscale wheelSlip;Wheel slip;"%", 0.1, 0, -100, 300, 1
+ end_struct
+diff --git a/firmware/controllers/actuators/gppwm_channel_reader.cpp b/firmware/controllers/actuators/gppwm_channel_reader.cpp
+index be87065e409..9dcdf88b05f 100644
+--- a/firmware/controllers/actuators/gppwm_channel_reader.cpp
++++ b/firmware/controllers/actuators/gppwm_channel_reader.cpp
+@@ -170,6 +170,8 @@ expected<float> readGppwmChannel(gppwm_channel_e channel) {
+ 		return engine->module<EgtRiseMonitor>()->getMaxRiseRate();
+ 	case GPPWM_WmiFault:
+ 		return engine->module<WaterMethanol>()->isFault() ? 1.0f : 0.0f;
++	case GPPWM_WheelSlip:
++		return engine->module<TractionWheels>().unmock().getSlipPercent(getTimeNowNt());
+ 	case GPPWM_ThrottleRatio:
+ #if EFI_ENGINE_CONTROL
+ 		return getThrottlePressureRatio(Sensor::getOrZero(SensorType::Map));
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index 550f80e445e..6643ea47e6d 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -41,6 +41,7 @@
+ #include "downshift_blip.h"
+ #include "shift_light.h"
+ #include "water_methanol.h"
++#include "traction_wheels.h"
+ #include "ecu_passwords.h"
+ #include "hall_pullup.h"
+ #include "cold_start_injector.h"
+@@ -220,6 +221,7 @@ public:
+         DownshiftBlip,
+         ShiftLight,
+         WaterMethanol,
++        TractionWheels,
+         HallPullupController,
+         ColdStartInjector,
+         GearShiftDetector,
+diff --git a/firmware/controllers/algo/rusefi_enums.h b/firmware/controllers/algo/rusefi_enums.h
+index 61a4ee8e3ec..adfe4940000 100644
+--- a/firmware/controllers/algo/rusefi_enums.h
++++ b/firmware/controllers/algo/rusefi_enums.h
+@@ -396,6 +396,13 @@ typedef enum __attribute__ ((__packed__)) {
+ 	ALERT_ENGINE_OFF = 3,
+ } alert_action_e;
+ 
++// Where traction control reads the wheel speeds, see TractionWheels
++typedef enum __attribute__ ((__packed__)) {
++	TC_WHEELS_OFF = 0,
++	TC_WHEELS_WIRED = 1,
++	TC_WHEELS_CAN = 2,
++} tc_wheel_source_e;
++
+ // Where a value read from the pro CAN network goes, see FtcanReceiver
+ typedef enum __attribute__ ((__packed__)) {
+ 	FTCAN_TARGET_NONE = 0,
+@@ -405,6 +412,11 @@ typedef enum __attribute__ ((__packed__)) {
+ 	FTCAN_TARGET_AUX_TEMP1 = 4,
+ 	FTCAN_TARGET_AUX_TEMP2 = 5,
+ 	FTCAN_TARGET_FUEL_LEVEL = 6,
++	// traction control wheel speeds, km/h (TractionWheels)
++	FTCAN_TARGET_WHEEL_FL = 7,
++	FTCAN_TARGET_WHEEL_FR = 8,
++	FTCAN_TARGET_WHEEL_RL = 9,
++	FTCAN_TARGET_WHEEL_RR = 10,
+ } ftcan_target_e;
+ 
+ typedef enum __attribute__ ((__packed__)) {
+@@ -773,6 +785,8 @@ typedef enum __attribute__ ((__packed__)) {
+ 	GPPWM_EgtRiseRate = 47,
+ 	// water/methanol asked but the tank is low (1) or not (0)
+ 	GPPWM_WmiFault = 48,
++	// traction control wheel slip, driven axle over free axle, %
++	GPPWM_WheelSlip = 49,
+ 	// remember to manually sync 'pwmAxisLabels' in tunerstudio.template.ini
+ 	// todo: rename 'pwmAxisLabels' and maybe even gppwm_channel_e since we now use wider than just 'gppwm'?
+ } gppwm_channel_e;
+diff --git a/firmware/controllers/can/can_vss.cpp b/firmware/controllers/can/can_vss.cpp
+index 623faf30571..38ec1653764 100644
+--- a/firmware/controllers/can/can_vss.cpp
++++ b/firmware/controllers/can/can_vss.cpp
+@@ -205,8 +205,13 @@ void initCanVssSupport() {
+ 		if (auto canId = look_up_vss_can_id(engineConfiguration->canVssNbcType)) {
+ 			filterVssCanID = canId.Value;
+ 			filterSecondVssCanID = look_up_second_vss_can_id(engineConfiguration->canVssNbcType);
+-			canSpeed.Register();
+-			wheelSlipRatio.Register();
++			// a sensor already given by another source (traction control wheels) stays
++			if (!Sensor::hasSensor(SensorType::VehicleSpeed)) {
++				canSpeed.Register();
++			}
++			if (!Sensor::hasSensor(SensorType::WheelSlipRatio)) {
++				wheelSlipRatio.Register();
++			}
+ 			isInit = true;
+ 		} else {
+ 			isInit = false;
+diff --git a/firmware/controllers/can/ftcan_receiver.cpp b/firmware/controllers/can/ftcan_receiver.cpp
+index 8f811a986f0..3d42f66bcce 100644
+--- a/firmware/controllers/can/ftcan_receiver.cpp
++++ b/firmware/controllers/can/ftcan_receiver.cpp
+@@ -234,7 +234,15 @@ static FtcanValueSensor* canTargetSensor(ftcan_target_e target) {
+ 	return &targetSensors[index];
+ }
+ 
++static bool isWheelTarget(ftcan_target_e target) {
++	return target >= FTCAN_TARGET_WHEEL_FL && target <= FTCAN_TARGET_WHEEL_RR;
++}
++
+ void registerCanTarget(ftcan_target_e target, int timeoutMs) {
++	if (isWheelTarget(target)) {
++		// wheel speeds are kept by TractionWheels, nothing to register
++		return;
++	}
+ 	auto sensor = canTargetSensor(target);
+ 	if (!sensor) {
+ 		return;
+@@ -244,6 +252,10 @@ void registerCanTarget(ftcan_target_e target, int timeoutMs) {
+ }
+ 
+ void setCanTargetValue(ftcan_target_e target, float value, efitick_t nowNt) {
++	if (isWheelTarget(target)) {
++		engine->module<TractionWheels>().unmock().setCanWheelSpeed((TcWheel)(target - FTCAN_TARGET_WHEEL_FL), value, nowNt);
++		return;
++	}
+ 	auto sensor = canTargetSensor(target);
+ 	if (sensor) {
+ 		sensor->setValidValue(value, nowNt);
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index acbd4366e7d..002629f7352 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -27,6 +27,7 @@ include $(PROJECT_DIR)/controllers/modules/egt_rise/egt_rise.mk
+ include $(PROJECT_DIR)/controllers/modules/downshift_blip/downshift_blip.mk
+ include $(PROJECT_DIR)/controllers/modules/shift_light/shift_light.mk
+ include $(PROJECT_DIR)/controllers/modules/water_methanol/water_methanol.mk
++include $(PROJECT_DIR)/controllers/modules/traction_wheels/traction_wheels.mk
+ include $(PROJECT_DIR)/controllers/modules/hall_pullup/hall_pullup.mk
+ include $(PROJECT_DIR)/controllers/modules/cold_start_injector/cold_start_injector.mk
+ include $(PROJECT_DIR)/controllers/modules/gear_shift/gear_shift.mk
+diff --git a/firmware/controllers/modules/traction_wheels/traction_wheels.cpp b/firmware/controllers/modules/traction_wheels/traction_wheels.cpp
+new file mode 100644
+index 00000000000..a293c3e9b71
+--- /dev/null
++++ b/firmware/controllers/modules/traction_wheels/traction_wheels.cpp
+@@ -0,0 +1,162 @@
++#include "pch.h"
++
++#include "traction_wheels.h"
++
++// a CAN wheel speed older than this is not used
++static constexpr float canWheelTimeoutSec = 0.5f;
++
++float TractionWheels::wiredHzToKph(float hz, int pulsesPerRev) {
++	if (pulsesPerRev <= 0) {
++		return 0;
++	}
++	// revs per second x circumference (m) = m/s, x 3.6 = km/h
++	float circumferenceM = engineConfiguration->tcTireCircumference / 1000.0f;
++	return hz / pulsesPerRev * circumferenceM * 3.6f;
++}
++
++void TractionWheels::setCanWheelSpeed(TcWheel wheel, float kph, efitick_t nowNt) {
++	size_t i = (size_t)wheel;
++	if (i >= TC_WHEEL_COUNT) {
++		return;
++	}
++	m_canSpeed[i] = kph;
++	m_canTime[i] = nowNt;
++	m_canSeen[i] = true;
++}
++
++expected<float> TractionWheels::canAxle(TcWheel left, TcWheel right, efitick_t nowNt) const {
++	float sum = 0;
++	int count = 0;
++	for (auto wheel : { left, right }) {
++		size_t i = (size_t)wheel;
++		if (m_canSeen[i] && NT2US(nowNt - m_canTime[i]) * 1e-6f < canWheelTimeoutSec) {
++			sum += m_canSpeed[i];
++			count++;
++		}
++	}
++	if (count == 0) {
++		return unexpected;
++	}
++	return sum / count;
++}
++
++static expected<float> wiredAxle(SensorType type, int pulsesPerRev) {
++	auto hz = Sensor::get(type);
++	if (!hz) {
++		return unexpected;
++	}
++	return TractionWheels::wiredHzToKph(hz.Value, pulsesPerRev);
++}
++
++expected<float> TractionWheels::getFrontSpeed(efitick_t nowNt) const {
++	switch (engineConfiguration->tcWheelSource) {
++	case TC_WHEELS_WIRED:
++		return wiredAxle(SensorType::AuxSpeed1, engineConfiguration->tcFrontPulsesPerRev);
++	case TC_WHEELS_CAN:
++		return canAxle(TcWheel::FrontLeft, TcWheel::FrontRight, nowNt);
++	default:
++		return unexpected;
++	}
++}
++
++expected<float> TractionWheels::getRearSpeed(efitick_t nowNt) const {
++	switch (engineConfiguration->tcWheelSource) {
++	case TC_WHEELS_WIRED:
++		return wiredAxle(SensorType::AuxSpeed2, engineConfiguration->tcRearPulsesPerRev);
++	case TC_WHEELS_CAN:
++		return canAxle(TcWheel::RearLeft, TcWheel::RearRight, nowNt);
++	default:
++		return unexpected;
++	}
++}
++
++bool TractionWheels::isEnabledBySwitch() const {
++#if EFI_GPIO_HARDWARE
++	if (isBrainPinValid(engineConfiguration->tcSwitchPin)) {
++		return efiReadPin(engineConfiguration->tcSwitchPin, engineConfiguration->tcSwitchPinMode);
++	}
++#endif
++	// no switch: always on
++	return true;
++}
++
++expected<float> TractionWheels::getSlipRatio(efitick_t nowNt) const {
++	if (engineConfiguration->tcWheelSource == TC_WHEELS_OFF || !isEnabledBySwitch()) {
++		return unexpected;
++	}
++	auto front = getFrontSpeed(nowNt);
++	auto rear = getRearSpeed(nowNt);
++	if (!front || !rear) {
++		return unexpected;
++	}
++	bool frontDriven = engineConfiguration->tcFrontWheelDrive;
++	float driven = frontDriven ? front.Value : rear.Value;
++	float free = frontDriven ? rear.Value : front.Value;
++	if (free < std::max<float>(engineConfiguration->tcMinSpeed, 1)) {
++		return unexpected;
++	}
++	return driven / free;
++}
++
++expected<float> TractionWheels::getSlipPercent(efitick_t nowNt) const {
++	auto ratio = getSlipRatio(nowNt);
++	if (!ratio) {
++		return unexpected;
++	}
++	return (ratio.Value - 1) * 100;
++}
++
++void TractionWheels::onSlowCallback() {
++	efitick_t nowNt = getTimeNowNt();
++	engine->outputChannels.wheelSpeedFront = getFrontSpeed(nowNt).value_or(0);
++	engine->outputChannels.wheelSpeedRear = getRearSpeed(nowNt).value_or(0);
++	engine->outputChannels.wheelSlip = getSlipPercent(nowNt).value_or(0);
++}
++
++class TractionSlipSensor : public Sensor {
++public:
++	TractionSlipSensor() : Sensor(SensorType::WheelSlipRatio) {}
++
++	SensorResult get() const final override {
++		auto ratio = engine->module<TractionWheels>().unmock().getSlipRatio(getTimeNowNt());
++		if (!ratio) {
++			return UnexpectedCode::Unknown;
++		}
++		return ratio.Value;
++	}
++
++	void showInfo(const char*) const override {}
++};
++
++// vehicle speed from the free (not driven) axle, only when no other speed sensor exists
++class FreeAxleSpeedSensor : public Sensor {
++public:
++	FreeAxleSpeedSensor() : Sensor(SensorType::VehicleSpeed) {}
++
++	SensorResult get() const final override {
++		auto& wheels = engine->module<TractionWheels>().unmock();
++		efitick_t nowNt = getTimeNowNt();
++		auto speed = engineConfiguration->tcFrontWheelDrive ? wheels.getRearSpeed(nowNt) : wheels.getFrontSpeed(nowNt);
++		if (!speed) {
++			return UnexpectedCode::Unknown;
++		}
++		return speed.Value;
++	}
++
++	void showInfo(const char*) const override {}
++};
++
++static TractionSlipSensor slipSensor;
++static FreeAxleSpeedSensor freeAxleSpeed;
++
++void initTractionWheels() {
++	if (engineConfiguration->tcWheelSource == TC_WHEELS_OFF) {
++		return;
++	}
++	if (!Sensor::hasSensor(SensorType::WheelSlipRatio)) {
++		slipSensor.Register();
++	}
++	if (!Sensor::hasSensor(SensorType::VehicleSpeed)) {
++		freeAxleSpeed.Register();
++	}
++}
+diff --git a/firmware/controllers/modules/traction_wheels/traction_wheels.h b/firmware/controllers/modules/traction_wheels/traction_wheels.h
+new file mode 100644
+index 00000000000..8307ae1b490
+--- /dev/null
++++ b/firmware/controllers/modules/traction_wheels/traction_wheels.h
+@@ -0,0 +1,54 @@
++/*
++ * @file traction_wheels.h
++ *
++ * Wheel speeds for traction control, from wired sensors or from the CAN network.
++ * - wired: aux speed input 1 = front wheel, aux speed input 2 = rear wheel, turned into
++ *   km/h with the teeth of each tone ring and the tire circumference
++ * - CAN: four wheel speeds in km/h received by the custom CAN frames (any ABS, when its
++ *   frame layout is known) or by the pro CAN slots, targets 'Wheel speed FL/FR/RL/RR'
++ * The axle speed is the average of the wheels that work. Slip = driven axle / free axle,
++ * published as the WheelSlipRatio sensor that the traction control tables already use
++ * (timing drop, spark skip and throttle drop by slip x speed).
++ */
++
++#pragma once
++
++#define TC_WHEEL_COUNT 4
++
++enum class TcWheel : uint8_t {
++	FrontLeft = 0,
++	FrontRight = 1,
++	RearLeft = 2,
++	RearRight = 3,
++};
++
++class TractionWheels : public EngineModule {
++public:
++	using interface_t = TractionWheels;
++
++	void onSlowCallback() override;
++
++	void setCanWheelSpeed(TcWheel wheel, float kph, efitick_t nowNt);
++
++	expected<float> getFrontSpeed(efitick_t nowNt) const;
++	expected<float> getRearSpeed(efitick_t nowNt) const;
++	// driven / free, unexpected when off, switched off, a speed is missing or below the minimum speed
++	expected<float> getSlipRatio(efitick_t nowNt) const;
++	// (driven - free) / free in %
++	expected<float> getSlipPercent(efitick_t nowNt) const;
++
++	bool isEnabledBySwitch() const;
++
++	// wired sensor frequency (Hz) to km/h
++	static float wiredHzToKph(float hz, int pulsesPerRev);
++
++private:
++	expected<float> canAxle(TcWheel left, TcWheel right, efitick_t nowNt) const;
++
++	float m_canSpeed[TC_WHEEL_COUNT] = {};
++	efitick_t m_canTime[TC_WHEEL_COUNT] = {};
++	bool m_canSeen[TC_WHEEL_COUNT] = {};
++};
++
++// registers the wheel slip sensor when a wheel speed source is chosen (after the other sensors)
++void initTractionWheels();
+diff --git a/firmware/controllers/modules/traction_wheels/traction_wheels.mk b/firmware/controllers/modules/traction_wheels/traction_wheels.mk
+new file mode 100644
+index 00000000000..d3554cc5a6b
+--- /dev/null
++++ b/firmware/controllers/modules/traction_wheels/traction_wheels.mk
+@@ -0,0 +1,3 @@
++# Traction control wheel speeds from wired sensors or CAN, wheel slip sensor
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/traction_wheels
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/traction_wheels/traction_wheels.cpp
+diff --git a/firmware/init/sensor/init_aux_speed_sensor.cpp b/firmware/init/sensor/init_aux_speed_sensor.cpp
+index a074dcfe846..762d931b4e7 100644
+--- a/firmware/init/sensor/init_aux_speed_sensor.cpp
++++ b/firmware/init/sensor/init_aux_speed_sensor.cpp
+@@ -47,7 +47,9 @@ void initAuxSpeedSensors() {
+ 			engineConfiguration->auxSpeedSensorInputPin[0], converter, engineConfiguration->auxFrequencyFilter);
+ 	auxSpeed2.initIfValid(engineConfiguration->auxSpeedSensorInputPin[1], converter, 0.05f);
+ 
+-	if (engineConfiguration->useAuxSpeedForSlipRatio) {
++	// the traction control wheel speeds give a better slip (km/h per axle) when chosen
++	if (engineConfiguration->useAuxSpeedForSlipRatio && engineConfiguration->tcWheelSource == TC_WHEELS_OFF
++			&& !Sensor::hasSensor(SensorType::WheelSlipRatio)) {
+ 		wheelSlipSensor.Register();
+ 	}
+ }
+diff --git a/firmware/init/sensor/init_sensors.cpp b/firmware/init/sensor/init_sensors.cpp
+index ef4c4b15858..13e91743681 100644
+--- a/firmware/init/sensor/init_sensors.cpp
++++ b/firmware/init/sensor/init_sensors.cpp
+@@ -9,6 +9,7 @@
+ #include "io_pins.h"
+ #include "lua_hooks.h"
+ #include "ftcan_receiver.h"
++#include "traction_wheels.h"
+ #include "can_custom_frames.h"
+ 
+ static void initSensorCli();
+@@ -144,6 +145,8 @@ void initNewSensors() {
+ 	// pro products over CAN fill the sensors still free
+ 	initFtcanSensors();
+ 	initCustomCanFrames();
++	// traction control wheel speeds (wired or CAN) give the wheel slip
++	initTractionWheels();
+ 
+ 	// Init CLI functionality for sensors (mocking)
+ 	initSensorCli();
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index c97b54e6797..7654c3d622b 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2100,6 +2100,17 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ 	int8_t autoscale wmiTimingAdd;Timing added while WMI flows - full value at 100 % duty - scaled by the duty.;"deg", 0.1, 0, -12, 12, 1
+ 	int8_t wmiFuelTrim;Fuel change while WMI flows - full value at 100 % duty - scaled by the duty (methanol is fuel: often negative).;"%", 1, 0, -50, 50, 0
+ 
++! Traction control wheel speeds, see TractionWheels
++custom tc_wheel_source_e 1 bits, U08, @OFFSET@, [0:1], "Off", "Wired (aux speed 1 front - 2 rear)", "CAN (wheel speed FL FR RL RR)", "INVALID"
++	tc_wheel_source_e tcWheelSource;Where the wheel speeds come from. Wired: aux speed input 1 = front wheel and 2 = rear wheel. CAN: custom CAN frames or pro CAN slots with target 'Wheel speed FL/FR/RL/RR' in km/h (ABS of the car or a module). The slip feeds the traction control tables.
++	uint8_t tcFrontWheelDrive;Driven axle: 0 = rear wheel drive - 1 = front wheel drive.;"", 1, 0, 0, 1, 0
++	uint8_t tcMinSpeed;No slip below this speed of the free axle.;"km/h", 1, 0, 0, 100, 0
++	uint8_t tcFrontPulsesPerRev;Wired: teeth of the front tone ring (pulses per wheel turn).;"", 1, 0, 0, 255, 0
++	uint8_t tcRearPulsesPerRev;Wired: teeth of the rear tone ring.;"", 1, 0, 0, 255, 0
++	uint16_t tcTireCircumference;Wired: tire rolling circumference.;"mm", 1, 0, 0, 4000, 0
++	switch_input_pin_e tcSwitchPin;Optional traction control switch: when set the traction control only works while the switch is active.
++	pin_input_mode_e tcSwitchPinMode;
++
+ ! pro-style custom firing order, used when firingOrder is FO_CUSTOM
+ 	uint8_t[MAX_CYLINDER_COUNT iterate] customFiringOrder;Cylinder number fired at this position of the custom firing order (only the first 'Number of cylinders' positions are used). Example K20: 1, 3, 4, 2. Each cylinder must appear once, or 1, 2, 3... is used and a warning is shown.;"", 1, 0, 1, @@MAX_CYLINDER_COUNT@@, 0
+ 
+@@ -2854,7 +2865,7 @@ ecu_passwords_s ecuPasswords;
+ 
+ ! pro CAN receive (FtcanReceiver): dash CAN protocol real-time data from pro products, by DataID
+ #define FTCAN_SENSOR_COUNT 4
+-custom ftcan_target_e 1 bits, U08, @OFFSET@, [0:2], "None", "Oil pressure", "Fuel pressure", "Oil temperature", "Aux temp 1", "Aux temp 2", "Fuel level"
++custom ftcan_target_e 1 bits, U08, @OFFSET@, [0:3], "None", "Oil pressure", "Fuel pressure", "Oil temperature", "Aux temp 1", "Aux temp 2", "Fuel level", "Wheel speed FL (km/h)", "Wheel speed FR (km/h)", "Wheel speed RL (km/h)", "Wheel speed RR (km/h)"
+ uint16_t ftcanLambda1DataId;DataID read as Lambda 1: 18 = general O2, 19 to 26 = O2 of cylinder 1 to 8. 0 = off.;"", 1, 0, 0, 1023, 0
+ uint16_t ftcanLambda2DataId;DataID read as Lambda 2. 0 = off.;"", 1, 0, 0, 1023, 0
+ struct ftcan_sensor_s
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index bc31e779b17..4e88a6e88b3 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -116,7 +116,7 @@ enable2ndByteCanID = false
+ #define pin_mode_e_enum="default", "INVALID", "INVALID", "INVALID", "opendrain", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "PULLUP", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "PULLDOWN"
+ #define pin_input_mode_e_enum="DEFAULT", "PULLUP", "PULLDOWN", "INVALID", "INVERTED DEFAULT", "INVERTED PULLUP", "INVERTED PULLDOWN", "INVALID
+ #define pin_output_mode_e_enum="default", "default inverted", "open collector", "open collector inverted"
+-#define gppwm_channel_e_enum="Zero", "TPS", "MAP", "CLT", "IAT", "Fuel Load", "Ignition Load", "Aux Temp 1", "Aux Temp 2", "Accel Pedal", "Battery Voltage", "VVT 1 In Actual", "VVT 1 Ex Actual", "VVT 2 In Actual", "VVT 2 Ex Actual", "Ethanol (Flex) %", "Aux Linear 1", "Aux Linear 2", "GPPWM Output 1", "GPPWM Output 2", "GPPWM Output 3", "GPPWM Output 4", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure", "EGT 1", "EGT 2", "Aux Linear 3", "Aux Linear 4", "Vehicle speed", "Oil pressure", "Oil temp", "Fuel Pressure", "Throttle Ratio", "EGT 3", "EGT 4", "EGT 5", "EGT 6", "EGT 7", "EGT 8", "Fuel Pressure Diff", "EGT max", "Closed loop trim", "Turbo speed", "MAP over ethanol limit", "EGT rise rate", "WMI fault"
++#define gppwm_channel_e_enum="Zero", "TPS", "MAP", "CLT", "IAT", "Fuel Load", "Ignition Load", "Aux Temp 1", "Aux Temp 2", "Accel Pedal", "Battery Voltage", "VVT 1 In Actual", "VVT 1 Ex Actual", "VVT 2 In Actual", "VVT 2 Ex Actual", "Ethanol (Flex) %", "Aux Linear 1", "Aux Linear 2", "GPPWM Output 1", "GPPWM Output 2", "GPPWM Output 3", "GPPWM Output 4", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure", "EGT 1", "EGT 2", "Aux Linear 3", "Aux Linear 4", "Vehicle speed", "Oil pressure", "Oil temp", "Fuel Pressure", "Throttle Ratio", "EGT 3", "EGT 4", "EGT 5", "EGT 6", "EGT 7", "EGT 8", "Fuel Pressure Diff", "EGT max", "Closed loop trim", "Turbo speed", "MAP over ethanol limit", "EGT rise rate", "WMI fault", "Wheel slip %"
+ #define spi_device_e_enum="Off", "SPI1", "SPI2", "SPI3", "SPI4", "SPI5", "SPI6"
+ 
+ ; Remove next line when Java toolset gets adjusted to load those from json config into VariablesRegistry
+@@ -396,7 +396,7 @@ include_file @@TUNING_SECTION_FILE@@
+ 	targetMixtureFinalTargetLabels = bits, U08, [0:1], "Final target AFR (fuel)", "Final target lambda"
+ 	; [tag:ve_blend_default_axis] Display-only entries 36..39 follow veLoadSrc; 36..41 follow afrLoadSrc.
+ 	; The first 36 entries retain their GPPWM channel indices.
+-	pwmAxisLabels = bits, U08, [0:5], "Zero", "TPS %", "MAP kPa", "CLT C", "IAT C", "Fuel Load", "Ignition Load", "Aux Temp 1 C", "Aux Temp 2 C", "Accel Pedal %", "Battery Voltage Volts", "VVT 1 I Deg", "VVT 1 E Deg", "VVT 2 I Deg", "VVT 2 E Deg", "Ethanol (Flex) %", "Aux Linear 1 *", "Aux Linear 2 *", "GPPWM Output 1 %", "GPPWM Output 2 %", "GPPWM Output 3 %", "GPPWM Output 4 %", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure kPa", "EGT 1 C", "EGT 2 C", "Aux Linear 3", "Aux Linear 4", "Vehicle Speed KPH", "Oil pressure kPa", "Oil temp C", "Fuel Pressure", "Throttle Pressure Ratio", "EGT 3 C", "EGT 4 C", "EGT 5 C", "EGT 6 C", "EGT 7 C", "EGT 8 C", "Fuel Pressure Diff kPa", "EGT max C", "Closed loop trim %", "Turbo speed RPM", "MAP over E% limit kPa", "EGT rise C/s", "WMI fault", "MAP kPa", "TPS %", "Air Charge %", "Lua load", "Accel Pedal %", "Cylinder Filling %"
++	pwmAxisLabels = bits, U08, [0:5], "Zero", "TPS %", "MAP kPa", "CLT C", "IAT C", "Fuel Load", "Ignition Load", "Aux Temp 1 C", "Aux Temp 2 C", "Accel Pedal %", "Battery Voltage Volts", "VVT 1 I Deg", "VVT 1 E Deg", "VVT 2 I Deg", "VVT 2 E Deg", "Ethanol (Flex) %", "Aux Linear 1 *", "Aux Linear 2 *", "GPPWM Output 1 %", "GPPWM Output 2 %", "GPPWM Output 3 %", "GPPWM Output 4 %", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure kPa", "EGT 1 C", "EGT 2 C", "Aux Linear 3", "Aux Linear 4", "Vehicle Speed KPH", "Oil pressure kPa", "Oil temp C", "Fuel Pressure", "Throttle Pressure Ratio", "EGT 3 C", "EGT 4 C", "EGT 5 C", "EGT 6 C", "EGT 7 C", "EGT 8 C", "Fuel Pressure Diff kPa", "EGT max C", "Closed loop trim %", "Turbo speed RPM", "MAP over E% limit kPa", "EGT rise C/s", "WMI fault", "Wheel slip %", "MAP kPa", "TPS %", "Air Charge %", "Lua load", "Accel Pedal %", "Cylinder Filling %"
+ 	veAxisLabels = bits, U08, [0:1], "MAP", "TPS", "Air Charge", "Lua"
+ 	targetAfrAxisLabels = bits, U08, [0:2], "MAP", "TPS", "Air Charge", "Lua", "Acc Pedal", "Cyl Filling"
+ 	; [tag:ignition_blend_load_axis] Native-unit labels follow ignLoadSrc without changing GPPWM indices.
+@@ -1600,7 +1600,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend1Table, veBlend1Map, @@VE_BLEND1_TABLE_NAME@@, 1
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends1_yAxisOverride ? veBlends1_yAxisOverride : 49 + veLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends1_yAxisOverride ? veBlends1_yAxisOverride : 50 + veLoadSrc)}
+ 		xBins		= veBlends1_rpmBins, RPMValue
+ 		yBins		= veBlends1_loadBins, veBlendYAxis1
+ 		zBins		= veBlends1_table
+@@ -1608,7 +1608,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend2Table, veBlend2Map, "VE blend 2", 1@@if_ts_show_veBlends2
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends2
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends2_yAxisOverride ? veBlends2_yAxisOverride : 49 + veLoadSrc)}@@if_ts_show_veBlends2
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends2_yAxisOverride ? veBlends2_yAxisOverride : 50 + veLoadSrc)}@@if_ts_show_veBlends2
+ 		xBins		= veBlends2_rpmBins, RPMValue@@if_ts_show_veBlends2
+ 		yBins		= veBlends2_loadBins, veBlendYAxis2@@if_ts_show_veBlends2
+ 		zBins		= veBlends2_table@@if_ts_show_veBlends2
+@@ -1616,7 +1616,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend3Table, veBlend3Map, "VE blend 3", 1@@if_ts_show_veBlends3
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends3
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends3_yAxisOverride ? veBlends3_yAxisOverride : 49 + veLoadSrc)}@@if_ts_show_veBlends3
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends3_yAxisOverride ? veBlends3_yAxisOverride : 50 + veLoadSrc)}@@if_ts_show_veBlends3
+ 		xBins		= veBlends3_rpmBins, RPMValue@@if_ts_show_veBlends3
+ 		yBins		= veBlends3_loadBins, veBlendYAxis3@@if_ts_show_veBlends3
+ 		zBins		= veBlends3_table@@if_ts_show_veBlends3
+@@ -1624,7 +1624,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend4Table, veBlend4Map, "VE blend 4", 1@@if_ts_show_veBlends4
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends4
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends4_yAxisOverride ? veBlends4_yAxisOverride : 49 + veLoadSrc)}@@if_ts_show_veBlends4
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends4_yAxisOverride ? veBlends4_yAxisOverride : 50 + veLoadSrc)}@@if_ts_show_veBlends4
+ 		xBins		= veBlends4_rpmBins, RPMValue@@if_ts_show_veBlends4
+ 		yBins		= veBlends4_loadBins, veBlendYAxis4@@if_ts_show_veBlends4
+ 		zBins		= veBlends4_table@@if_ts_show_veBlends4
+@@ -1667,7 +1667,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 	table = targetAfrBlend1Table, targetAfrBlend1Map, "Target Mixture Adder 1", 1
+ 		topicHelp = "targetMixtureAdderHelp"
+ 		; [tag:ve_blend_default_axis] Zero inherits the main target-table load source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends1_yAxisOverride ? targetAfrBlends1_yAxisOverride : 49 + afrLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends1_yAxisOverride ? targetAfrBlends1_yAxisOverride : 50 + afrLoadSrc)}
+ 		xBins = targetAfrBlends1_rpmBins, RPMValue
+ 		yBins = targetAfrBlends1_loadBins, targetAfrBlendYAxis1
+ 		; [tag:target_adder_display] Both unit modes share this editor and the native saved table.
+@@ -1678,7 +1678,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 	table = targetAfrBlend2Table, targetAfrBlend2Map, "Target Mixture Adder 2", 1
+ 		topicHelp = "targetMixtureAdderHelp"
+ 		; [tag:ve_blend_default_axis] Zero inherits the main target-table load source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends2_yAxisOverride ? targetAfrBlends2_yAxisOverride : 49 + afrLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends2_yAxisOverride ? targetAfrBlends2_yAxisOverride : 50 + afrLoadSrc)}
+ 		xBins = targetAfrBlends2_rpmBins, RPMValue
+ 		yBins = targetAfrBlends2_loadBins, targetAfrBlendYAxis2
+ 		; [tag:target_adder_display] Both unit modes share this editor and the native saved table.
+@@ -2548,6 +2548,7 @@ include_file @@TOP_LEVEL_MENU_FILE@@
+ 		@@BOARD_MENU_FROM_FILE@@
+ 		subMenu = std_separator
+ 
++		subMenu = tractionWheelsSettings,	"Traction Control wheel speeds"
+ 		subMenu = tractionControlEtb,    "Traction Control ETB Drop"@@if_ts_show_etb
+ 		subMenu = tractionTimingTableTbl,    "Traction Control Timing Adjustment"
+ 		subMenu = tractionIgnitionSkipDialog,    "Traction Control Skip Ignition"
+@@ -5825,6 +5826,21 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "Fuel change at 100 % duty",		wmiFuelTrim, { wmiGppwmChannel != 0 }
+ 		field = "#Alert sensor 'WMI fault' = 1 when WMI is asked and the tank is low."
+ 
++	dialog = tractionWheelsSettings, "Traction Control wheel speeds"
++		field = "Slip = driven axle speed / free axle speed. It feeds the traction control tables (timing drop, ignition skip, throttle drop by slip x speed)."
++		field = "Wheel speed source",				tcWheelSource
++		field = "Front wheel drive (0 = rear)",		tcFrontWheelDrive, { tcWheelSource != 0 }
++		field = "No slip below free axle speed",	tcMinSpeed, { tcWheelSource != 0 }
++		field = "Front wheel sensor (wired)",		auxSpeedSensorInputPin1, { tcWheelSource == 1 }
++		field = "Front tone ring teeth",			tcFrontPulsesPerRev, { tcWheelSource == 1 }
++		field = "Rear wheel sensor (wired)",		auxSpeedSensorInputPin2, { tcWheelSource == 1 }
++		field = "Rear tone ring teeth",				tcRearPulsesPerRev, { tcWheelSource == 1 }
++		field = "Tire circumference",				tcTireCircumference, { tcWheelSource == 1 }
++		field = "#CAN: set a Custom CAN frame (receive) or a pro CAN slot with target Wheel speed FL/FR/RL/RR in km/h."
++		field = "Traction control switch (optional)",	tcSwitchPin, { tcWheelSource != 0 }
++		field = "Switch mode",						tcSwitchPinMode, { tcWheelSource != 0 && tcSwitchPin != 0 }
++		field = "#With no other speed sensor the free axle also gives the vehicle speed."
++
+ 	dialog = etbSpeedLimitSettings, "Throttle speed by coolant temperature"
+ 		field = "Limit throttle speed",					etbSpeedLimitEnabled
+ 		field = "0 %/s in a point means no limit there."
+diff --git a/unit_tests/tests/test_traction_wheels.cpp b/unit_tests/tests/test_traction_wheels.cpp
+new file mode 100644
+index 00000000000..2b7f2ef2022
+--- /dev/null
++++ b/unit_tests/tests/test_traction_wheels.cpp
+@@ -0,0 +1,87 @@
++#include "pch.h"
++
++#include "traction_wheels.h"
++#include "ftcan_receiver.h"
++#include "gppwm_channel_reader.h"
++
++// Traction control wheel speeds from wired sensors or CAN, wheel slip
++
++static void setupCan() {
++	engineConfiguration->tcWheelSource = TC_WHEELS_CAN;
++	engineConfiguration->tcFrontWheelDrive = 0; // rear drive
++	engineConfiguration->tcMinSpeed = 10;
++}
++
++TEST(TractionWheels, offByDefault) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	auto& tc = engine->module<TractionWheels>().unmock();
++	tc.setCanWheelSpeed(TcWheel::RearLeft, 50, getTimeNowNt());
++	EXPECT_FALSE(tc.getSlipRatio(getTimeNowNt()));
++}
++
++TEST(TractionWheels, canSlipRearDrive) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupCan();
++	auto& tc = engine->module<TractionWheels>().unmock();
++	efitick_t now = getTimeNowNt();
++
++	// CAN targets reach the wheels
++	setCanTargetValue(FTCAN_TARGET_WHEEL_FL, 50, now);
++	setCanTargetValue(FTCAN_TARGET_WHEEL_FR, 50, now);
++	setCanTargetValue(FTCAN_TARGET_WHEEL_RL, 55, now);
++	setCanTargetValue(FTCAN_TARGET_WHEEL_RR, 65, now);
++
++	EXPECT_NEAR(50, tc.getFrontSpeed(now).value_or(0), 1e-4);
++	EXPECT_NEAR(60, tc.getRearSpeed(now).value_or(0), 1e-4);
++	EXPECT_NEAR(1.2, tc.getSlipRatio(now).value_or(0), 1e-4);
++	EXPECT_NEAR(20, tc.getSlipPercent(now).value_or(0), 1e-3);
++	EXPECT_NEAR(20, readGppwmChannel(GPPWM_WheelSlip).value_or(0), 1e-3);
++
++	// one wheel per axle is enough
++	advanceTimeUs(300'000);
++	now = getTimeNowNt();
++	tc.setCanWheelSpeed(TcWheel::FrontLeft, 40, now);
++	tc.setCanWheelSpeed(TcWheel::RearLeft, 44, now);
++	advanceTimeUs(300'000);
++	now = getTimeNowNt();
++	EXPECT_NEAR(1.1, tc.getSlipRatio(now).value_or(0), 1e-4);
++
++	// all CAN data old: no slip
++	advanceTimeUs(600'000);
++	EXPECT_FALSE(tc.getSlipRatio(getTimeNowNt()));
++}
++
++TEST(TractionWheels, frontDriveAndMinSpeed) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupCan();
++	engineConfiguration->tcFrontWheelDrive = 1;
++	auto& tc = engine->module<TractionWheels>().unmock();
++	efitick_t now = getTimeNowNt();
++
++	tc.setCanWheelSpeed(TcWheel::FrontLeft, 30, now);
++	tc.setCanWheelSpeed(TcWheel::RearLeft, 25, now);
++	EXPECT_NEAR(1.2, tc.getSlipRatio(now).value_or(0), 1e-4);
++
++	// free axle below the minimum speed: no slip (standing start wheelspin is launch control)
++	tc.setCanWheelSpeed(TcWheel::FrontLeft, 20, now);
++	tc.setCanWheelSpeed(TcWheel::RearLeft, 5, now);
++	EXPECT_FALSE(tc.getSlipRatio(now));
++}
++
++TEST(TractionWheels, wiredSpeedFromToneRing) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->tcWheelSource = TC_WHEELS_WIRED;
++	engineConfiguration->tcFrontPulsesPerRev = 48;
++	engineConfiguration->tcRearPulsesPerRev = 48;
++	engineConfiguration->tcTireCircumference = 2000; // mm
++	engineConfiguration->tcMinSpeed = 10;
++	auto& tc = engine->module<TractionWheels>().unmock();
++
++	// 48 pulses per turn, 10 turns/s = 480 Hz = 20 m/s = 72 km/h
++	EXPECT_NEAR(72, TractionWheels::wiredHzToKph(480, 48), 1e-3);
++
++	Sensor::setMockValue(SensorType::AuxSpeed1, 480);
++	Sensor::setMockValue(SensorType::AuxSpeed2, 528);
++	EXPECT_NEAR(72, tc.getFrontSpeed(getTimeNowNt()).value_or(0), 1e-3);
++	EXPECT_NEAR(1.1, tc.getSlipRatio(getTimeNowNt()).value_or(0), 1e-4);
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index be47024b97a..991fdcf5db3 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -286,6 +286,7 @@ TESTS_SRC_CPP = \
+ 	tests/test_downshift_blip.cpp \
+ 	tests/test_shift_light.cpp \
+ 	tests/test_water_methanol.cpp \
++	tests/test_traction_wheels.cpp \
+ 	tests/test_custom_firing_order.cpp \
+ 	tests/controllers/modules/map_averaging/test_map_averaging.cpp \
+ 	tests/util/test_utils.cpp \
+-- 
+2.43.0
+

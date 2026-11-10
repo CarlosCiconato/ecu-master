@@ -1,0 +1,1387 @@
+From c425b47325827d1c972b95a930f8fdceb75c3c2d Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sat, 31 Oct 2026 22:02:20 +0000
+Subject: [PATCH] Alert sensor: EGT rise rate, pro-style fast EGT rise
+ alert
+
+Plan item 41b (the "fast heating" part of item 41).
+- new module EgtRiseMonitor: how fast each EGT goes up, in C per second;
+  sampled every 0.5 s and smoothed over about 1 s so thermocouple noise
+  does not trip the alert; a sensor that stops working is forgotten
+- new alert / GPPWM sensor 47 "EGT rise rate" = the fastest rising EGT
+  (unexpected when no EGT works)
+- output channel / log: EGT rise rate (fastest)
+- TS lists updated, ve/afr blend axis label offset moved from 47 to 48
+- 5 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ firmware/console/binary/output_channels.txt   |  1 +
+ .../actuators/gppwm_channel_reader.cpp        |  3 +
+ firmware/controllers/algo/engine.h            |  2 +
+ firmware/controllers/algo/rusefi_enums.h      |  2 +
+ .../controllers/modules/egt_rise/egt_rise.mk  |  3 +
+ .../modules/egt_rise/egt_rise_monitor.cpp     | 77 +++++++++++++++++++
+ .../modules/egt_rise/egt_rise_monitor.h       | 39 ++++++++++
+ firmware/controllers/modules/modules.mk       |  1 +
+ firmware/tunerstudio/tunerstudio.template.ini | 16 ++--
+ unit_tests/tests/test_egt_rise.cpp            | 64 +++++++++++++++
+ unit_tests/tests/tests.mk                     |  1 +
+ 11 files changed, 201 insertions(+), 8 deletions(-)
+ create mode 100644 firmware/controllers/modules/egt_rise/egt_rise.mk
+ create mode 100644 firmware/controllers/modules/egt_rise/egt_rise_monitor.cpp
+ create mode 100644 firmware/controllers/modules/egt_rise/egt_rise_monitor.h
+ create mode 100644 unit_tests/tests/test_egt_rise.cpp
+
+diff --git a/firmware/console/binary/output_channels.txt b/firmware/console/binary/output_channels.txt
+index 3c47c40a8c..62b13cc15b 100644
+--- a/firmware/console/binary/output_channels.txt
++++ b/firmware/console/binary/output_channels.txt
+@@ -518,4 +518,5 @@ float mapFast
+ 	uint8_t pinLastResult;Password: last result;"", 1, 0, 0, 4, 0
+ 	uint8_t pinLockoutLeft;Password: lockout left;"s", 1, 0, 0, 30, 0
+ 	int8_t[8 iterate] autoscale cylLambdaTrim;Lambda trim cyl;"%", 0.2, 0, -25, 25, 1
++	int16_t egtRiseRate;EGT rise rate (fastest);"C/s", 1, 0, -1000, 1000, 0
+ end_struct
+diff --git a/firmware/controllers/actuators/gppwm_channel_reader.cpp b/firmware/controllers/actuators/gppwm_channel_reader.cpp
+index cbe41eca84..1d206c16fa 100644
+--- a/firmware/controllers/actuators/gppwm_channel_reader.cpp
++++ b/firmware/controllers/actuators/gppwm_channel_reader.cpp
+@@ -5,6 +5,7 @@
+ #include "pch.h"
+ #include "throttle_model.h"
+ #include "gppwm_channel_reader.h"
++#include "egt_rise_monitor.h"
+ 
+ // fuel pressure above manifold pressure, from the fuel pressure sensor whatever the injector compensation mode
+ static expected<float> readFuelPressureDiff() {
+@@ -164,6 +165,8 @@ expected<float> readGppwmChannel(gppwm_channel_e channel) {
+ 		return Sensor::get(SensorType::TurbochargerSpeed);
+ 	case GPPWM_MapOverEthanolLimit:
+ 		return readMapOverEthanolLimit();
++	case GPPWM_EgtRiseRate:
++		return engine->module<EgtRiseMonitor>()->getMaxRiseRate();
+ 	case GPPWM_ThrottleRatio:
+ #if EFI_ENGINE_CONTROL
+ 		return getThrottlePressureRatio(Sensor::getOrZero(SensorType::Map));
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index d582604a42..4944d021b4 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -37,6 +37,7 @@
+ #include "tune_selector.h"
+ #include "rgb_status_led.h"
+ #include "cylinder_lambda_trim.h"
++#include "egt_rise_monitor.h"
+ #include "ecu_passwords.h"
+ #include "hall_pullup.h"
+ #include "cold_start_injector.h"
+@@ -212,6 +213,7 @@ public:
+         EcuPasswords,
+         RgbStatusLed,
+         CylinderLambdaTrim,
++        EgtRiseMonitor,
+         HallPullupController,
+         ColdStartInjector,
+         GearShiftDetector,
+diff --git a/firmware/controllers/algo/rusefi_enums.h b/firmware/controllers/algo/rusefi_enums.h
+index c73b3b04de..d0527b5be6 100644
+--- a/firmware/controllers/algo/rusefi_enums.h
++++ b/firmware/controllers/algo/rusefi_enums.h
+@@ -769,6 +769,8 @@ typedef enum __attribute__ ((__packed__)) {
+ 	GPPWM_TurboSpeed = 45,
+ 	// MAP above the max boost allowed for the ethanol % right now
+ 	GPPWM_MapOverEthanolLimit = 46,
++	// fastest rising EGT, C per second (pro-style fast EGT rise alert)
++	GPPWM_EgtRiseRate = 47,
+ 	// remember to manually sync 'pwmAxisLabels' in tunerstudio.template.ini
+ 	// todo: rename 'pwmAxisLabels' and maybe even gppwm_channel_e since we now use wider than just 'gppwm'?
+ } gppwm_channel_e;
+diff --git a/firmware/controllers/modules/egt_rise/egt_rise.mk b/firmware/controllers/modules/egt_rise/egt_rise.mk
+new file mode 100644
+index 0000000000..39d98bc10e
+--- /dev/null
++++ b/firmware/controllers/modules/egt_rise/egt_rise.mk
+@@ -0,0 +1,3 @@
++# pro-style alert sensor: how fast the EGT is rising
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/egt_rise
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/egt_rise/egt_rise_monitor.cpp
+diff --git a/firmware/controllers/modules/egt_rise/egt_rise_monitor.cpp b/firmware/controllers/modules/egt_rise/egt_rise_monitor.cpp
+new file mode 100644
+index 0000000000..c33764ec4b
+--- /dev/null
++++ b/firmware/controllers/modules/egt_rise/egt_rise_monitor.cpp
+@@ -0,0 +1,77 @@
++#include "pch.h"
++
++#include "egt_rise_monitor.h"
++
++void EgtRiseMonitor::update(const SensorResult* egts, size_t count, float dtSeconds) {
++	count = std::min<size_t>(count, EGT_RISE_COUNT);
++
++	for (size_t i = 0; i < count; i++) {
++		if (!egts[i]) {
++			// sensor not working: forget its history
++			m_valid[i] = false;
++			m_hasWindowStart[i] = false;
++			m_rate[i] = 0;
++		} else {
++			m_valid[i] = true;
++		}
++	}
++
++	m_elapsed += dtSeconds;
++	if (m_elapsed < sampleTime) {
++		return;
++	}
++
++	float elapsed = m_elapsed;
++	m_elapsed = 0;
++
++	// first order smoothing, about smoothTime long
++	float alpha = elapsed / (smoothTime + elapsed);
++
++	for (size_t i = 0; i < count; i++) {
++		if (!egts[i]) {
++			continue;
++		}
++
++		float temp = egts[i].Value;
++		if (m_hasWindowStart[i]) {
++			float raw = (temp - m_windowStart[i]) / elapsed;
++			m_rate[i] += alpha * (raw - m_rate[i]);
++		}
++		m_windowStart[i] = temp;
++		m_hasWindowStart[i] = true;
++	}
++}
++
++expected<float> EgtRiseMonitor::getMaxRiseRate() const {
++	expected<float> result = unexpected;
++	for (size_t i = 0; i < EGT_RISE_COUNT; i++) {
++		if (m_valid[i] && (!result || m_rate[i] > result.Value)) {
++			result = m_rate[i];
++		}
++	}
++	return result;
++}
++
++float EgtRiseMonitor::getRiseRate(size_t index) const {
++	return index < EGT_RISE_COUNT ? m_rate[index] : 0;
++}
++
++void EgtRiseMonitor::onSlowCallback() {
++	efitick_t nowNt = getTimeNowNt();
++	float dt = m_timerStarted ? m_timer.getElapsedSecondsAndReset(nowNt) : 0;
++	if (!m_timerStarted) {
++		m_timer.reset(nowNt);
++		m_timerStarted = true;
++	}
++	// a long pause (debugger, first call) must not look like a slow rise
++	dt = std::min(dt, 1.0f);
++
++	SensorResult egts[EGT_RISE_COUNT] = {unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected};
++	for (size_t i = 0; i < EGT_RISE_COUNT; i++) {
++		egts[i] = Sensor::get(static_cast<SensorType>(static_cast<int>(SensorType::EGT1) + i));
++	}
++	update(egts, EGT_RISE_COUNT, dt);
++
++	auto maxRate = getMaxRiseRate();
++	engine->outputChannels.egtRiseRate = maxRate ? maxRate.Value : 0;
++}
+diff --git a/firmware/controllers/modules/egt_rise/egt_rise_monitor.h b/firmware/controllers/modules/egt_rise/egt_rise_monitor.h
+new file mode 100644
+index 0000000000..be324fd292
+--- /dev/null
++++ b/firmware/controllers/modules/egt_rise/egt_rise_monitor.h
+@@ -0,0 +1,39 @@
++/*
++ * @file egt_rise_monitor.h
++ *
++ * pro-style "fast EGT rise" alert sensor: how fast each EGT is going up, in C per
++ * second. The temperature is sampled every half second and the rate is smoothed over about
++ * a second, so thermocouple noise does not trip the alert. The fastest rising EGT is the
++ * alert sensor "EGT rise rate".
++ */
++
++#pragma once
++
++#define EGT_RISE_COUNT 8 // initializers below list 8 entries
++
++class EgtRiseMonitor : public EngineModule {
++public:
++	using interface_t = EgtRiseMonitor;
++
++	void onSlowCallback() override;
++
++	// egts: one reading per EGT input (invalid = sensor not working); dtSeconds since the last call
++	void update(const SensorResult* egts, size_t count, float dtSeconds);
++
++	// fastest rising EGT in C/s, unexpected when no EGT works
++	expected<float> getMaxRiseRate() const;
++	float getRiseRate(size_t index) const;
++
++	// sample window and smoothing time
++	static constexpr float sampleTime = 0.5f;
++	static constexpr float smoothTime = 1.0f;
++
++private:
++	float m_elapsed = 0;
++	float m_windowStart[EGT_RISE_COUNT] = {};
++	bool m_hasWindowStart[EGT_RISE_COUNT] = {};
++	float m_rate[EGT_RISE_COUNT] = {};
++	bool m_valid[EGT_RISE_COUNT] = {};
++	Timer m_timer;
++	bool m_timerStarted = false;
++};
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index 178f3b78dd..5429bbd590 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -23,6 +23,7 @@ include $(PROJECT_DIR)/controllers/modules/alerts/alerts.mk
+ include $(PROJECT_DIR)/controllers/modules/tune_selector/tune_selector.mk
+ include $(PROJECT_DIR)/controllers/modules/rgb_status_led/rgb_status_led.mk
+ include $(PROJECT_DIR)/controllers/modules/cylinder_lambda_trim/cylinder_lambda_trim.mk
++include $(PROJECT_DIR)/controllers/modules/egt_rise/egt_rise.mk
+ include $(PROJECT_DIR)/controllers/modules/hall_pullup/hall_pullup.mk
+ include $(PROJECT_DIR)/controllers/modules/cold_start_injector/cold_start_injector.mk
+ include $(PROJECT_DIR)/controllers/modules/gear_shift/gear_shift.mk
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index b6f3ac1364..207af117d8 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -116,7 +116,7 @@ enable2ndByteCanID = false
+ #define pin_mode_e_enum="default", "INVALID", "INVALID", "INVALID", "opendrain", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "PULLUP", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "PULLDOWN"
+ #define pin_input_mode_e_enum="DEFAULT", "PULLUP", "PULLDOWN", "INVALID", "INVERTED DEFAULT", "INVERTED PULLUP", "INVERTED PULLDOWN", "INVALID
+ #define pin_output_mode_e_enum="default", "default inverted", "open collector", "open collector inverted"
+-#define gppwm_channel_e_enum="Zero", "TPS", "MAP", "CLT", "IAT", "Fuel Load", "Ignition Load", "Aux Temp 1", "Aux Temp 2", "Accel Pedal", "Battery Voltage", "VVT 1 In Actual", "VVT 1 Ex Actual", "VVT 2 In Actual", "VVT 2 Ex Actual", "Ethanol (Flex) %", "Aux Linear 1", "Aux Linear 2", "GPPWM Output 1", "GPPWM Output 2", "GPPWM Output 3", "GPPWM Output 4", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure", "EGT 1", "EGT 2", "Aux Linear 3", "Aux Linear 4", "Vehicle speed", "Oil pressure", "Oil temp", "Fuel Pressure", "Throttle Ratio", "EGT 3", "EGT 4", "EGT 5", "EGT 6", "EGT 7", "EGT 8", "Fuel Pressure Diff", "EGT max", "Closed loop trim", "Turbo speed", "MAP over ethanol limit"
++#define gppwm_channel_e_enum="Zero", "TPS", "MAP", "CLT", "IAT", "Fuel Load", "Ignition Load", "Aux Temp 1", "Aux Temp 2", "Accel Pedal", "Battery Voltage", "VVT 1 In Actual", "VVT 1 Ex Actual", "VVT 2 In Actual", "VVT 2 Ex Actual", "Ethanol (Flex) %", "Aux Linear 1", "Aux Linear 2", "GPPWM Output 1", "GPPWM Output 2", "GPPWM Output 3", "GPPWM Output 4", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure", "EGT 1", "EGT 2", "Aux Linear 3", "Aux Linear 4", "Vehicle speed", "Oil pressure", "Oil temp", "Fuel Pressure", "Throttle Ratio", "EGT 3", "EGT 4", "EGT 5", "EGT 6", "EGT 7", "EGT 8", "Fuel Pressure Diff", "EGT max", "Closed loop trim", "Turbo speed", "MAP over ethanol limit", "EGT rise rate"
+ #define spi_device_e_enum="Off", "SPI1", "SPI2", "SPI3", "SPI4", "SPI5", "SPI6"
+ 
+ ; Remove next line when Java toolset gets adjusted to load those from json config into VariablesRegistry
+@@ -396,7 +396,7 @@ include_file @@TUNING_SECTION_FILE@@
+ 	targetMixtureFinalTargetLabels = bits, U08, [0:1], "Final target AFR (fuel)", "Final target lambda"
+ 	; [tag:ve_blend_default_axis] Display-only entries 36..39 follow veLoadSrc; 36..41 follow afrLoadSrc.
+ 	; The first 36 entries retain their GPPWM channel indices.
+-	pwmAxisLabels = bits, U08, [0:5], "Zero", "TPS %", "MAP kPa", "CLT C", "IAT C", "Fuel Load", "Ignition Load", "Aux Temp 1 C", "Aux Temp 2 C", "Accel Pedal %", "Battery Voltage Volts", "VVT 1 I Deg", "VVT 1 E Deg", "VVT 2 I Deg", "VVT 2 E Deg", "Ethanol (Flex) %", "Aux Linear 1 *", "Aux Linear 2 *", "GPPWM Output 1 %", "GPPWM Output 2 %", "GPPWM Output 3 %", "GPPWM Output 4 %", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure kPa", "EGT 1 C", "EGT 2 C", "Aux Linear 3", "Aux Linear 4", "Vehicle Speed KPH", "Oil pressure kPa", "Oil temp C", "Fuel Pressure", "Throttle Pressure Ratio", "EGT 3 C", "EGT 4 C", "EGT 5 C", "EGT 6 C", "EGT 7 C", "EGT 8 C", "Fuel Pressure Diff kPa", "EGT max C", "Closed loop trim %", "Turbo speed RPM", "MAP over E% limit kPa", "MAP kPa", "TPS %", "Air Charge %", "Lua load", "Accel Pedal %", "Cylinder Filling %"
++	pwmAxisLabels = bits, U08, [0:5], "Zero", "TPS %", "MAP kPa", "CLT C", "IAT C", "Fuel Load", "Ignition Load", "Aux Temp 1 C", "Aux Temp 2 C", "Accel Pedal %", "Battery Voltage Volts", "VVT 1 I Deg", "VVT 1 E Deg", "VVT 2 I Deg", "VVT 2 E Deg", "Ethanol (Flex) %", "Aux Linear 1 *", "Aux Linear 2 *", "GPPWM Output 1 %", "GPPWM Output 2 %", "GPPWM Output 3 %", "GPPWM Output 4 %", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure kPa", "EGT 1 C", "EGT 2 C", "Aux Linear 3", "Aux Linear 4", "Vehicle Speed KPH", "Oil pressure kPa", "Oil temp C", "Fuel Pressure", "Throttle Pressure Ratio", "EGT 3 C", "EGT 4 C", "EGT 5 C", "EGT 6 C", "EGT 7 C", "EGT 8 C", "Fuel Pressure Diff kPa", "EGT max C", "Closed loop trim %", "Turbo speed RPM", "MAP over E% limit kPa", "EGT rise C/s", "MAP kPa", "TPS %", "Air Charge %", "Lua load", "Accel Pedal %", "Cylinder Filling %"
+ 	veAxisLabels = bits, U08, [0:1], "MAP", "TPS", "Air Charge", "Lua"
+ 	targetAfrAxisLabels = bits, U08, [0:2], "MAP", "TPS", "Air Charge", "Lua", "Acc Pedal", "Cyl Filling"
+ 	; [tag:ignition_blend_load_axis] Native-unit labels follow ignLoadSrc without changing GPPWM indices.
+@@ -1586,7 +1586,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend1Table, veBlend1Map, @@VE_BLEND1_TABLE_NAME@@, 1
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends1_yAxisOverride ? veBlends1_yAxisOverride : 47 + veLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends1_yAxisOverride ? veBlends1_yAxisOverride : 48 + veLoadSrc)}
+ 		xBins		= veBlends1_rpmBins, RPMValue
+ 		yBins		= veBlends1_loadBins, veBlendYAxis1
+ 		zBins		= veBlends1_table
+@@ -1594,7 +1594,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend2Table, veBlend2Map, "VE blend 2", 1@@if_ts_show_veBlends2
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends2
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends2_yAxisOverride ? veBlends2_yAxisOverride : 47 + veLoadSrc)}@@if_ts_show_veBlends2
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends2_yAxisOverride ? veBlends2_yAxisOverride : 48 + veLoadSrc)}@@if_ts_show_veBlends2
+ 		xBins		= veBlends2_rpmBins, RPMValue@@if_ts_show_veBlends2
+ 		yBins		= veBlends2_loadBins, veBlendYAxis2@@if_ts_show_veBlends2
+ 		zBins		= veBlends2_table@@if_ts_show_veBlends2
+@@ -1602,7 +1602,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend3Table, veBlend3Map, "VE blend 3", 1@@if_ts_show_veBlends3
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends3
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends3_yAxisOverride ? veBlends3_yAxisOverride : 47 + veLoadSrc)}@@if_ts_show_veBlends3
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends3_yAxisOverride ? veBlends3_yAxisOverride : 48 + veLoadSrc)}@@if_ts_show_veBlends3
+ 		xBins		= veBlends3_rpmBins, RPMValue@@if_ts_show_veBlends3
+ 		yBins		= veBlends3_loadBins, veBlendYAxis3@@if_ts_show_veBlends3
+ 		zBins		= veBlends3_table@@if_ts_show_veBlends3
+@@ -1610,7 +1610,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend4Table, veBlend4Map, "VE blend 4", 1@@if_ts_show_veBlends4
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends4
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends4_yAxisOverride ? veBlends4_yAxisOverride : 47 + veLoadSrc)}@@if_ts_show_veBlends4
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends4_yAxisOverride ? veBlends4_yAxisOverride : 48 + veLoadSrc)}@@if_ts_show_veBlends4
+ 		xBins		= veBlends4_rpmBins, RPMValue@@if_ts_show_veBlends4
+ 		yBins		= veBlends4_loadBins, veBlendYAxis4@@if_ts_show_veBlends4
+ 		zBins		= veBlends4_table@@if_ts_show_veBlends4
+@@ -1653,7 +1653,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 	table = targetAfrBlend1Table, targetAfrBlend1Map, "Target Mixture Adder 1", 1
+ 		topicHelp = "targetMixtureAdderHelp"
+ 		; [tag:ve_blend_default_axis] Zero inherits the main target-table load source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends1_yAxisOverride ? targetAfrBlends1_yAxisOverride : 47 + afrLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends1_yAxisOverride ? targetAfrBlends1_yAxisOverride : 48 + afrLoadSrc)}
+ 		xBins = targetAfrBlends1_rpmBins, RPMValue
+ 		yBins = targetAfrBlends1_loadBins, targetAfrBlendYAxis1
+ 		; [tag:target_adder_display] Both unit modes share this editor and the native saved table.
+@@ -1664,7 +1664,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 	table = targetAfrBlend2Table, targetAfrBlend2Map, "Target Mixture Adder 2", 1
+ 		topicHelp = "targetMixtureAdderHelp"
+ 		; [tag:ve_blend_default_axis] Zero inherits the main target-table load source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends2_yAxisOverride ? targetAfrBlends2_yAxisOverride : 47 + afrLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends2_yAxisOverride ? targetAfrBlends2_yAxisOverride : 48 + afrLoadSrc)}
+ 		xBins = targetAfrBlends2_rpmBins, RPMValue
+ 		yBins = targetAfrBlends2_loadBins, targetAfrBlendYAxis2
+ 		; [tag:target_adder_display] Both unit modes share this editor and the native saved table.
+diff --git a/unit_tests/tests/test_egt_rise.cpp b/unit_tests/tests/test_egt_rise.cpp
+new file mode 100644
+index 0000000000..68c93745d5
+--- /dev/null
++++ b/unit_tests/tests/test_egt_rise.cpp
+@@ -0,0 +1,64 @@
++#include "pch.h"
++
++#include "egt_rise_monitor.h"
++#include "gppwm_channel_reader.h"
++
++// pro-style "fast EGT rise" alert sensor
++
++static void feed(EgtRiseMonitor& mon, float startTemp, float ratePerSecond, float seconds, size_t cylinder = 0) {
++	const float dt = 0.05f;
++	float temp = startTemp;
++	for (float t = 0; t < seconds; t += dt) {
++		SensorResult egts[EGT_RISE_COUNT] = {unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected};
++		for (size_t i = 0; i < EGT_RISE_COUNT; i++) {
++			egts[i] = (i == cylinder) ? SensorResult(temp) : SensorResult(500.0f);
++		}
++		mon.update(egts, EGT_RISE_COUNT, dt);
++		temp += ratePerSecond * dt;
++	}
++}
++
++TEST(EgtRise, steadyTemperatureIsZero) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EgtRiseMonitor mon;
++	feed(mon, 700, 0, 5);
++	EXPECT_NEAR(0, mon.getMaxRiseRate().value_or(-1), 0.5);
++}
++
++TEST(EgtRise, fastRiseIsSeen) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EgtRiseMonitor mon;
++	// cylinder 3 heats up 100 C per second, the others stay
++	feed(mon, 600, 100, 6, 2);
++	EXPECT_NEAR(100, mon.getRiseRate(2), 5);
++	EXPECT_NEAR(0, mon.getRiseRate(0), 0.5);
++	EXPECT_NEAR(100, mon.getMaxRiseRate().value_or(0), 5);
++}
++
++TEST(EgtRise, coolingIsNegative) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EgtRiseMonitor mon;
++	feed(mon, 900, -50, 6, 1);
++	EXPECT_NEAR(-50, mon.getRiseRate(1), 3);
++	// the fastest rising is one of the steady ones
++	EXPECT_NEAR(0, mon.getMaxRiseRate().value_or(-1), 0.5);
++}
++
++TEST(EgtRise, noWorkingSensor) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EgtRiseMonitor mon;
++	SensorResult egts[EGT_RISE_COUNT] = {unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected};
++	for (auto& e : egts) {
++		e = unexpected;
++	}
++	mon.update(egts, EGT_RISE_COUNT, 1);
++	EXPECT_FALSE(mon.getMaxRiseRate().Valid);
++}
++
++TEST(EgtRise, alertSensorReadsModule) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	auto& mon = engine->module<EgtRiseMonitor>().unmock();
++	EXPECT_FALSE(readGppwmChannel(GPPWM_EgtRiseRate).Valid);
++	feed(mon, 600, 80, 6, 4);
++	EXPECT_NEAR(80, readGppwmChannel(GPPWM_EgtRiseRate).value_or(0), 5);
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 2e637b27e9..7aac7c08c1 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -281,6 +281,7 @@ TESTS_SRC_CPP = \
+ 	tests/test_ecu_passwords.cpp \
+ 	tests/test_rgb_status_led.cpp \
+ 	tests/test_cylinder_lambda_trim.cpp \
++	tests/test_egt_rise.cpp \
+ 	tests/controllers/modules/map_averaging/test_map_averaging.cpp \
+ 	tests/util/test_utils.cpp \
+ 	tests/controllers/algo/test_engine_cylinder.cpp \
+-- 
+2.43.0
+
+From 9dbb25cfd8605a109045af5795270363689a37de Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sat, 31 Oct 2026 22:09:46 +0000
+Subject: [PATCH] Oil pressure: settable time to build pressure and restart
+ lock after an oil shutdown
+
+Plan item 57 (from the outra-ecu T20K manual, oil pressure alert).
+- oilPressureStartTimeout: time after start for the oil pressure to reach
+  'After start minimum oil pressure', or the engine is shut off (0 = 5 s,
+  the old fixed value)
+- oilRestartLockTime: after the engine was shut off for low oil pressure
+  (after-start check, running low oil protection, or an alert on oil
+  pressure with the Engine off action) a new start is blocked (no fuel, no
+  spark) for this long once the engine has stopped; turning the key off
+  ends the lock; 0 = off (default)
+- new cut reason 26 "Oil restart lock"
+- AlertManager::isEngineOffBy(sensor)
+- TunerStudio: Low oil pressure protection dialog
+- 6 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ firmware/controllers/limp_manager.cpp         |  51 +++++-
+ firmware/controllers/limp_manager.h           |  13 ++
+ .../modules/alerts/alert_manager.cpp          |  10 ++
+ .../modules/alerts/alert_manager.h            |   2 +
+ firmware/integration/rusefi_config.txt        |   4 +
+ firmware/tunerstudio/tunerstudio.template.ini |   4 +-
+ unit_tests/tests/test_oil_restart_lock.cpp    | 150 ++++++++++++++++++
+ unit_tests/tests/tests.mk                     |   1 +
+ 8 files changed, 233 insertions(+), 2 deletions(-)
+ create mode 100644 unit_tests/tests/test_oil_restart_lock.cpp
+
+diff --git a/firmware/controllers/limp_manager.cpp b/firmware/controllers/limp_manager.cpp
+index e8049595ba..4850c9a021 100644
+--- a/firmware/controllers/limp_manager.cpp
++++ b/firmware/controllers/limp_manager.cpp
+@@ -214,6 +214,7 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 		m_boostCutHysteresis = {};
+ 	}
+ 
++	bool oilCutNow = false;
+ 	if (engine->rpmCalculator.isRunning()) {
+ 		bool hasOilpSensor = Sensor::hasSensor(SensorType::OilPressure);
+ 		auto oilp = Sensor::get(SensorType::OilPressure);
+@@ -223,7 +224,11 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 		// Only check if the setting is enabled and you have an oil pressure sensor
+ 		if (minOilPressure > 0 && hasOilpSensor) {
+ 			// Has it been long enough we should have pressure?
+-			bool isTimedOut = engine->rpmCalculator.getSecondsSinceEngineStart(nowNt) > 5.0f;
++			// pro/outra-ecu style: the time to build pressure can be set, 0 = 5 s as before
++			float startTimeout = engineConfiguration->oilPressureStartTimeout > 0
++				? (float)engineConfiguration->oilPressureStartTimeout
++				: 5.0f;
++			bool isTimedOut = engine->rpmCalculator.getSecondsSinceEngineStart(nowNt) > startTimeout;
+ 			isInAfterStartWindow = !isTimedOut;
+ 
+ 			// Only check before timed out
+@@ -239,6 +244,7 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 			// If time is up, the sensor works, and no pressure, kill the engine.
+ 			if (isTimedOut && !m_hadOilPressureAfterStart) {
+ 				allowFuel.clear(ClearReason::OilPressure);
++				oilCutNow = true;
+ 			}
+ 		}
+ 
+@@ -255,6 +261,7 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 			if (!isPressureSufficient && !isInAfterStartWindow
+ 				&& m_lowOilPressureTimer.hasElapsedSec(engineConfiguration->minimumOilPressureTimeout)) {
+ 				allowFuel.clear(ClearReason::OilPressure);
++				oilCutNow = true;
+ 			}
+ 		}
+ 
+@@ -280,6 +287,16 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 		m_highOilPressureTimer.reset(nowNt);
+ 	}
+ 
++	// An alert on oil pressure that shut the engine off counts as a low oil pressure shutdown too
++	if (engine->module<AlertManager>()->isEngineOffBy(GPPWM_OilPressure)) {
++		oilCutNow = true;
++	}
++	updateOilRestartLock(engine->rpmCalculator.isRunning(), oilCutNow, nowNt);
++	if (m_oilRestartLocked) {
++		allowFuel.clear(ClearReason::OilRestartLock);
++		allowSpark.clear(ClearReason::OilRestartLock);
++	}
++
+ 	// If we're in the engine-stop window (a stop was requested recently via start button, Lua,
+ 	// console, TS command or a board hook - see ShutdownController::isEngineStop and
+ 	// StopRequestedReason), inhibit fuel so the engine actually winds down instead of restarting
+@@ -375,7 +392,39 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 	}
+ }
+ 
++void LimpManager::updateOilRestartLock(bool isRunning, bool oilCutNow, efitick_t nowNt) {
++	if (isRunning && oilCutNow) {
++		m_oilCutWhileRunning = true;
++	}
++
++	if (m_oilRestartLocked
++		&& m_oilRestartLockTimer.hasElapsedSec(engineConfiguration->oilRestartLockTime)) {
++		m_oilRestartLocked = false;
++	}
++
++	// The engine stopped after a low oil pressure cut: block the next start for a while
++	if (m_oilCutWhileRunning && engine->rpmCalculator.isStopped()) {
++		m_oilCutWhileRunning = false;
++		if (engineConfiguration->oilRestartLockTime > 0) {
++			m_oilRestartLocked = true;
++			m_oilRestartLockTimer.reset(nowNt);
++		}
++	}
++}
++
++float LimpManager::getOilRestartLockLeft(efitick_t nowNt) const {
++	if (!m_oilRestartLocked) {
++		return 0;
++	}
++	return std::max(0.0f, engineConfiguration->oilRestartLockTime - m_oilRestartLockTimer.getElapsedSeconds(nowNt));
++}
++
+ void LimpManager::onIgnitionStateChanged(bool ignitionOn) {
++	// Turning the key off ends the oil restart lock
++	if (!ignitionOn) {
++		m_oilRestartLocked = false;
++		m_oilCutWhileRunning = false;
++	}
+ 	m_ignitionOn = ignitionOn;
+ }
+ 
+diff --git a/firmware/controllers/limp_manager.h b/firmware/controllers/limp_manager.h
+index df603f3892..963936bc2b 100644
+--- a/firmware/controllers/limp_manager.h
++++ b/firmware/controllers/limp_manager.h
+@@ -37,6 +37,7 @@ enum class ClearReason : uint8_t {
+ 	AlertEngineOff, // 23
+ 	AlertSafeMode, // 24
+ 	StartPassword, // 25
++	OilRestartLock, // 26
+ 
+ 	// Keep this list in sync with fuelIgnCutCodeList in tunerstudio.template.ini!
+ 	// todo: add a code generator between ClearReason and fuelIgnCutCodeList in tunerstudio.template.ini
+@@ -122,6 +123,12 @@ public:
+ 
+ 	float getTimeSinceAnyCut() const;
+ 
++	// After an engine shutdown for low oil pressure, a new start is blocked for oilRestartLockTime
++	bool isOilRestartLocked() const {
++		return m_oilRestartLocked;
++	}
++	float getOilRestartLockLeft(efitick_t nowNt) const;
++
+ 	bool allowTriggerInput() const;
+ 
+ 	void updateRevLimit(float rpm);
+@@ -158,6 +165,12 @@ private:
+ 
+ 	bool m_hadOilPressureAfterStart = false;
+ 
++	// pro/outra-ecu-style oil restart lock, see oilRestartLockTime
++	void updateOilRestartLock(bool isRunning, bool oilCutNow, efitick_t nowNt);
++	bool m_oilCutWhileRunning = false;
++	bool m_oilRestartLocked = false;
++	Timer m_oilRestartLockTimer;
++
+ 	// Ignition switch state
+ 	bool m_ignitionOn = false;
+ 
+diff --git a/firmware/controllers/modules/alerts/alert_manager.cpp b/firmware/controllers/modules/alerts/alert_manager.cpp
+index 3a5b842460..e70f49398d 100644
+--- a/firmware/controllers/modules/alerts/alert_manager.cpp
++++ b/firmware/controllers/modules/alerts/alert_manager.cpp
+@@ -91,6 +91,16 @@ bool AlertManager::isTripped(size_t index) const {
+ 	return m_latchedMask & (1 << index);
+ }
+ 
++bool AlertManager::isEngineOffBy(gppwm_channel_e sensor) const {
++	for (size_t i = 0; i < ALERT_COUNT; i++) {
++		const auto& alert = config->alerts[i];
++		if (isTripped(i) && alert.action == ALERT_ENGINE_OFF && alert.sensor == sensor) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ void AlertManager::clearLatches() {
+ 	m_latchedMask = 0;
+ }
+diff --git a/firmware/controllers/modules/alerts/alert_manager.h b/firmware/controllers/modules/alerts/alert_manager.h
+index 9fabc058d6..520c4748b0 100644
+--- a/firmware/controllers/modules/alerts/alert_manager.h
++++ b/firmware/controllers/modules/alerts/alert_manager.h
+@@ -23,6 +23,8 @@ public:
+ 	// Most severe action among latched alerts
+ 	alert_action_e getLevel() const;
+ 	bool isTripped(size_t index) const;
++	// An alert on this sensor has shut the engine off (latched)
++	bool isEngineOffBy(gppwm_channel_e sensor) const;
+ 	// Threshold in use right now (fixed value or RPM curve)
+ 	float getThreshold(size_t index, float rpm) const;
+ 	void clearLatches();
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 0311439100..5ec2965f9c 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2067,6 +2067,10 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ 	uint8_t autoscale etbAutoRecoverDelay;The sensors must read fine for this long before the throttle is turned back on.;"s", 0.1, 0, 0.1, 25, 1
+ 	uint8_t etbAutoRecoverMaxTries;How many times the throttle is turned back on before it stays off until the next power up. 0 = no limit.;"", 1, 0, 0, 100, 0
+ 
++! pro/outra-ecu-style oil pressure start check and restart lock
++	uint8_t oilPressureStartTimeout;Time after start for the oil pressure to reach 'After start minimum oil pressure', or the engine is shut off. 0 = 5 s.;"s", 1, 0, 0, 60, 0
++	uint8_t oilRestartLockTime;After the engine was shut off for low oil pressure (oil protection or an oil pressure alert with the Engine off action), a new start is blocked for this long. Turning the key off ends the lock. 0 = off.;"s", 1, 0, 0, 255, 0
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 207af117d8..1bfd7705e3 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -450,7 +450,7 @@ include_file @@TUNING_SECTION_FILE@@
+ 	ignModeList = bits, U08, [0:3], "Single Coil", "Sequential", "Wasted", "Two Coils"
+ 
+ ; ClearReason
+-	fuelIgnCutCodeList = bits, U08, [0:7], "None", "fatal error", "setting disabled", "RPM limit", "ETB RPM limit", "boost cut", "oil pressure", "stop requested", "ETB problem", "launch control", "max injector duty", "flood clear", "engine sync", "kickstart", "ign off", "Lua", "ACR", "Lambda Prot", "GDI Comms", "Brake", "Fatal", "GDI limits", "Pump limit", "Alert engine off", "Alert safe mode", "Start password"
++	fuelIgnCutCodeList = bits, U08, [0:7], "None", "fatal error", "setting disabled", "RPM limit", "ETB RPM limit", "boost cut", "oil pressure", "stop requested", "ETB problem", "launch control", "max injector duty", "flood clear", "engine sync", "kickstart", "ign off", "Lua", "ACR", "Lambda Prot", "GDI Comms", "Brake", "Fatal", "GDI limits", "Pump limit", "Alert engine off", "Alert safe mode", "Start password", "Oil restart lock"
+ 
+ ; TpsState
+ 	etbCutCodeList = bits, U08, [0:7], "None", "engine stopped", "TPS error", "PPS error", "TPS noise", "Autotune", "Lua", "TPS Calib", "N/A", "Redundancy", "PPS noise", "Jam"
+@@ -5757,6 +5757,8 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 	dialog = lowOilPressureProtection, "Low oil pressure protection"
+ 		topicHelp = "lowOilPressureProtectionHelp"
+ 		field = "After start Minimum oil pressure",		minOilPressureAfterStart
++		field = "Time to build oil pressure (0 = 5 s)",	oilPressureStartTimeout, { minOilPressureAfterStart > 0 }
++		field = "Restart lock after oil shutdown",		oilRestartLockTime
+ 		field = "Running engine Low oil pressure",	enableOilPressureProtect
+ 		field = "Running engine protection timeout", 	minimumOilPressureTimeout, { enableOilPressureProtect }
+ 		panel = minimumOilPressure
+diff --git a/unit_tests/tests/test_oil_restart_lock.cpp b/unit_tests/tests/test_oil_restart_lock.cpp
+new file mode 100644
+index 0000000000..e8abc87b8d
+--- /dev/null
++++ b/unit_tests/tests/test_oil_restart_lock.cpp
+@@ -0,0 +1,150 @@
++#include "pch.h"
++
++#include "limp_manager.h"
++#include "alert_manager.h"
++
++// pro/outra-ecu-style oil pressure start check: settable time to build pressure, and
++// a restart lock after the engine was shut off for low oil pressure
++
++TEST(OilRestartLock, startTimeoutCanBeSet) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->minOilPressureAfterStart = 200;
++	engineConfiguration->oilPressureStartTimeout = 2;
++
++	LimpManager dut;
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	engine->rpmCalculator.setRpmValue(1000);
++
++	dut.updateState(1000, getTimeNowNt());
++	EXPECT_TRUE(dut.allowInjection());
++
++	advanceTimeUs(1.5e6);
++	dut.updateState(1000, getTimeNowNt());
++	EXPECT_TRUE(dut.allowInjection());
++
++	// 2.5 s after start: cut, instead of waiting 5 s
++	advanceTimeUs(1.0e6);
++	dut.updateState(1000, getTimeNowNt());
++	EXPECT_EQ(ClearReason::OilPressure, dut.allowInjection().reason);
++}
++
++static void shutDownForLowOil(LimpManager& dut) {
++	engineConfiguration->minOilPressureAfterStart = 200;
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	engine->rpmCalculator.setRpmValue(1000);
++	dut.updateState(1000, getTimeNowNt());
++	advanceTimeUs(5.5e6);
++	dut.updateState(1000, getTimeNowNt());
++	ASSERT_EQ(ClearReason::OilPressure, dut.allowInjection().reason);
++
++	// the engine stops
++	engine->rpmCalculator.setRpmValue(0);
++	dut.updateState(0, getTimeNowNt());
++}
++
++TEST(OilRestartLock, offByDefault) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	LimpManager dut;
++	shutDownForLowOil(dut);
++	EXPECT_FALSE(dut.isOilRestartLocked());
++	EXPECT_TRUE(dut.allowInjection());
++}
++
++TEST(OilRestartLock, blocksStartForSetTime) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->oilRestartLockTime = 30;
++	LimpManager dut;
++	shutDownForLowOil(dut);
++
++	EXPECT_TRUE(dut.isOilRestartLocked());
++	EXPECT_EQ(ClearReason::OilRestartLock, dut.allowInjection().reason);
++	EXPECT_EQ(ClearReason::OilRestartLock, dut.allowIgnition().reason);
++	EXPECT_NEAR(30, dut.getOilRestartLockLeft(getTimeNowNt()), 0.1);
++
++	// still locked after 20 s, also while cranking
++	advanceTimeUs(20e6);
++	engine->rpmCalculator.setRpmValue(200);
++	dut.updateState(200, getTimeNowNt());
++	EXPECT_EQ(ClearReason::OilRestartLock, dut.allowInjection().reason);
++	EXPECT_NEAR(10, dut.getOilRestartLockLeft(getTimeNowNt()), 0.1);
++
++	// free after 30 s
++	advanceTimeUs(11e6);
++	engine->rpmCalculator.setRpmValue(0);
++	dut.updateState(0, getTimeNowNt());
++	EXPECT_FALSE(dut.isOilRestartLocked());
++	EXPECT_TRUE(dut.allowInjection());
++}
++
++TEST(OilRestartLock, keyOffEndsLock) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->oilRestartLockTime = 60;
++	LimpManager dut;
++	shutDownForLowOil(dut);
++	ASSERT_TRUE(dut.isOilRestartLocked());
++
++	dut.onIgnitionStateChanged(false);
++	dut.onIgnitionStateChanged(true);
++	dut.updateState(0, getTimeNowNt());
++	EXPECT_FALSE(dut.isOilRestartLocked());
++	EXPECT_TRUE(dut.allowInjection());
++}
++
++TEST(OilRestartLock, oilAlertEngineOffLocksToo) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->oilRestartLockTime = 30;
++	engineConfiguration->cranking.rpm = 400;
++
++	auto& oil = config->alerts[0];
++	oil.sensor = GPPWM_OilPressure;
++	oil.action = ALERT_ENGINE_OFF;
++	oil.triggerBelow = true;
++	oil.useRpmCurve = false;
++	oil.threshold = 100;
++	oil.delay = 0;
++	oil.minRpm = 0;
++
++	auto& alerts = engine->module<AlertManager>().unmock();
++	LimpManager dut;
++
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	engine->rpmCalculator.setRpmValue(3000);
++	Sensor::setMockValue(SensorType::Rpm, 3000);
++	alerts.update(getTimeNowNt());
++	ASSERT_TRUE(alerts.isEngineOffBy(GPPWM_OilPressure));
++	EXPECT_FALSE(alerts.isEngineOffBy(GPPWM_Clt));
++	dut.updateState(3000, getTimeNowNt());
++	EXPECT_EQ(ClearReason::AlertEngineOff, dut.allowInjection().reason);
++
++	engine->rpmCalculator.setRpmValue(0);
++	dut.updateState(0, getTimeNowNt());
++	EXPECT_TRUE(dut.isOilRestartLocked());
++}
++
++TEST(OilRestartLock, otherAlertDoesNotLock) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->oilRestartLockTime = 30;
++
++	auto& clt = config->alerts[0];
++	clt.sensor = GPPWM_Clt;
++	clt.action = ALERT_ENGINE_OFF;
++	clt.triggerBelow = false;
++	clt.useRpmCurve = false;
++	clt.threshold = 110;
++	clt.delay = 0;
++	clt.minRpm = 0;
++
++	auto& alerts = engine->module<AlertManager>().unmock();
++	LimpManager dut;
++
++	Sensor::setMockValue(SensorType::Clt, 120);
++	engine->rpmCalculator.setRpmValue(3000);
++	Sensor::setMockValue(SensorType::Rpm, 3000);
++	alerts.update(getTimeNowNt());
++	dut.updateState(3000, getTimeNowNt());
++	EXPECT_EQ(ClearReason::AlertEngineOff, dut.allowInjection().reason);
++
++	engine->rpmCalculator.setRpmValue(0);
++	dut.updateState(0, getTimeNowNt());
++	EXPECT_FALSE(dut.isOilRestartLocked());
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 7aac7c08c1..36eb55a2ca 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -282,6 +282,7 @@ TESTS_SRC_CPP = \
+ 	tests/test_rgb_status_led.cpp \
+ 	tests/test_cylinder_lambda_trim.cpp \
+ 	tests/test_egt_rise.cpp \
++	tests/test_oil_restart_lock.cpp \
+ 	tests/controllers/modules/map_averaging/test_map_averaging.cpp \
+ 	tests/util/test_utils.cpp \
+ 	tests/controllers/algo/test_engine_cylinder.cpp \
+-- 
+2.43.0
+
+From 61169cc2bfb5b1cbb221ee5bf61a639cb608a684 Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sat, 31 Oct 2026 22:15:49 +0000
+Subject: [PATCH] Tune selector switch on an analog input, outra-ecu style
+
+Plan item 58 (from the outra-ecu T20K manual, map selector by voltage).
+- tuneSelectorChannel: analog input of a tune selector switch; 0-5 V is
+  split in equal bands, one per tune (3 tunes: below 1.67 V tune 1, up to
+  3.33 V tune 2, above tune 3)
+- moving the switch picks its tune, also with the engine running; 0.1 V
+  hysteresis at the band edges; empty tunes are skipped as before; the
+  tune button and the app still work, the last change wins
+- TunerStudio: Tunes dialog
+- 5 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ .../modules/tune_selector/tune_selector.cpp   | 43 ++++++++++++-
+ .../modules/tune_selector/tune_selector.h     | 12 +++-
+ firmware/integration/rusefi_config.txt        |  3 +
+ firmware/tunerstudio/tunerstudio.template.ini |  1 +
+ .../tests/controllers/test_tune_selector.cpp  | 61 +++++++++++++++++++
+ 5 files changed, 117 insertions(+), 3 deletions(-)
+
+diff --git a/firmware/controllers/modules/tune_selector/tune_selector.cpp b/firmware/controllers/modules/tune_selector/tune_selector.cpp
+index 0f2c7c0b5d..00edf5b7ff 100644
+--- a/firmware/controllers/modules/tune_selector/tune_selector.cpp
++++ b/firmware/controllers/modules/tune_selector/tune_selector.cpp
+@@ -89,7 +89,29 @@ void TuneSelector::selectTune(uint8_t tune) {
+ 	}
+ }
+ 
++uint8_t TuneSelector::getSelectorPosition(float volts, uint8_t count) const {
++	if (count < 1) {
++		return 1;
++	}
++	float band = 5.0f / count;
++	int position = std::clamp<int>(static_cast<int>(volts / band) + 1, 1, count);
++
++	// stay where we are until the voltage is clearly in the next band
++	if (m_selectorPosition >= 1 && m_selectorPosition <= count && position != m_selectorPosition) {
++		float lower = (m_selectorPosition - 1) * band;
++		float upper = m_selectorPosition * band;
++		if (volts > lower - selectorHysteresis && volts < upper + selectorHysteresis) {
++			position = m_selectorPosition;
++		}
++	}
++	return position;
++}
++
+ void TuneSelector::update(bool buttonPressed) {
++	update(buttonPressed, unexpected);
++}
++
++void TuneSelector::update(bool buttonPressed, SensorResult selectorVoltage) {
+ 	uint8_t count = getTuneCount();
+ 
+ 	// The app (or TunerStudio) picks a tune by writing activeTune
+@@ -97,7 +119,20 @@ void TuneSelector::update(bool buttonPressed) {
+ 	if (configTune != m_lastConfigTune) {
+ 		m_lastConfigTune = configTune;
+ 		selectTune(configTune);
+-	} else if (buttonPressed && !m_wasPressed) {
++	}
++
++	// Selector switch by voltage: a new position picks its tune
++	if (selectorVoltage) {
++		uint8_t position = getSelectorPosition(selectorVoltage.Value, count);
++		if (position != m_selectorPosition) {
++			m_selectorPosition = position;
++			selectTune(position);
++		}
++	} else {
++		m_selectorPosition = 0;
++	}
++
++	if (buttonPressed && !m_wasPressed) {
+ 		// Next usable tune, skipping empty ones
+ 		uint8_t tune = m_activeTune;
+ 		for (uint8_t i = 0; i < count; i++) {
+@@ -126,5 +161,9 @@ void TuneSelector::update(bool buttonPressed) {
+ void TuneSelector::onSlowCallback() {
+ 	bool pressed = isBrainPinValid(engineConfiguration->tuneSwitchPin)
+ 		&& efiReadPin(engineConfiguration->tuneSwitchPin, engineConfiguration->tuneSwitchPinMode);
+-	update(pressed);
++	SensorResult selector = unexpected;
++	if (isAdcChannelValid(engineConfiguration->tuneSelectorChannel)) {
++		selector = adcGetScaledVoltage("tune", engineConfiguration->tuneSelectorChannel);
++	}
++	update(pressed, selector);
+ }
+diff --git a/firmware/controllers/modules/tune_selector/tune_selector.h b/firmware/controllers/modules/tune_selector/tune_selector.h
+index 83a9c72f79..484aaf1e22 100644
+--- a/firmware/controllers/modules/tune_selector/tune_selector.h
++++ b/firmware/controllers/modules/tune_selector/tune_selector.h
+@@ -4,7 +4,9 @@
+  * pro-style tunes ("ajustes"): tune 1 is the main tables, tunes 2 and 3 are
+  * config->extraTunes, each with its own main fuel (ms or VE), ignition, lambda and boost
+  * tables on the main tables axes. A button cycles through the tunes, and the app can pick
+- * one by writing activeTune, also with the engine running.
++ * one by writing activeTune, also with the engine running. A selector switch on an analog
++ * input (outra-ecu style) can also pick the tune by its voltage: 0-5 V split in equal bands,
++ * one per tune.
+  */
+ 
+ #pragma once
+@@ -23,6 +25,13 @@ public:
+ 	void onSlowCallback() override;
+ 
+ 	void update(bool buttonPressed);
++	// selectorVoltage: voltage of the tune selector switch, unexpected when not used
++	void update(bool buttonPressed, SensorResult selectorVoltage);
++
++	// Selector position (1..count) for a voltage, with a little hysteresis around the band
++	// edges so a switch sitting on an edge does not flicker; 0 = no selector
++	uint8_t getSelectorPosition(float volts, uint8_t count) const;
++	static constexpr float selectorHysteresis = 0.1f;
+ 
+ 	// 1 is the main tables, 2 and 3 are config->extraTunes
+ 	uint8_t getActiveTune() const {
+@@ -38,6 +47,7 @@ private:
+ 	uint8_t m_activeTune = 1;
+ 	uint8_t m_lastConfigTune = 0;
+ 	bool m_wasPressed = false;
++	uint8_t m_selectorPosition = 0;
+ };
+ 
+ // Tables of the tune in use
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 5ec2965f9c..197978980c 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2071,6 +2071,9 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ 	uint8_t oilPressureStartTimeout;Time after start for the oil pressure to reach 'After start minimum oil pressure', or the engine is shut off. 0 = 5 s.;"s", 1, 0, 0, 60, 0
+ 	uint8_t oilRestartLockTime;After the engine was shut off for low oil pressure (oil protection or an oil pressure alert with the Engine off action), a new start is blocked for this long. Turning the key off ends the lock. 0 = off.;"s", 1, 0, 0, 255, 0
+ 
++! outra-ecu-style tune selector switch on an analog input, see TuneSelector
++	adc_channel_e tuneSelectorChannel;Analog input of a tune selector switch: 0-5 V is split in equal bands, one per tune (3 tunes: below 1.67 V tune 1, up to 3.33 V tune 2, above tune 3). Moving the switch picks the tune, also with the engine running.
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 1bfd7705e3..1985ffd54c 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -5617,6 +5617,7 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "Tune in use at start-up",			activeTune
+ 		field = "Tune button",						tuneSwitchPin, { tuneCount > 1 }
+ 		field = "Tune button mode",					tuneSwitchPinMode, { tuneCount > 1 && tuneSwitchPin != 0 }
++		field = "Tune selector switch (by voltage)",	tuneSelectorChannel, { tuneCount > 1 }
+ 
+ 	dialog = alertSettings, "Alerts"
+ 		field = "Each alert watches one sensor. When it stays past its limit for the delay, the action runs and the alert output stays on until the next start."
+diff --git a/unit_tests/tests/controllers/test_tune_selector.cpp b/unit_tests/tests/controllers/test_tune_selector.cpp
+index 6157a2693c..948eb5773e 100644
+--- a/unit_tests/tests/controllers/test_tune_selector.cpp
++++ b/unit_tests/tests/controllers/test_tune_selector.cpp
+@@ -152,3 +152,64 @@ TEST_F(TuneSelectorTest, MsTableOfTheTuneIsUsed) {
+ 	float tune2Mass = getInjectionTimeTableFuelMass(3000);
+ 	EXPECT_GT(tune2Mass, mainMass);
+ }
++
++// outra-ecu-style selector switch: 0-5 V in equal bands, one per tune
++
++TEST_F(TuneSelectorTest, SelectorVoltagePicksTune) {
++	tunes().update(false, 0.5f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++	tunes().update(false, 2.5f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++	EXPECT_EQ(&config->extraTunes[0].veTable, &getActiveVeTable());
++	tunes().update(false, 4.5f);
++	EXPECT_EQ(3, tunes().getActiveTune());
++	tunes().update(false, 0.2f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, SelectorHysteresisAtBandEdge) {
++	// 3 tunes: edges at 1.67 V and 3.33 V
++	tunes().update(false, 1.0f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++	// just past the edge: stays on tune 1
++	tunes().update(false, 1.70f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++	// clearly in band 2
++	tunes().update(false, 1.80f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++	// back just under the edge: stays on tune 2
++	tunes().update(false, 1.62f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++	tunes().update(false, 1.5f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, SelectorSkipsEmptyTune) {
++	setTable(config->extraTunes[1].lambdaTable, 0);
++	tunes().update(false, 2.5f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++	// tune 3 is empty: stays on tune 2
++	tunes().update(false, 4.5f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, ButtonStillWorksWithSelector) {
++	tunes().update(false, 0.5f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++	// button moves on while the selector stays put
++	tunes().update(true, 0.5f);
++	tunes().update(false, 0.5f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++	// moving the selector picks its tune again
++	tunes().update(false, 4.5f);
++	EXPECT_EQ(3, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, SelectorFollowsTuneCount) {
++	engineConfiguration->tuneCount = 2;
++	// 2 tunes: one band each side of 2.5 V
++	tunes().update(false, 2.0f);
++	EXPECT_EQ(1, tunes().getActiveTune());
++	tunes().update(false, 4.9f);
++	EXPECT_EQ(2, tunes().getActiveTune());
++}
+-- 
+2.43.0
+
+From f8ea536b9a1e991a191fb98f2be1024a66233e20 Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sat, 31 Oct 2026 22:21:58 +0000
+Subject: [PATCH] Throttle blip on downshift with the electronic throttle,
+ outra-ecu style
+
+Plan item 59 (from the outra-ecu T20K manual; pulled forward from phase 4,
+item 52, because it is useful on the street too).
+- new module DownshiftBlip: each press of the blip button (or a micro
+  switch on the clutch or the gear lever) adds blipThrottleAdd % to the
+  throttle target for blipDuration ms, only at or above blipMinRpm;
+  holding the button does not make the blip longer
+- added on top of the pedal target, before the throttle maximum position
+  and the throttle rev limiter
+- 0 % = off (default)
+- output channel / log: Downshift blip throttle add
+- TunerStudio: Throttle blip on downshift (electronic throttle menu)
+- 4 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ firmware/console/binary/output_channels.txt   |  1 +
+ .../actuators/electronic_throttle.cpp         |  3 +
+ firmware/controllers/algo/engine.h            |  2 +
+ .../modules/downshift_blip/downshift_blip.cpp | 35 ++++++++
+ .../modules/downshift_blip/downshift_blip.h   | 30 +++++++
+ .../modules/downshift_blip/downshift_blip.mk  |  3 +
+ firmware/controllers/modules/modules.mk       |  1 +
+ firmware/integration/rusefi_config.txt        |  7 ++
+ firmware/tunerstudio/top_level_menu.ini       |  1 +
+ firmware/tunerstudio/tunerstudio.template.ini |  8 ++
+ unit_tests/tests/test_downshift_blip.cpp      | 86 +++++++++++++++++++
+ unit_tests/tests/tests.mk                     |  1 +
+ 12 files changed, 178 insertions(+)
+ create mode 100644 firmware/controllers/modules/downshift_blip/downshift_blip.cpp
+ create mode 100644 firmware/controllers/modules/downshift_blip/downshift_blip.h
+ create mode 100644 firmware/controllers/modules/downshift_blip/downshift_blip.mk
+ create mode 100644 unit_tests/tests/test_downshift_blip.cpp
+
+diff --git a/firmware/console/binary/output_channels.txt b/firmware/console/binary/output_channels.txt
+index 62b13cc15b..a15326f2db 100644
+--- a/firmware/console/binary/output_channels.txt
++++ b/firmware/console/binary/output_channels.txt
+@@ -519,4 +519,5 @@ float mapFast
+ 	uint8_t pinLockoutLeft;Password: lockout left;"s", 1, 0, 0, 30, 0
+ 	int8_t[8 iterate] autoscale cylLambdaTrim;Lambda trim cyl;"%", 0.2, 0, -25, 25, 1
+ 	int16_t egtRiseRate;EGT rise rate (fastest);"C/s", 1, 0, -1000, 1000, 0
++	uint8_t blipThrottleAdd;Downshift blip throttle add;"%", 1, 0, 0, 100, 0
+ end_struct
+diff --git a/firmware/controllers/actuators/electronic_throttle.cpp b/firmware/controllers/actuators/electronic_throttle.cpp
+index 5684febc9c..e3744ae275 100644
+--- a/firmware/controllers/actuators/electronic_throttle.cpp
++++ b/firmware/controllers/actuators/electronic_throttle.cpp
+@@ -346,6 +346,9 @@ expected<percent_t> EtbController::getSetpointEtb() {
+ 	}
+ #endif /* EFI_ANTILAG_SYSTEM */
+ 
++	// outra-ecu-style throttle blip on downshift
++	targetPosition += engine->module<DownshiftBlip>()->getThrottleAdd(getTimeNowNt());
++
+   float vehicleSpeed = Sensor::getOrZero(SensorType::VehicleSpeed);
+   float wheelSlip = Sensor::getOrZero(SensorType::WheelSlipRatio);
+   tcEtbDrop = tcEtbDropTable.getValue(wheelSlip, vehicleSpeed);
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index 4944d021b4..b8dddafa7f 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -38,6 +38,7 @@
+ #include "rgb_status_led.h"
+ #include "cylinder_lambda_trim.h"
+ #include "egt_rise_monitor.h"
++#include "downshift_blip.h"
+ #include "ecu_passwords.h"
+ #include "hall_pullup.h"
+ #include "cold_start_injector.h"
+@@ -214,6 +215,7 @@ public:
+         RgbStatusLed,
+         CylinderLambdaTrim,
+         EgtRiseMonitor,
++        DownshiftBlip,
+         HallPullupController,
+         ColdStartInjector,
+         GearShiftDetector,
+diff --git a/firmware/controllers/modules/downshift_blip/downshift_blip.cpp b/firmware/controllers/modules/downshift_blip/downshift_blip.cpp
+new file mode 100644
+index 0000000000..d7f40328e4
+--- /dev/null
++++ b/firmware/controllers/modules/downshift_blip/downshift_blip.cpp
+@@ -0,0 +1,35 @@
++#include "pch.h"
++
++#include "downshift_blip.h"
++
++void DownshiftBlip::update(bool buttonPressed, float rpm, efitick_t nowNt) {
++	bool enabled = engineConfiguration->blipThrottleAdd > 0 && engineConfiguration->blipDuration > 0;
++
++	// a new press starts a blip; holding the button does not make it longer
++	if (enabled && buttonPressed && !m_wasPressed && rpm >= engineConfiguration->blipMinRpm) {
++		m_started = true;
++		m_blipTimer.reset(nowNt);
++	}
++	m_wasPressed = buttonPressed;
++
++	if (!enabled) {
++		m_started = false;
++	}
++}
++
++bool DownshiftBlip::isActive(efitick_t nowNt) const {
++	return m_started
++		&& m_blipTimer.getElapsedSeconds(nowNt) * 1000 < engineConfiguration->blipDuration;
++}
++
++float DownshiftBlip::getThrottleAdd(efitick_t nowNt) const {
++	return isActive(nowNt) ? engineConfiguration->blipThrottleAdd : 0;
++}
++
++void DownshiftBlip::onFastCallback() {
++	bool pressed = isBrainPinValid(engineConfiguration->blipButtonPin)
++		&& efiReadPin(engineConfiguration->blipButtonPin, engineConfiguration->blipButtonPinMode);
++	efitick_t nowNt = getTimeNowNt();
++	update(pressed, Sensor::getOrZero(SensorType::Rpm), nowNt);
++	engine->outputChannels.blipThrottleAdd = getThrottleAdd(nowNt);
++}
+diff --git a/firmware/controllers/modules/downshift_blip/downshift_blip.h b/firmware/controllers/modules/downshift_blip/downshift_blip.h
+new file mode 100644
+index 0000000000..2c1b802f26
+--- /dev/null
++++ b/firmware/controllers/modules/downshift_blip/downshift_blip.h
+@@ -0,0 +1,30 @@
++/*
++ * @file downshift_blip.h
++ *
++ * outra-ecu-style throttle blip on downshift ("punta-taco") with the electronic throttle:
++ * pressing the blip button (or a micro switch on the clutch or the gear lever) adds a
++ * throttle opening for a set time, only above a minimum RPM. The added opening goes on
++ * top of the pedal target, before the throttle maximum and the throttle rev limiter.
++ */
++
++#pragma once
++
++#include <rusefi/timer.h>
++
++class DownshiftBlip : public EngineModule {
++public:
++	using interface_t = DownshiftBlip;
++
++	void onFastCallback() override;
++
++	void update(bool buttonPressed, float rpm, efitick_t nowNt);
++
++	// throttle opening to add right now, in %
++	float getThrottleAdd(efitick_t nowNt) const;
++	bool isActive(efitick_t nowNt) const;
++
++private:
++	bool m_wasPressed = false;
++	bool m_started = false;
++	Timer m_blipTimer;
++};
+diff --git a/firmware/controllers/modules/downshift_blip/downshift_blip.mk b/firmware/controllers/modules/downshift_blip/downshift_blip.mk
+new file mode 100644
+index 0000000000..52cb0964ff
+--- /dev/null
++++ b/firmware/controllers/modules/downshift_blip/downshift_blip.mk
+@@ -0,0 +1,3 @@
++# outra-ecu-style throttle blip on downshift with the electronic throttle
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/downshift_blip
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/downshift_blip/downshift_blip.cpp
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index 5429bbd590..f253e92175 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -24,6 +24,7 @@ include $(PROJECT_DIR)/controllers/modules/tune_selector/tune_selector.mk
+ include $(PROJECT_DIR)/controllers/modules/rgb_status_led/rgb_status_led.mk
+ include $(PROJECT_DIR)/controllers/modules/cylinder_lambda_trim/cylinder_lambda_trim.mk
+ include $(PROJECT_DIR)/controllers/modules/egt_rise/egt_rise.mk
++include $(PROJECT_DIR)/controllers/modules/downshift_blip/downshift_blip.mk
+ include $(PROJECT_DIR)/controllers/modules/hall_pullup/hall_pullup.mk
+ include $(PROJECT_DIR)/controllers/modules/cold_start_injector/cold_start_injector.mk
+ include $(PROJECT_DIR)/controllers/modules/gear_shift/gear_shift.mk
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 197978980c..e97ab0cba7 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2074,6 +2074,13 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ ! outra-ecu-style tune selector switch on an analog input, see TuneSelector
+ 	adc_channel_e tuneSelectorChannel;Analog input of a tune selector switch: 0-5 V is split in equal bands, one per tune (3 tunes: below 1.67 V tune 1, up to 3.33 V tune 2, above tune 3). Moving the switch picks the tune, also with the engine running.
+ 
++! outra-ecu-style throttle blip on downshift, see DownshiftBlip
++	switch_input_pin_e blipButtonPin;Blip button, or a micro switch on the clutch or the gear lever: each press opens the electronic throttle a little for a short time, for downshifts.
++	pin_input_mode_e blipButtonPinMode;
++	uint8_t blipThrottleAdd;Throttle opening added during the blip. 0 = off.;"%", 1, 0, 0, 100, 0
++	uint16_t blipDuration;How long the blip lasts.;"ms", 1, 0, 0, 2000, 0
++	uint16_t blipMinRpm;No blip below this RPM.;"RPM", 1, 0, 0, 15000, 0
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index 064d2bcc79..f2122c0736 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -246,6 +246,7 @@
+ 		subMenu = etbDialog,				"Electronic Throttle Body actuator"@@if_ts_show_etb
+ 		subMenu = etbTpsBiasCurve,			"ETB bias curve (feed forward)"@@if_ts_show_etb_bias_curve
+ 		subMenu = etbSpeedLimitSettings,	"Throttle speed by coolant temperature"@@if_ts_show_etb
++		subMenu = downshiftBlipSettings,	"Throttle blip on downshift"@@if_ts_show_etb
+ 		subMenu = pedalToTpsTbl,			@@pedalToTpsTbl_NAME@@ @@if_ts_show_etb
+ 		subMenu = throttle2TrimTbl,			"ETB #2 Trim", { isTps2Primary } @@if_ts_show_tps2
+ 
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 1985ffd54c..6eefc4237a 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -5775,6 +5775,14 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		panel = etbOpenSpeedCurve, { etbSpeedLimitEnabled }
+ 		panel = etbCloseSpeedCurve, { etbSpeedLimitEnabled }
+ 
++	dialog = downshiftBlipSettings, "Throttle blip on downshift"
++		field = "Each press of the blip button opens the throttle a little for a short time, for downshifts."
++		field = "Throttle added (0 = off)",			blipThrottleAdd
++		field = "Blip time",						blipDuration, { blipThrottleAdd > 0 }
++		field = "Minimum RPM",						blipMinRpm, { blipThrottleAdd > 0 }
++		field = "Blip button",						blipButtonPin, { blipThrottleAdd > 0 }
++		field = "Blip button mode",					blipButtonPinMode, { blipThrottleAdd > 0 && blipButtonPin != 0 }
++
+ 	dialog = etbLimits, "Electronic Throttle Limiting"
+ 		field = "Smoothly close the throttle to limit RPM."
+ 		field = "Soft limiter start",				etbRevLimitStart
+diff --git a/unit_tests/tests/test_downshift_blip.cpp b/unit_tests/tests/test_downshift_blip.cpp
+new file mode 100644
+index 0000000000..df99b923a0
+--- /dev/null
++++ b/unit_tests/tests/test_downshift_blip.cpp
+@@ -0,0 +1,86 @@
++#include "pch.h"
++
++#include "downshift_blip.h"
++#include "electronic_throttle_impl.h"
++#include "mocks.h"
++
++using ::testing::_;
++using ::testing::StrictMock;
++
++// outra-ecu-style throttle blip on downshift
++
++static void setupBlip() {
++	engineConfiguration->blipThrottleAdd = 15;
++	engineConfiguration->blipDuration = 300;
++	engineConfiguration->blipMinRpm = 1500;
++}
++
++TEST(DownshiftBlip, offByDefault) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	DownshiftBlip blip;
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_EQ(0, blip.getThrottleAdd(getTimeNowNt()));
++}
++
++TEST(DownshiftBlip, pressGivesTimedBlip) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupBlip();
++	DownshiftBlip blip;
++
++	blip.update(false, 4000, getTimeNowNt());
++	EXPECT_EQ(0, blip.getThrottleAdd(getTimeNowNt()));
++
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_EQ(15, blip.getThrottleAdd(getTimeNowNt()));
++
++	// holding the button does not make it longer
++	advanceTimeUs(200e3);
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_EQ(15, blip.getThrottleAdd(getTimeNowNt()));
++	advanceTimeUs(150e3);
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_EQ(0, blip.getThrottleAdd(getTimeNowNt()));
++
++	// a new press gives a new blip
++	blip.update(false, 4000, getTimeNowNt());
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_EQ(15, blip.getThrottleAdd(getTimeNowNt()));
++}
++
++TEST(DownshiftBlip, noBlipBelowMinRpm) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupBlip();
++	DownshiftBlip blip;
++	blip.update(false, 1000, getTimeNowNt());
++	blip.update(true, 1000, getTimeNowNt());
++	EXPECT_EQ(0, blip.getThrottleAdd(getTimeNowNt()));
++}
++
++TEST(DownshiftBlip, addsToThrottleTarget) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	setupBlip();
++	engineConfiguration->etbIdleThrottleRange = 0;
++
++	Sensor::setMockValue(SensorType::Tps1Primary, 0);
++	Sensor::setMockValue(SensorType::Tps1, 0.0f, true);
++	Sensor::setMockValue(SensorType::AcceleratorPedal, 0.0f, true);
++
++	EtbController etb;
++	StrictMock<MockVp3d> pedalMap;
++	EXPECT_CALL(pedalMap, getValue(_, _))
++		.WillRepeatedly([](float xRpm, float y) {
++			return y;
++		});
++	etb.init(DC_Throttle1, nullptr, nullptr, &pedalMap);
++
++	Sensor::setMockValue(SensorType::AcceleratorPedal, 10.0f, true);
++	EXPECT_FLOAT_EQ(10, etb.getSetpoint().value_or(-1));
++
++	auto& blip = engine->module<DownshiftBlip>().unmock();
++	blip.update(false, 4000, getTimeNowNt());
++	blip.update(true, 4000, getTimeNowNt());
++	EXPECT_FLOAT_EQ(25, etb.getSetpoint().value_or(-1));
++
++	advanceTimeUs(400e3);
++	EXPECT_FLOAT_EQ(10, etb.getSetpoint().value_or(-1));
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 36eb55a2ca..75cb3ea09c 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -283,6 +283,7 @@ TESTS_SRC_CPP = \
+ 	tests/test_cylinder_lambda_trim.cpp \
+ 	tests/test_egt_rise.cpp \
+ 	tests/test_oil_restart_lock.cpp \
++	tests/test_downshift_blip.cpp \
+ 	tests/controllers/modules/map_averaging/test_map_averaging.cpp \
+ 	tests/util/test_utils.cpp \
+ 	tests/controllers/algo/test_engine_cylinder.cpp \
+-- 
+2.43.0
+

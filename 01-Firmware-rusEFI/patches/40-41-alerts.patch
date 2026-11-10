@@ -1,0 +1,296 @@
+From b184c7843059b80049311e763c80ac8237a78f8f Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:53:59 +0000
+Subject: [PATCH] Alert sensors: EGT 3-8, hottest EGT and fuel pressure above
+ MAP (pro-style)
+
+New gppwm_channel_e values Egt3..Egt8, FuelPressureDiff (fuel pressure minus MAP,
+from the sensor mode, whatever the injector compensation) and EgtMax (hottest working
+EGT). They can be used by alerts, GPPWM and every other gppwm_channel_e axis.
+TS lists updated, ve/afr blend axis label offset moved from 36 to 44.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../actuators/gppwm_channel_reader.cpp        | 49 ++++++++++
+ firmware/controllers/algo/rusefi_enums.h      | 10 ++
+ firmware/tunerstudio/tunerstudio.template.ini | 16 ++--
+ .../tests/controllers/test_alert_manager.cpp  | 94 +++++++++++++++++++
+ 4 files changed, 161 insertions(+), 8 deletions(-)
+
+diff --git a/firmware/controllers/actuators/gppwm_channel_reader.cpp b/firmware/controllers/actuators/gppwm_channel_reader.cpp
+index 08e5d3b..47edb96 100644
+--- a/firmware/controllers/actuators/gppwm_channel_reader.cpp
++++ b/firmware/controllers/actuators/gppwm_channel_reader.cpp
+@@ -6,6 +6,39 @@
+ #include "throttle_model.h"
+ #include "gppwm_channel_reader.h"
+ 
++// fuel pressure above manifold pressure, from the fuel pressure sensor whatever the injector compensation mode
++static expected<float> readFuelPressureDiff() {
++	auto fps = Sensor::get(SensorType::FuelPressureInjector);
++	if (!fps) {
++		return unexpected;
++	}
++	if (engineConfiguration->fuelPressureSensorMode == FPM_Differential) {
++		return fps.Value;
++	}
++	auto map = Sensor::get(SensorType::Map);
++	if (!map) {
++		return unexpected;
++	}
++	if (engineConfiguration->fuelPressureSensorMode == FPM_Gauge) {
++		auto baro = Sensor::get(SensorType::BarometricPressure);
++		float baroKpa = (baro && baro.Value > 50 && baro.Value < 120) ? baro.Value : STD_ATMOSPHERE;
++		return fps.Value + baroKpa - map.Value;
++	}
++	return fps.Value - map.Value;
++}
++
++// hottest cylinder, only working EGT sensors count
++static expected<float> readEgtMax() {
++	expected<float> result = unexpected;
++	for (int i = 0; i < 8; i++) {
++		auto egt = Sensor::get(static_cast<SensorType>(static_cast<int>(SensorType::EGT1) + i));
++		if (egt && (!result || egt.Value > result.Value)) {
++			result = egt.Value;
++		}
++	}
++	return result;
++}
++
+ expected<float> readGppwmChannel(gppwm_channel_e channel) {
+ 	switch (channel) {
+ 	case GPPWM_Zero:
+@@ -90,6 +123,22 @@ expected<float> readGppwmChannel(gppwm_channel_e channel) {
+ 		return Sensor::get(SensorType::OilTemperature);
+ 	case GPPWM_FuelPressure:
+ 		return Sensor::get(SensorType::FuelPressureInjector);
++	case GPPWM_Egt3:
++		return Sensor::get(SensorType::EGT3);
++	case GPPWM_Egt4:
++		return Sensor::get(SensorType::EGT4);
++	case GPPWM_Egt5:
++		return Sensor::get(SensorType::EGT5);
++	case GPPWM_Egt6:
++		return Sensor::get(SensorType::EGT6);
++	case GPPWM_Egt7:
++		return Sensor::get(SensorType::EGT7);
++	case GPPWM_Egt8:
++		return Sensor::get(SensorType::EGT8);
++	case GPPWM_FuelPressureDiff:
++		return readFuelPressureDiff();
++	case GPPWM_EgtMax:
++		return readEgtMax();
+ 	case GPPWM_ThrottleRatio:
+ #if EFI_ENGINE_CONTROL
+ 		return getThrottlePressureRatio(Sensor::getOrZero(SensorType::Map));
+diff --git a/firmware/controllers/algo/rusefi_enums.h b/firmware/controllers/algo/rusefi_enums.h
+index d8e8757..717433e 100644
+--- a/firmware/controllers/algo/rusefi_enums.h
++++ b/firmware/controllers/algo/rusefi_enums.h
+@@ -728,6 +728,16 @@ typedef enum __attribute__ ((__packed__)) {
+ 	GPPWM_OilTemp = 33,
+ 	GPPWM_FuelPressure = 34,
+ 	GPPWM_ThrottleRatio = 35,
++	GPPWM_Egt3 = 36,
++	GPPWM_Egt4 = 37,
++	GPPWM_Egt5 = 38,
++	GPPWM_Egt6 = 39,
++	GPPWM_Egt7 = 40,
++	GPPWM_Egt8 = 41,
++	// fuel pressure above manifold pressure, what the injector sees
++	GPPWM_FuelPressureDiff = 42,
++	// hottest of all EGT sensors
++	GPPWM_EgtMax = 43,
+ 	// remember to manually sync 'pwmAxisLabels' in tunerstudio.template.ini
+ 	// todo: rename 'pwmAxisLabels' and maybe even gppwm_channel_e since we now use wider than just 'gppwm'?
+ } gppwm_channel_e;
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index a5a8d30..a2c81c1 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -116,7 +116,7 @@ enable2ndByteCanID = false
+ #define pin_mode_e_enum="default", "INVALID", "INVALID", "INVALID", "opendrain", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "PULLUP", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "PULLDOWN"
+ #define pin_input_mode_e_enum="DEFAULT", "PULLUP", "PULLDOWN", "INVALID", "INVERTED DEFAULT", "INVERTED PULLUP", "INVERTED PULLDOWN", "INVALID
+ #define pin_output_mode_e_enum="default", "default inverted", "open collector", "open collector inverted"
+-#define gppwm_channel_e_enum="Zero", "TPS", "MAP", "CLT", "IAT", "Fuel Load", "Ignition Load", "Aux Temp 1", "Aux Temp 2", "Accel Pedal", "Battery Voltage", "VVT 1 In Actual", "VVT 1 Ex Actual", "VVT 2 In Actual", "VVT 2 Ex Actual", "Ethanol (Flex) %", "Aux Linear 1", "Aux Linear 2", "GPPWM Output 1", "GPPWM Output 2", "GPPWM Output 3", "GPPWM Output 4", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure", "EGT 1", "EGT 2", "Aux Linear 3", "Aux Linear 4", "Vehicle speed", "Oil pressure", "Oil temp", "Fuel Pressure"
++#define gppwm_channel_e_enum="Zero", "TPS", "MAP", "CLT", "IAT", "Fuel Load", "Ignition Load", "Aux Temp 1", "Aux Temp 2", "Accel Pedal", "Battery Voltage", "VVT 1 In Actual", "VVT 1 Ex Actual", "VVT 2 In Actual", "VVT 2 Ex Actual", "Ethanol (Flex) %", "Aux Linear 1", "Aux Linear 2", "GPPWM Output 1", "GPPWM Output 2", "GPPWM Output 3", "GPPWM Output 4", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure", "EGT 1", "EGT 2", "Aux Linear 3", "Aux Linear 4", "Vehicle speed", "Oil pressure", "Oil temp", "Fuel Pressure", "Throttle Ratio", "EGT 3", "EGT 4", "EGT 5", "EGT 6", "EGT 7", "EGT 8", "Fuel Pressure Diff", "EGT max"
+ #define spi_device_e_enum="Off", "SPI1", "SPI2", "SPI3", "SPI4", "SPI5", "SPI6"
+ 
+ ; Remove next line when Java toolset gets adjusted to load those from json config into VariablesRegistry
+@@ -395,7 +395,7 @@ include_file @@TUNING_SECTION_FILE@@
+ 	targetMixtureFinalTargetLabels = bits, U08, [0:1], "Final target AFR (fuel)", "Final target lambda"
+ 	; [tag:ve_blend_default_axis] Display-only entries 36..39 follow veLoadSrc; 36..41 follow afrLoadSrc.
+ 	; The first 36 entries retain their GPPWM channel indices.
+-	pwmAxisLabels = bits, U08, [0:5], "Zero", "TPS %", "MAP kPa", "CLT C", "IAT C", "Fuel Load", "Ignition Load", "Aux Temp 1 C", "Aux Temp 2 C", "Accel Pedal %", "Battery Voltage Volts", "VVT 1 I Deg", "VVT 1 E Deg", "VVT 2 I Deg", "VVT 2 E Deg", "Ethanol (Flex) %", "Aux Linear 1 *", "Aux Linear 2 *", "GPPWM Output 1 %", "GPPWM Output 2 %", "GPPWM Output 3 %", "GPPWM Output 4 %", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure kPa", "EGT 1 C", "EGT 2 C", "Aux Linear 3", "Aux Linear 4", "Vehicle Speed KPH", "Oil pressure kPa", "Oil temp C", "Fuel Pressure", "Throttle Pressure Ratio", "MAP kPa", "TPS %", "Air Charge %", "Lua load", "Accel Pedal %", "Cylinder Filling %"
++	pwmAxisLabels = bits, U08, [0:5], "Zero", "TPS %", "MAP kPa", "CLT C", "IAT C", "Fuel Load", "Ignition Load", "Aux Temp 1 C", "Aux Temp 2 C", "Accel Pedal %", "Battery Voltage Volts", "VVT 1 I Deg", "VVT 1 E Deg", "VVT 2 I Deg", "VVT 2 E Deg", "Ethanol (Flex) %", "Aux Linear 1 *", "Aux Linear 2 *", "GPPWM Output 1 %", "GPPWM Output 2 %", "GPPWM Output 3 %", "GPPWM Output 4 %", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure kPa", "EGT 1 C", "EGT 2 C", "Aux Linear 3", "Aux Linear 4", "Vehicle Speed KPH", "Oil pressure kPa", "Oil temp C", "Fuel Pressure", "Throttle Pressure Ratio", "EGT 3 C", "EGT 4 C", "EGT 5 C", "EGT 6 C", "EGT 7 C", "EGT 8 C", "Fuel Pressure Diff kPa", "EGT max C", "MAP kPa", "TPS %", "Air Charge %", "Lua load", "Accel Pedal %", "Cylinder Filling %"
+ 	veAxisLabels = bits, U08, [0:1], "MAP", "TPS", "Air Charge", "Lua"
+ 	targetAfrAxisLabels = bits, U08, [0:2], "MAP", "TPS", "Air Charge", "Lua", "Acc Pedal", "Cyl Filling"
+ 	; [tag:ignition_blend_load_axis] Native-unit labels follow ignLoadSrc without changing GPPWM indices.
+@@ -1525,7 +1525,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend1Table, veBlend1Map, @@VE_BLEND1_TABLE_NAME@@, 1
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends1_yAxisOverride ? veBlends1_yAxisOverride : 36 + veLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends1_yAxisOverride ? veBlends1_yAxisOverride : 44 + veLoadSrc)}
+ 		xBins		= veBlends1_rpmBins, RPMValue
+ 		yBins		= veBlends1_loadBins, veBlendYAxis1
+ 		zBins		= veBlends1_table
+@@ -1533,7 +1533,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend2Table, veBlend2Map, "VE blend 2", 1@@if_ts_show_veBlends2
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends2
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends2_yAxisOverride ? veBlends2_yAxisOverride : 36 + veLoadSrc)}@@if_ts_show_veBlends2
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends2_yAxisOverride ? veBlends2_yAxisOverride : 44 + veLoadSrc)}@@if_ts_show_veBlends2
+ 		xBins		= veBlends2_rpmBins, RPMValue@@if_ts_show_veBlends2
+ 		yBins		= veBlends2_loadBins, veBlendYAxis2@@if_ts_show_veBlends2
+ 		zBins		= veBlends2_table@@if_ts_show_veBlends2
+@@ -1541,7 +1541,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend3Table, veBlend3Map, "VE blend 3", 1@@if_ts_show_veBlends3
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends3
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends3_yAxisOverride ? veBlends3_yAxisOverride : 36 + veLoadSrc)}@@if_ts_show_veBlends3
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends3_yAxisOverride ? veBlends3_yAxisOverride : 44 + veLoadSrc)}@@if_ts_show_veBlends3
+ 		xBins		= veBlends3_rpmBins, RPMValue@@if_ts_show_veBlends3
+ 		yBins		= veBlends3_loadBins, veBlendYAxis3@@if_ts_show_veBlends3
+ 		zBins		= veBlends3_table@@if_ts_show_veBlends3
+@@ -1549,7 +1549,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend4Table, veBlend4Map, "VE blend 4", 1@@if_ts_show_veBlends4
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends4
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends4_yAxisOverride ? veBlends4_yAxisOverride : 36 + veLoadSrc)}@@if_ts_show_veBlends4
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends4_yAxisOverride ? veBlends4_yAxisOverride : 44 + veLoadSrc)}@@if_ts_show_veBlends4
+ 		xBins		= veBlends4_rpmBins, RPMValue@@if_ts_show_veBlends4
+ 		yBins		= veBlends4_loadBins, veBlendYAxis4@@if_ts_show_veBlends4
+ 		zBins		= veBlends4_table@@if_ts_show_veBlends4
+@@ -1592,7 +1592,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 	table = targetAfrBlend1Table, targetAfrBlend1Map, "Target Mixture Adder 1", 1
+ 		topicHelp = "targetMixtureAdderHelp"
+ 		; [tag:ve_blend_default_axis] Zero inherits the main target-table load source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends1_yAxisOverride ? targetAfrBlends1_yAxisOverride : 36 + afrLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends1_yAxisOverride ? targetAfrBlends1_yAxisOverride : 44 + afrLoadSrc)}
+ 		xBins = targetAfrBlends1_rpmBins, RPMValue
+ 		yBins = targetAfrBlends1_loadBins, targetAfrBlendYAxis1
+ 		; [tag:target_adder_display] Both unit modes share this editor and the native saved table.
+@@ -1603,7 +1603,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 	table = targetAfrBlend2Table, targetAfrBlend2Map, "Target Mixture Adder 2", 1
+ 		topicHelp = "targetMixtureAdderHelp"
+ 		; [tag:ve_blend_default_axis] Zero inherits the main target-table load source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends2_yAxisOverride ? targetAfrBlends2_yAxisOverride : 36 + afrLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends2_yAxisOverride ? targetAfrBlends2_yAxisOverride : 44 + afrLoadSrc)}
+ 		xBins = targetAfrBlends2_rpmBins, RPMValue
+ 		yBins = targetAfrBlends2_loadBins, targetAfrBlendYAxis2
+ 		; [tag:target_adder_display] Both unit modes share this editor and the native saved table.
+diff --git a/unit_tests/tests/controllers/test_alert_manager.cpp b/unit_tests/tests/controllers/test_alert_manager.cpp
+index fd46f94..bde281b 100644
+--- a/unit_tests/tests/controllers/test_alert_manager.cpp
++++ b/unit_tests/tests/controllers/test_alert_manager.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "alert_manager.h"
+ #include "limp_manager.h"
++#include "gppwm_channel_reader.h"
+ 
+ // pro-style alert engine: sensor + limit (fixed or RPM curve) + minimum time + action,
+ // latched with the alert output until the next engine start.
+@@ -176,3 +177,96 @@ TEST_F(AlertManagerTest, SafeModeLimitsRpm) {
+ 	getLimpManager()->updateState(2500, getTimeNowNt());
+ 	EXPECT_TRUE(getLimpManager()->allowInjection().value);
+ }
++
++// Items 40/41: fuel pressure and per-cylinder EGT alerts
++TEST_F(AlertManagerTest, EgtSensorsForEachCylinder) {
++	Sensor::setMockValue(SensorType::EGT3, 650);
++	Sensor::setMockValue(SensorType::EGT8, 720);
++	EXPECT_NEAR(650, readGppwmChannel(GPPWM_Egt3).value_or(0), 0.01);
++	EXPECT_NEAR(720, readGppwmChannel(GPPWM_Egt8).value_or(0), 0.01);
++	EXPECT_FALSE(readGppwmChannel(GPPWM_Egt5).Valid);
++
++	// hottest cylinder, failed sensors left out
++	EXPECT_NEAR(720, readGppwmChannel(GPPWM_EgtMax).value_or(0), 0.01);
++	Sensor::setMockValue(SensorType::EGT4, 910);
++	EXPECT_NEAR(910, readGppwmChannel(GPPWM_EgtMax).value_or(0), 0.01);
++}
++
++TEST_F(AlertManagerTest, NoEgtSensorMeansNoEgtMax) {
++	EXPECT_FALSE(readGppwmChannel(GPPWM_EgtMax).Valid);
++}
++
++TEST_F(AlertManagerTest, FuelPressureDifferential) {
++	Sensor::setMockValue(SensorType::Map, 150);
++	Sensor::setMockValue(SensorType::BarometricPressure, 100);
++
++	engineConfiguration->fuelPressureSensorMode = FPM_Absolute;
++	Sensor::setMockValue(SensorType::FuelPressureInjector, 400);
++	EXPECT_NEAR(250, readGppwmChannel(GPPWM_FuelPressureDiff).value_or(0), 0.01);
++
++	engineConfiguration->fuelPressureSensorMode = FPM_Gauge;
++	Sensor::setMockValue(SensorType::FuelPressureInjector, 300);
++	EXPECT_NEAR(250, readGppwmChannel(GPPWM_FuelPressureDiff).value_or(0), 0.01);
++
++	engineConfiguration->fuelPressureSensorMode = FPM_Differential;
++	EXPECT_NEAR(300, readGppwmChannel(GPPWM_FuelPressureDiff).value_or(0), 0.01);
++
++	// failed MAP: no reading unless the sensor is differential
++	Sensor::setInvalidMockValue(SensorType::Map);
++	EXPECT_TRUE(readGppwmChannel(GPPWM_FuelPressureDiff).Valid);
++	engineConfiguration->fuelPressureSensorMode = FPM_Absolute;
++	EXPECT_FALSE(readGppwmChannel(GPPWM_FuelPressureDiff).Valid);
++}
++
++TEST_F(AlertManagerTest, LowFuelPressureDifferentialTrips) {
++	auto& fuel = config->alerts[1];
++	fuel.sensor = GPPWM_FuelPressureDiff;
++	fuel.action = ALERT_SAFE_MODE;
++	fuel.triggerBelow = true;
++	fuel.useRpmCurve = false;
++	fuel.threshold = 250; // kPa above MAP
++	fuel.delay = 0.2f;
++	fuel.minRpm = 1000;
++
++	engineConfiguration->fuelPressureSensorMode = FPM_Absolute;
++	Sensor::setMockValue(SensorType::Map, 200);
++	Sensor::setMockValue(SensorType::FuelPressureInjector, 500); // 300 kPa above MAP
++	update();
++	advanceTimeUs(300'000);
++	update();
++	EXPECT_FALSE(alerts().isTripped(1));
++
++	// boost goes up, fuel pressure does not follow
++	Sensor::setMockValue(SensorType::Map, 280); // 220 kPa above MAP
++	update();
++	advanceTimeUs(300'000);
++	update();
++	EXPECT_TRUE(alerts().isTripped(1));
++	EXPECT_EQ(ALERT_SAFE_MODE, alerts().getLevel());
++}
++
++TEST_F(AlertManagerTest, HotCylinderTrips) {
++	auto& egt = config->alerts[2];
++	egt.sensor = GPPWM_EgtMax;
++	egt.action = ALERT_WARN;
++	egt.triggerBelow = false;
++	egt.useRpmCurve = false;
++	egt.threshold = 900; // C
++	egt.delay = 0.1f;
++	egt.minRpm = 0;
++
++	for (auto t : { SensorType::EGT1, SensorType::EGT2, SensorType::EGT3, SensorType::EGT4 }) {
++		Sensor::setMockValue(t, 800);
++	}
++	update();
++	advanceTimeUs(200'000);
++	update();
++	EXPECT_FALSE(alerts().isTripped(2));
++
++	Sensor::setMockValue(SensorType::EGT3, 950);
++	update();
++	advanceTimeUs(200'000);
++	update();
++	EXPECT_TRUE(alerts().isTripped(2));
++	EXPECT_EQ(ALERT_WARN, alerts().getLevel());
++}
+-- 
+2.43.0
+

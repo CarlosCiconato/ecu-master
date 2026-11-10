@@ -1,0 +1,412 @@
+From 9dbb25cfd8605a109045af5795270363689a37de Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sat, 31 Oct 2026 22:09:46 +0000
+Subject: [PATCH] Oil pressure: settable time to build pressure and restart
+ lock after an oil shutdown
+
+Plan item 57 (from the outra-ecu T20K manual, oil pressure alert).
+- oilPressureStartTimeout: time after start for the oil pressure to reach
+  'After start minimum oil pressure', or the engine is shut off (0 = 5 s,
+  the old fixed value)
+- oilRestartLockTime: after the engine was shut off for low oil pressure
+  (after-start check, running low oil protection, or an alert on oil
+  pressure with the Engine off action) a new start is blocked (no fuel, no
+  spark) for this long once the engine has stopped; turning the key off
+  ends the lock; 0 = off (default)
+- new cut reason 26 "Oil restart lock"
+- AlertManager::isEngineOffBy(sensor)
+- TunerStudio: Low oil pressure protection dialog
+- 6 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ firmware/controllers/limp_manager.cpp         |  51 +++++-
+ firmware/controllers/limp_manager.h           |  13 ++
+ .../modules/alerts/alert_manager.cpp          |  10 ++
+ .../modules/alerts/alert_manager.h            |   2 +
+ firmware/integration/rusefi_config.txt        |   4 +
+ firmware/tunerstudio/tunerstudio.template.ini |   4 +-
+ unit_tests/tests/test_oil_restart_lock.cpp    | 150 ++++++++++++++++++
+ unit_tests/tests/tests.mk                     |   1 +
+ 8 files changed, 233 insertions(+), 2 deletions(-)
+ create mode 100644 unit_tests/tests/test_oil_restart_lock.cpp
+
+diff --git a/firmware/controllers/limp_manager.cpp b/firmware/controllers/limp_manager.cpp
+index e8049595ba..4850c9a021 100644
+--- a/firmware/controllers/limp_manager.cpp
++++ b/firmware/controllers/limp_manager.cpp
+@@ -214,6 +214,7 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 		m_boostCutHysteresis = {};
+ 	}
+ 
++	bool oilCutNow = false;
+ 	if (engine->rpmCalculator.isRunning()) {
+ 		bool hasOilpSensor = Sensor::hasSensor(SensorType::OilPressure);
+ 		auto oilp = Sensor::get(SensorType::OilPressure);
+@@ -223,7 +224,11 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 		// Only check if the setting is enabled and you have an oil pressure sensor
+ 		if (minOilPressure > 0 && hasOilpSensor) {
+ 			// Has it been long enough we should have pressure?
+-			bool isTimedOut = engine->rpmCalculator.getSecondsSinceEngineStart(nowNt) > 5.0f;
++			// pro/outra-ecu style: the time to build pressure can be set, 0 = 5 s as before
++			float startTimeout = engineConfiguration->oilPressureStartTimeout > 0
++				? (float)engineConfiguration->oilPressureStartTimeout
++				: 5.0f;
++			bool isTimedOut = engine->rpmCalculator.getSecondsSinceEngineStart(nowNt) > startTimeout;
+ 			isInAfterStartWindow = !isTimedOut;
+ 
+ 			// Only check before timed out
+@@ -239,6 +244,7 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 			// If time is up, the sensor works, and no pressure, kill the engine.
+ 			if (isTimedOut && !m_hadOilPressureAfterStart) {
+ 				allowFuel.clear(ClearReason::OilPressure);
++				oilCutNow = true;
+ 			}
+ 		}
+ 
+@@ -255,6 +261,7 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 			if (!isPressureSufficient && !isInAfterStartWindow
+ 				&& m_lowOilPressureTimer.hasElapsedSec(engineConfiguration->minimumOilPressureTimeout)) {
+ 				allowFuel.clear(ClearReason::OilPressure);
++				oilCutNow = true;
+ 			}
+ 		}
+ 
+@@ -280,6 +287,16 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 		m_highOilPressureTimer.reset(nowNt);
+ 	}
+ 
++	// An alert on oil pressure that shut the engine off counts as a low oil pressure shutdown too
++	if (engine->module<AlertManager>()->isEngineOffBy(GPPWM_OilPressure)) {
++		oilCutNow = true;
++	}
++	updateOilRestartLock(engine->rpmCalculator.isRunning(), oilCutNow, nowNt);
++	if (m_oilRestartLocked) {
++		allowFuel.clear(ClearReason::OilRestartLock);
++		allowSpark.clear(ClearReason::OilRestartLock);
++	}
++
+ 	// If we're in the engine-stop window (a stop was requested recently via start button, Lua,
+ 	// console, TS command or a board hook - see ShutdownController::isEngineStop and
+ 	// StopRequestedReason), inhibit fuel so the engine actually winds down instead of restarting
+@@ -375,7 +392,39 @@ void LimpManager::updateState(float rpm, efitick_t nowNt) {
+ 	}
+ }
+ 
++void LimpManager::updateOilRestartLock(bool isRunning, bool oilCutNow, efitick_t nowNt) {
++	if (isRunning && oilCutNow) {
++		m_oilCutWhileRunning = true;
++	}
++
++	if (m_oilRestartLocked
++		&& m_oilRestartLockTimer.hasElapsedSec(engineConfiguration->oilRestartLockTime)) {
++		m_oilRestartLocked = false;
++	}
++
++	// The engine stopped after a low oil pressure cut: block the next start for a while
++	if (m_oilCutWhileRunning && engine->rpmCalculator.isStopped()) {
++		m_oilCutWhileRunning = false;
++		if (engineConfiguration->oilRestartLockTime > 0) {
++			m_oilRestartLocked = true;
++			m_oilRestartLockTimer.reset(nowNt);
++		}
++	}
++}
++
++float LimpManager::getOilRestartLockLeft(efitick_t nowNt) const {
++	if (!m_oilRestartLocked) {
++		return 0;
++	}
++	return std::max(0.0f, engineConfiguration->oilRestartLockTime - m_oilRestartLockTimer.getElapsedSeconds(nowNt));
++}
++
+ void LimpManager::onIgnitionStateChanged(bool ignitionOn) {
++	// Turning the key off ends the oil restart lock
++	if (!ignitionOn) {
++		m_oilRestartLocked = false;
++		m_oilCutWhileRunning = false;
++	}
+ 	m_ignitionOn = ignitionOn;
+ }
+ 
+diff --git a/firmware/controllers/limp_manager.h b/firmware/controllers/limp_manager.h
+index df603f3892..963936bc2b 100644
+--- a/firmware/controllers/limp_manager.h
++++ b/firmware/controllers/limp_manager.h
+@@ -37,6 +37,7 @@ enum class ClearReason : uint8_t {
+ 	AlertEngineOff, // 23
+ 	AlertSafeMode, // 24
+ 	StartPassword, // 25
++	OilRestartLock, // 26
+ 
+ 	// Keep this list in sync with fuelIgnCutCodeList in tunerstudio.template.ini!
+ 	// todo: add a code generator between ClearReason and fuelIgnCutCodeList in tunerstudio.template.ini
+@@ -122,6 +123,12 @@ public:
+ 
+ 	float getTimeSinceAnyCut() const;
+ 
++	// After an engine shutdown for low oil pressure, a new start is blocked for oilRestartLockTime
++	bool isOilRestartLocked() const {
++		return m_oilRestartLocked;
++	}
++	float getOilRestartLockLeft(efitick_t nowNt) const;
++
+ 	bool allowTriggerInput() const;
+ 
+ 	void updateRevLimit(float rpm);
+@@ -158,6 +165,12 @@ private:
+ 
+ 	bool m_hadOilPressureAfterStart = false;
+ 
++	// pro/outra-ecu-style oil restart lock, see oilRestartLockTime
++	void updateOilRestartLock(bool isRunning, bool oilCutNow, efitick_t nowNt);
++	bool m_oilCutWhileRunning = false;
++	bool m_oilRestartLocked = false;
++	Timer m_oilRestartLockTimer;
++
+ 	// Ignition switch state
+ 	bool m_ignitionOn = false;
+ 
+diff --git a/firmware/controllers/modules/alerts/alert_manager.cpp b/firmware/controllers/modules/alerts/alert_manager.cpp
+index 3a5b842460..e70f49398d 100644
+--- a/firmware/controllers/modules/alerts/alert_manager.cpp
++++ b/firmware/controllers/modules/alerts/alert_manager.cpp
+@@ -91,6 +91,16 @@ bool AlertManager::isTripped(size_t index) const {
+ 	return m_latchedMask & (1 << index);
+ }
+ 
++bool AlertManager::isEngineOffBy(gppwm_channel_e sensor) const {
++	for (size_t i = 0; i < ALERT_COUNT; i++) {
++		const auto& alert = config->alerts[i];
++		if (isTripped(i) && alert.action == ALERT_ENGINE_OFF && alert.sensor == sensor) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ void AlertManager::clearLatches() {
+ 	m_latchedMask = 0;
+ }
+diff --git a/firmware/controllers/modules/alerts/alert_manager.h b/firmware/controllers/modules/alerts/alert_manager.h
+index 9fabc058d6..520c4748b0 100644
+--- a/firmware/controllers/modules/alerts/alert_manager.h
++++ b/firmware/controllers/modules/alerts/alert_manager.h
+@@ -23,6 +23,8 @@ public:
+ 	// Most severe action among latched alerts
+ 	alert_action_e getLevel() const;
+ 	bool isTripped(size_t index) const;
++	// An alert on this sensor has shut the engine off (latched)
++	bool isEngineOffBy(gppwm_channel_e sensor) const;
+ 	// Threshold in use right now (fixed value or RPM curve)
+ 	float getThreshold(size_t index, float rpm) const;
+ 	void clearLatches();
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 0311439100..5ec2965f9c 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2067,6 +2067,10 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ 	uint8_t autoscale etbAutoRecoverDelay;The sensors must read fine for this long before the throttle is turned back on.;"s", 0.1, 0, 0.1, 25, 1
+ 	uint8_t etbAutoRecoverMaxTries;How many times the throttle is turned back on before it stays off until the next power up. 0 = no limit.;"", 1, 0, 0, 100, 0
+ 
++! pro/outra-ecu-style oil pressure start check and restart lock
++	uint8_t oilPressureStartTimeout;Time after start for the oil pressure to reach 'After start minimum oil pressure', or the engine is shut off. 0 = 5 s.;"s", 1, 0, 0, 60, 0
++	uint8_t oilRestartLockTime;After the engine was shut off for low oil pressure (oil protection or an oil pressure alert with the Engine off action), a new start is blocked for this long. Turning the key off ends the lock. 0 = off.;"s", 1, 0, 0, 255, 0
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 207af117d8..1bfd7705e3 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -450,7 +450,7 @@ include_file @@TUNING_SECTION_FILE@@
+ 	ignModeList = bits, U08, [0:3], "Single Coil", "Sequential", "Wasted", "Two Coils"
+ 
+ ; ClearReason
+-	fuelIgnCutCodeList = bits, U08, [0:7], "None", "fatal error", "setting disabled", "RPM limit", "ETB RPM limit", "boost cut", "oil pressure", "stop requested", "ETB problem", "launch control", "max injector duty", "flood clear", "engine sync", "kickstart", "ign off", "Lua", "ACR", "Lambda Prot", "GDI Comms", "Brake", "Fatal", "GDI limits", "Pump limit", "Alert engine off", "Alert safe mode", "Start password"
++	fuelIgnCutCodeList = bits, U08, [0:7], "None", "fatal error", "setting disabled", "RPM limit", "ETB RPM limit", "boost cut", "oil pressure", "stop requested", "ETB problem", "launch control", "max injector duty", "flood clear", "engine sync", "kickstart", "ign off", "Lua", "ACR", "Lambda Prot", "GDI Comms", "Brake", "Fatal", "GDI limits", "Pump limit", "Alert engine off", "Alert safe mode", "Start password", "Oil restart lock"
+ 
+ ; TpsState
+ 	etbCutCodeList = bits, U08, [0:7], "None", "engine stopped", "TPS error", "PPS error", "TPS noise", "Autotune", "Lua", "TPS Calib", "N/A", "Redundancy", "PPS noise", "Jam"
+@@ -5757,6 +5757,8 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 	dialog = lowOilPressureProtection, "Low oil pressure protection"
+ 		topicHelp = "lowOilPressureProtectionHelp"
+ 		field = "After start Minimum oil pressure",		minOilPressureAfterStart
++		field = "Time to build oil pressure (0 = 5 s)",	oilPressureStartTimeout, { minOilPressureAfterStart > 0 }
++		field = "Restart lock after oil shutdown",		oilRestartLockTime
+ 		field = "Running engine Low oil pressure",	enableOilPressureProtect
+ 		field = "Running engine protection timeout", 	minimumOilPressureTimeout, { enableOilPressureProtect }
+ 		panel = minimumOilPressure
+diff --git a/unit_tests/tests/test_oil_restart_lock.cpp b/unit_tests/tests/test_oil_restart_lock.cpp
+new file mode 100644
+index 0000000000..e8abc87b8d
+--- /dev/null
++++ b/unit_tests/tests/test_oil_restart_lock.cpp
+@@ -0,0 +1,150 @@
++#include "pch.h"
++
++#include "limp_manager.h"
++#include "alert_manager.h"
++
++// pro/outra-ecu-style oil pressure start check: settable time to build pressure, and
++// a restart lock after the engine was shut off for low oil pressure
++
++TEST(OilRestartLock, startTimeoutCanBeSet) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->minOilPressureAfterStart = 200;
++	engineConfiguration->oilPressureStartTimeout = 2;
++
++	LimpManager dut;
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	engine->rpmCalculator.setRpmValue(1000);
++
++	dut.updateState(1000, getTimeNowNt());
++	EXPECT_TRUE(dut.allowInjection());
++
++	advanceTimeUs(1.5e6);
++	dut.updateState(1000, getTimeNowNt());
++	EXPECT_TRUE(dut.allowInjection());
++
++	// 2.5 s after start: cut, instead of waiting 5 s
++	advanceTimeUs(1.0e6);
++	dut.updateState(1000, getTimeNowNt());
++	EXPECT_EQ(ClearReason::OilPressure, dut.allowInjection().reason);
++}
++
++static void shutDownForLowOil(LimpManager& dut) {
++	engineConfiguration->minOilPressureAfterStart = 200;
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	engine->rpmCalculator.setRpmValue(1000);
++	dut.updateState(1000, getTimeNowNt());
++	advanceTimeUs(5.5e6);
++	dut.updateState(1000, getTimeNowNt());
++	ASSERT_EQ(ClearReason::OilPressure, dut.allowInjection().reason);
++
++	// the engine stops
++	engine->rpmCalculator.setRpmValue(0);
++	dut.updateState(0, getTimeNowNt());
++}
++
++TEST(OilRestartLock, offByDefault) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	LimpManager dut;
++	shutDownForLowOil(dut);
++	EXPECT_FALSE(dut.isOilRestartLocked());
++	EXPECT_TRUE(dut.allowInjection());
++}
++
++TEST(OilRestartLock, blocksStartForSetTime) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->oilRestartLockTime = 30;
++	LimpManager dut;
++	shutDownForLowOil(dut);
++
++	EXPECT_TRUE(dut.isOilRestartLocked());
++	EXPECT_EQ(ClearReason::OilRestartLock, dut.allowInjection().reason);
++	EXPECT_EQ(ClearReason::OilRestartLock, dut.allowIgnition().reason);
++	EXPECT_NEAR(30, dut.getOilRestartLockLeft(getTimeNowNt()), 0.1);
++
++	// still locked after 20 s, also while cranking
++	advanceTimeUs(20e6);
++	engine->rpmCalculator.setRpmValue(200);
++	dut.updateState(200, getTimeNowNt());
++	EXPECT_EQ(ClearReason::OilRestartLock, dut.allowInjection().reason);
++	EXPECT_NEAR(10, dut.getOilRestartLockLeft(getTimeNowNt()), 0.1);
++
++	// free after 30 s
++	advanceTimeUs(11e6);
++	engine->rpmCalculator.setRpmValue(0);
++	dut.updateState(0, getTimeNowNt());
++	EXPECT_FALSE(dut.isOilRestartLocked());
++	EXPECT_TRUE(dut.allowInjection());
++}
++
++TEST(OilRestartLock, keyOffEndsLock) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->oilRestartLockTime = 60;
++	LimpManager dut;
++	shutDownForLowOil(dut);
++	ASSERT_TRUE(dut.isOilRestartLocked());
++
++	dut.onIgnitionStateChanged(false);
++	dut.onIgnitionStateChanged(true);
++	dut.updateState(0, getTimeNowNt());
++	EXPECT_FALSE(dut.isOilRestartLocked());
++	EXPECT_TRUE(dut.allowInjection());
++}
++
++TEST(OilRestartLock, oilAlertEngineOffLocksToo) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->oilRestartLockTime = 30;
++	engineConfiguration->cranking.rpm = 400;
++
++	auto& oil = config->alerts[0];
++	oil.sensor = GPPWM_OilPressure;
++	oil.action = ALERT_ENGINE_OFF;
++	oil.triggerBelow = true;
++	oil.useRpmCurve = false;
++	oil.threshold = 100;
++	oil.delay = 0;
++	oil.minRpm = 0;
++
++	auto& alerts = engine->module<AlertManager>().unmock();
++	LimpManager dut;
++
++	Sensor::setMockValue(SensorType::OilPressure, 50);
++	engine->rpmCalculator.setRpmValue(3000);
++	Sensor::setMockValue(SensorType::Rpm, 3000);
++	alerts.update(getTimeNowNt());
++	ASSERT_TRUE(alerts.isEngineOffBy(GPPWM_OilPressure));
++	EXPECT_FALSE(alerts.isEngineOffBy(GPPWM_Clt));
++	dut.updateState(3000, getTimeNowNt());
++	EXPECT_EQ(ClearReason::AlertEngineOff, dut.allowInjection().reason);
++
++	engine->rpmCalculator.setRpmValue(0);
++	dut.updateState(0, getTimeNowNt());
++	EXPECT_TRUE(dut.isOilRestartLocked());
++}
++
++TEST(OilRestartLock, otherAlertDoesNotLock) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->oilRestartLockTime = 30;
++
++	auto& clt = config->alerts[0];
++	clt.sensor = GPPWM_Clt;
++	clt.action = ALERT_ENGINE_OFF;
++	clt.triggerBelow = false;
++	clt.useRpmCurve = false;
++	clt.threshold = 110;
++	clt.delay = 0;
++	clt.minRpm = 0;
++
++	auto& alerts = engine->module<AlertManager>().unmock();
++	LimpManager dut;
++
++	Sensor::setMockValue(SensorType::Clt, 120);
++	engine->rpmCalculator.setRpmValue(3000);
++	Sensor::setMockValue(SensorType::Rpm, 3000);
++	alerts.update(getTimeNowNt());
++	dut.updateState(3000, getTimeNowNt());
++	EXPECT_EQ(ClearReason::AlertEngineOff, dut.allowInjection().reason);
++
++	engine->rpmCalculator.setRpmValue(0);
++	dut.updateState(0, getTimeNowNt());
++	EXPECT_FALSE(dut.isOilRestartLocked());
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 7aac7c08c1..36eb55a2ca 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -282,6 +282,7 @@ TESTS_SRC_CPP = \
+ 	tests/test_rgb_status_led.cpp \
+ 	tests/test_cylinder_lambda_trim.cpp \
+ 	tests/test_egt_rise.cpp \
++	tests/test_oil_restart_lock.cpp \
+ 	tests/controllers/modules/map_averaging/test_map_averaging.cpp \
+ 	tests/util/test_utils.cpp \
+ 	tests/controllers/algo/test_engine_cylinder.cpp \
+-- 
+2.43.0
+

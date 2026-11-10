@@ -1,0 +1,275 @@
+From f6d3638f63883eb304583dda1b785d4f6957ddc8 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Mon, 26 Oct 2026 10:05:58 +0000
+Subject: [PATCH] Boost values for 2-step and anti-lag, and eGate rest position
+ (pro-style)
+
+During 2-step (launch) or anti-lag the boost output and closed loop target can be
+fixed values instead of the boost maps; 2-step wins over anti-lag. With the engine
+stopped the boost output (eGate position or solenoid) can go to a rest position.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../controllers/actuators/boost_control.cpp   | 39 +++++++-
+ .../controllers/actuators/boost_control.h     |  2 +
+ .../controllers/actuators/boost_control.txt   |  3 +
+ firmware/integration/rusefi_config.txt        | 10 ++
+ firmware/tunerstudio/tunerstudio.template.ini |  9 ++
+ unit_tests/tests/actuators/test_boost.cpp     | 96 +++++++++++++++++++
+ 6 files changed, 157 insertions(+), 2 deletions(-)
+
+diff --git a/firmware/controllers/actuators/boost_control.cpp b/firmware/controllers/actuators/boost_control.cpp
+index 571c481..1fc0eca 100644
+--- a/firmware/controllers/actuators/boost_control.cpp
++++ b/firmware/controllers/actuators/boost_control.cpp
+@@ -76,6 +76,19 @@ expected<float> BoostController::observePlant() {
+     return map;
+ }
+ 
++void BoostController::updateOverrideState() {
++	isLaunchBoost = false;
++	isAntilagBoost = false;
++#if EFI_LAUNCH_CONTROL
++	isLaunchBoost = engineConfiguration->launchBoostOverride
++		&& engine->launchController.isLaunchOrPreLaunchCondition();
++#endif // EFI_LAUNCH_CONTROL
++#if EFI_ANTILAG_SYSTEM
++	isAntilagBoost = !isLaunchBoost && engineConfiguration->antilagBoostOverride
++		&& engine->antilagController.isAntilagCondition;
++#endif // EFI_ANTILAG_SYSTEM
++}
++
+ expected<float> BoostController::getSetpoint() {
+ 	// If we're in open loop only mode, disregard any target computation.
+ 	// Open loop needs to work even in case of invalid closed loop config
+@@ -85,6 +98,14 @@ expected<float> BoostController::getSetpoint() {
+ 		return (float)boostControllerClosedLoopPart;
+ 	}
+ 
++	// pro-style fixed target during 2-step or anti-lag
++	if (isLaunchBoost) {
++		return (float)engineConfiguration->launchBoostTarget;
++	}
++	if (isAntilagBoost) {
++		return (float)engineConfiguration->antilagBoostTarget;
++	}
++
+ 	float rpm = Sensor::getOrZero(SensorType::Rpm);
+ 
+ 	auto driverIntent = Sensor::get(SensorType::DriverThrottleIntent);
+@@ -124,6 +145,12 @@ expected<percent_t> BoostController::getOpenLoop(float target) {
+ 	// Boost control open loop doesn't care about target - only TPS/RPM
+ 	UNUSED(target);
+ 
++	// pro-style fixed output during 2-step or anti-lag
++	if (isLaunchBoost || isAntilagBoost) {
++		openLoopPart = isLaunchBoost ? engineConfiguration->launchBoostDuty : engineConfiguration->antilagBoostDuty;
++		return (float)openLoopPart;
++	}
++
+ 	float rpm = Sensor::getOrZero(SensorType::Rpm);
+ 	auto driverIntent = readGppwmChannel(engineConfiguration->boostOpenLoopYAxis);
+ 
+@@ -285,9 +312,17 @@ void BoostController::onFastCallback() {
+ 	tpsTooLow = Sensor::getOrZero(SensorType::Tps1) < engineConfiguration->boostControlMinTps;
+ 	mapTooLow = Sensor::getOrZero(SensorType::Map) < engineConfiguration->boostControlMinMap;
+ 
+-  isBoostControlled = !(rpmTooLow || tpsTooLow || mapTooLow);
++	isBoostControlled = !(rpmTooLow || tpsTooLow || mapTooLow);
++
++	updateOverrideState();
+ 
+-	if (!isBoostControlled) {
++	// eGate rest position with the engine stopped
++	isAtRest = engineConfiguration->boostRestEnabled && Sensor::getOrZero(SensorType::Rpm) == 0;
++
++	if (isAtRest) {
++		m_pid.reset();
++		setOutput((float)engineConfiguration->boostRestPosition);
++	} else if (!isBoostControlled && !isLaunchBoost && !isAntilagBoost) {
+ 		// Passing unexpected will use the safe duty cycle configured by the user
+ 		setOutput(unexpected);
+ 	} else {
+diff --git a/firmware/controllers/actuators/boost_control.h b/firmware/controllers/actuators/boost_control.h
+index b342bd6..ca917fe 100644
+--- a/firmware/controllers/actuators/boost_control.h
++++ b/firmware/controllers/actuators/boost_control.h
+@@ -44,6 +44,8 @@ public:
+ 
+ 	void setOutput(expected<percent_t> outputValue) override;
+ 
++	void updateOverrideState();
++
+ private:
+ 	percent_t getClosedLoopImpl(float target, float manifoldPressure);
+ 
+diff --git a/firmware/controllers/actuators/boost_control.txt b/firmware/controllers/actuators/boost_control.txt
+index cd237d1..959233f 100644
+--- a/firmware/controllers/actuators/boost_control.txt
++++ b/firmware/controllers/actuators/boost_control.txt
+@@ -13,6 +13,9 @@ bit tpsTooLow
+ bit mapTooLow
+ bit isPlantValid
+ bit isBoostControlled
++bit isLaunchBoost
++bit isAntilagBoost
++bit isAtRest
+ 
+     int16_t autoscale luaTargetAdd;"Lua target add";"percent", 0.5,0, -100,100, 1, @@GAUGE_CATEGORY_BOOST_CONTROL@@
+     int16_t autoscale boostControlTarget;@@GAUGE_NAME_BOOST_TARGET@@;"kPa",{1/@@PACK_MULT_PRESSURE@@},0, 0, 300, 1, @@GAUGE_CATEGORY_BOOST_CONTROL@@
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index f4aaa2c..63a3d0f 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2019,6 +2019,16 @@ custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall
+ 	output_pin_e hallPullupCam4Pin;Output that turns on the Hall pull-up of cam input 4.
+ 	pin_output_mode_e hallPullupCam4PinMode;
+ 
++! pro-style boost values during 2-step and anti-lag, and wastegate rest position
++	bit launchBoostOverride,"true","false";During 2-step (launch) use the launch boost values below instead of the boost maps.
++	bit antilagBoostOverride,"true","false";During anti-lag use the anti-lag boost values below instead of the boost maps.
++	bit boostRestEnabled,"true","false";With the engine stopped, put the boost output (eGate or solenoid) at the rest position.
++	uint8_t launchBoostDuty;Boost output during 2-step, open loop.;"%", 1, 0, 0, 100, 0
++	uint8_t antilagBoostDuty;Boost output during anti-lag, open loop.;"%", 1, 0, 0, 100, 0
++	uint8_t boostRestPosition;Boost output (eGate position) with the engine stopped.;"%", 1, 0, 0, 100, 0
++	uint16_t launchBoostTarget;Boost target during 2-step, closed loop.;"kPa", 1, 0, 0, 1000, 0
++	uint16_t antilagBoostTarget;Boost target during anti-lag, closed loop.;"kPa", 1, 0, 0, 1000, 0
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index c3999d5..7ed0ac9 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -5513,6 +5513,15 @@ dialog = tcuControls, "Transmission Settings"
+ 		field = "No boost control below RPM",	boostControlMinRpm, { isBoostControlEnabled }
+ 		field = "No boost control below TPS",	boostControlMinTps, { isBoostControlEnabled }
+ 		field = "No boost control below MAP",	boostControlMinMap, { isBoostControlEnabled }
++		field = ""
++		field = "2-step: use launch boost",			launchBoostOverride, { isBoostControlEnabled }
++		field = "2-step boost duty",				launchBoostDuty, { isBoostControlEnabled && launchBoostOverride }
++		field = "2-step boost target",				launchBoostTarget, { isBoostControlEnabled && launchBoostOverride && boostType == 1 }
++		field = "Anti-lag: use anti-lag boost",		antilagBoostOverride, { isBoostControlEnabled }
++		field = "Anti-lag boost duty",				antilagBoostDuty, { isBoostControlEnabled && antilagBoostOverride }
++		field = "Anti-lag boost target",			antilagBoostTarget, { isBoostControlEnabled && antilagBoostOverride && boostType == 1 }
++		field = "Engine stopped: rest position",	boostRestEnabled, { isBoostControlEnabled }
++		field = "Rest position (eGate)",			boostRestPosition, { isBoostControlEnabled && boostRestEnabled }
+ 
+ 	dialog = boostOpenLoopYAxisSelector, ""
+ 		field = "Y Axis", boostOpenLoopYAxis
+diff --git a/unit_tests/tests/actuators/test_boost.cpp b/unit_tests/tests/actuators/test_boost.cpp
+index e3b012a..acaf4b3 100644
+--- a/unit_tests/tests/actuators/test_boost.cpp
++++ b/unit_tests/tests/actuators/test_boost.cpp
+@@ -4,6 +4,8 @@
+ 
+ using ::testing::_;
+ using ::testing::StrictMock;
++using ::testing::Return;
++using ::testing::InSequence;
+ 
+ static Map2D<BOOST_CURVE_SIZE, float, float> testBoostCltCorr { "clt" };
+ static Map2D<BOOST_CURVE_SIZE, float, float> testBoostIatCorr { "iat" };
+@@ -409,3 +411,97 @@ TEST(BoostControl, SetOutputETB) {
+ 
+ 	bc.setOutput(25.0f);
+ }
++
++// pro-style boost values during 2-step and anti-lag
++TEST(BoostControl, LaunchAndAntilagOverride) {
++	MockVp3d targetMap;
++	MockVp3d openMap;
++	EXPECT_CALL(targetMap, getValue(_, _)).WillRepeatedly(Return(150));
++	EXPECT_CALL(openMap, getValue(_, _)).WillRepeatedly(Return(40));
++
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->boostType = CLOSED_LOOP;
++	Sensor::setMockValue(SensorType::DriverThrottleIntent, 80.0f);
++	Sensor::setMockValue(SensorType::Tps1, 80.0f);
++	Sensor::setMockValue(SensorType::Rpm, 4000);
++
++	testBoostCltCorr.initTable(config->cltBoostCorr, config->cltBoostCorrBins);
++	testBoostIatCorr.initTable(config->iatBoostCorr, config->iatBoostCorrBins);
++	testBoostCltAdder.initTable(config->cltBoostAdder, config->cltBoostAdderBins);
++	testBoostIatAdder.initTable(config->iatBoostAdder, config->iatBoostAdderBins);
++
++	BoostController bc;
++	bc.init(nullptr, &openMap, &targetMap, testBoostCltCorr, testBoostIatCorr, testBoostCltAdder, testBoostIatAdder, &engineConfiguration->boostPid);
++
++	engineConfiguration->launchBoostOverride = true;
++	engineConfiguration->launchBoostDuty = 70;
++	engineConfiguration->launchBoostTarget = 120;
++	engineConfiguration->antilagBoostOverride = true;
++	engineConfiguration->antilagBoostDuty = 90;
++	engineConfiguration->antilagBoostTarget = 200;
++
++	// no 2-step, no anti-lag: the maps
++	bc.updateOverrideState();
++	EXPECT_FALSE(bc.isLaunchBoost);
++	EXPECT_FALSE(bc.isAntilagBoost);
++	EXPECT_NEAR(150, bc.getSetpoint().value_or(-1), 0.1);
++	EXPECT_NEAR(40, bc.getOpenLoop(0).value_or(-1), 0.1);
++
++	// 2-step active
++	engineConfiguration->launchControlEnabled = true;
++	engine->launchController.isLaunchCondition = true;
++	bc.updateOverrideState();
++	EXPECT_TRUE(bc.isLaunchBoost);
++	EXPECT_NEAR(120, bc.getSetpoint().value_or(-1), 0.1);
++	EXPECT_NEAR(70, bc.getOpenLoop(0).value_or(-1), 0.1);
++
++	// 2-step wins over anti-lag
++	engine->antilagController.isAntilagCondition = true;
++	bc.updateOverrideState();
++	EXPECT_TRUE(bc.isLaunchBoost);
++	EXPECT_FALSE(bc.isAntilagBoost);
++
++	// anti-lag only
++	engine->launchController.isLaunchCondition = false;
++	bc.updateOverrideState();
++	EXPECT_TRUE(bc.isAntilagBoost);
++	EXPECT_NEAR(200, bc.getSetpoint().value_or(-1), 0.1);
++	EXPECT_NEAR(90, bc.getOpenLoop(0).value_or(-1), 0.1);
++
++	// override off: back to the maps even during anti-lag
++	engineConfiguration->antilagBoostOverride = false;
++	bc.updateOverrideState();
++	EXPECT_FALSE(bc.isAntilagBoost);
++	EXPECT_NEAR(150, bc.getSetpoint().value_or(-1), 0.1);
++}
++
++TEST(BoostControl, RestPositionWithEngineStopped) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++
++	engineConfiguration->isBoostControlEnabled = true;
++	engineConfiguration->boostControlPin = Gpio::A0;
++	engineConfiguration->boostControlSafeDutyCycle = 5;
++	engineConfiguration->boostRestEnabled = true;
++	engineConfiguration->boostRestPosition = 30;
++	engineConfiguration->boostControlMinRpm = 2000;
++
++	StrictMock<MockPwm> pwm;
++	BoostController bc;
++	bc.init(&pwm, nullptr, nullptr, testBoostCltCorr, testBoostIatCorr, testBoostCltAdder, testBoostIatAdder, &engineConfiguration->boostPid);
++
++	{
++		InSequence s;
++		// stopped: rest position
++		EXPECT_CALL(pwm, setSimplePwmDutyCycle(0.30f));
++		// running below boost control conditions: safe duty as before
++		EXPECT_CALL(pwm, setSimplePwmDutyCycle(0.05f));
++	}
++
++	Sensor::setMockValue(SensorType::Rpm, 0);
++	bc.onFastCallback();
++	EXPECT_TRUE(bc.isAtRest);
++
++	Sensor::setMockValue(SensorType::Rpm, 900);
++	bc.onFastCallback();
++	EXPECT_FALSE(bc.isAtRest);
++}
+-- 
+2.43.0
+

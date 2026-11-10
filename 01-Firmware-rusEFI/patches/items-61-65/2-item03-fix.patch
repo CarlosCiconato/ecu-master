@@ -1,0 +1,80 @@
+From a87a9bea5641cdb90cfe29a47af7636551d21c6d Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sun, 1 Nov 2026 14:38:39 +0000
+Subject: [PATCH] Alert limit as a float: RPM alerts and limits above 3276 work
+
+Plan item 3 fix. The fixed limit and the RPM curve of each alert were
+int16 x 0.1, so nothing above 3276 fit (no alert by RPM, turbo speed,
+EGT in F...). Now float, in the unit of the sensor, 2 decimals in
+TunerStudio (lambda 0.92 still works).
+- 1 new test
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ firmware/integration/rusefi_config.txt        |  4 +--
+ .../tests/controllers/test_alert_manager.cpp  | 35 +++++++++++++++++++
+ 2 files changed, 37 insertions(+), 2 deletions(-)
+
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 99d3a25b8d2..272858c9e30 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -2785,9 +2785,9 @@ struct alert_s
+ 	uint8_t autoscale delay;The condition must last this long before the alert trips.;"s", 0.1, 0, 0, 25, 1
+ 	bit triggerBelow,"below","above";Trip when the sensor goes below the limit (for example low oil pressure) or above it (for example high temperature).
+ 	bit useRpmCurve,"RPM curve","fixed";Use a limit that changes with RPM instead of a single value.
+-	int16_t autoscale threshold;Fixed limit.;"", 0.1, 0, -3000, 3000, 1
++	float threshold;Fixed limit, in the unit of the sensor (RPM, kPa, C, lambda...).;"", 1, 0, -100000, 100000, 2
+ 	uint16_t minRpm;The alert is only armed above this RPM. 0 means always armed.;"RPM", 1, 0, 0, 15000, 0
+-	int16_t[ALERT_CURVE_SIZE] autoscale curve;Limit by RPM.;"", 0.1, 0, -3000, 3000, 1
++	float[ALERT_CURVE_SIZE] curve;Limit by RPM.;"", 1, 0, -100000, 100000, 2
+ end_struct
+ 
+ uint16_t[ALERT_CURVE_SIZE] alertRpmBins;;"RPM", 1, 0, 0, 18000, 0
+diff --git a/unit_tests/tests/controllers/test_alert_manager.cpp b/unit_tests/tests/controllers/test_alert_manager.cpp
+index f6ccc87a9e0..267fda2aeaa 100644
+--- a/unit_tests/tests/controllers/test_alert_manager.cpp
++++ b/unit_tests/tests/controllers/test_alert_manager.cpp
+@@ -327,3 +327,38 @@ TEST_F(AlertManagerTest, TurboSpeed) {
+ 	Sensor::setMockValue(SensorType::TurbochargerSpeed, 150000);
+ 	EXPECT_NEAR(150000, readGppwmChannel(GPPWM_TurboSpeed).value_or(0), 1);
+ }
++
++// The limit is a float: RPM above 3276 and lambda with 2 decimals both work
++TEST_F(AlertManagerTest, LimitAboveOldMaximumAndFineLimit) {
++	auto& rpmAlert = config->alerts[1];
++	rpmAlert.sensor = GPPWM_Rpm;
++	rpmAlert.action = ALERT_WARN;
++	rpmAlert.triggerBelow = false;
++	rpmAlert.useRpmCurve = false;
++	rpmAlert.threshold = 8200;
++	rpmAlert.delay = 0;
++	rpmAlert.minRpm = 0;
++
++	setRpm(8100);
++	update();
++	EXPECT_FALSE(alerts().isTripped(1));
++
++	setRpm(8300);
++	update();
++	EXPECT_TRUE(alerts().isTripped(1));
++
++	auto& lean = config->alerts[2];
++	lean.sensor = GPPWM_AuxLinear1;
++	lean.action = ALERT_WARN;
++	lean.triggerBelow = false;
++	lean.useRpmCurve = false;
++	lean.threshold = 0.92f;
++	lean.delay = 0;
++	lean.minRpm = 0;
++	Sensor::setMockValue(SensorType::AuxLinear1, 0.91f);
++	update();
++	EXPECT_FALSE(alerts().isTripped(2));
++	Sensor::setMockValue(SensorType::AuxLinear1, 0.93f);
++	update();
++	EXPECT_TRUE(alerts().isTripped(2));
++}
+-- 
+2.43.0
+

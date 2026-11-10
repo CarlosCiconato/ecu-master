@@ -1,0 +1,65 @@
+From ac1a0a169bdc7e44a16700b18f6d9fc8b8859095 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 20:03:07 +0000
+Subject: [PATCH] Throttle maximum position can be set from 2 to 100%
+ (pro-style)
+
+Before, the lowest allowed value was 70%. A low maximum is useful to limit power. It must
+still stay above the minimum position, which the existing config check enforces.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ firmware/integration/rusefi_config.txt  |  2 +-
+ unit_tests/tests/actuators/test_etb.cpp | 22 ++++++++++++++++++++++
+ 2 files changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index dd9fb7a..8a59433 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -1051,7 +1051,7 @@ spi_device_e digitalPotentiometerSpiDevice;Digital Potentiometer is used by stoc
+ 
+ 	spi_device_e mc33972spiDevice;
+ 	uint8_t autoscale stoichRatioSecondary;Stoichiometric ratio for your secondary fuel. This value is used when the Flex Fuel sensor indicates E100, typically 9.0;":1", {1/@@PACK_MULT_AFR_CFG@@}, 0, 5, 25, 1
+-	uint8_t etbMaximumPosition;Maximum allowed ETB position. Some throttles go past fully open, so this allows you to limit it to fully open.;"%", 1, 0, 70, 100, 0
++	uint8_t etbMaximumPosition;Maximum allowed ETB position. Some throttles go past fully open, so this allows you to limit it to fully open. It can also be set low (pro-style) to limit power, it must stay above the minimum position.;"%", 1, 0, 2, 100, 0
+ 
+ 
+ custom uart_device_e 1 bits, U08, @OFFSET@, [0:1], "Off", "UART1", "UART2", "UART3"
+diff --git a/unit_tests/tests/actuators/test_etb.cpp b/unit_tests/tests/actuators/test_etb.cpp
+index d6d26d7..ab2d015 100644
+--- a/unit_tests/tests/actuators/test_etb.cpp
++++ b/unit_tests/tests/actuators/test_etb.cpp
+@@ -323,6 +323,28 @@ TEST(etb, testSetpointOnlyPedal) {
+ 	EXPECT_EQ(90, etb.getSetpoint().value_or(-1));
+ 	Sensor::setMockValue(SensorType::AcceleratorPedal, 95, true);
+ 	EXPECT_EQ(90, etb.getSetpoint().value_or(-1));
++
++	// pro-style low maximum, for example to limit power
++	engineConfiguration->etbMaximumPosition = 30;
++	Sensor::setMockValue(SensorType::AcceleratorPedal, 20, true);
++	EXPECT_EQ(20, etb.getSetpoint().value_or(-1));
++	Sensor::setMockValue(SensorType::AcceleratorPedal, 80, true);
++	EXPECT_EQ(30, etb.getSetpoint().value_or(-1));
++}
++
++TEST(etb, lowMaximumPositionIsValid) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->etbMinimumPosition = 1;
++
++	engineConfiguration->etbMaximumPosition = 30;
++	EXPECT_TRUE(validateConfigOnStartUpOrBurn());
++
++	engineConfiguration->etbMaximumPosition = 5;
++	EXPECT_TRUE(validateConfigOnStartUpOrBurn());
++
++	// must stay above the minimum position
++	engineConfiguration->etbMaximumPosition = 2;
++	EXPECT_FATAL_ERROR(validateConfigOnStartUpOrBurn());
+ }
+ 
+ TEST(etb, setpointSecondThrottleTrim) {
+-- 
+2.43.0
+

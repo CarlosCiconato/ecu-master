@@ -1,0 +1,379 @@
+From a98e4df9e7c2c4d9a81de82e30673854a9d5b814 Mon Sep 17 00:00:00 2001
+From: Carlos Ciconato <354919267+CarlosCiconato@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 11:06:16 +0000
+Subject: [PATCH] Add Injection time (ms) fuel strategy (pro-style main
+ map)
+
+New fuelAlgorithm LM_INJ_TIME: a 16x16 RPM x MAP/TPS table holds the
+injector pulse at 14 V with deadtime included. The pulse is converted to
+fuel mass at the reference deadtime and base flow, so CLT/IAT/baro/AE,
+closed loop, voltage and fuel pressure compensation all still apply.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../algo/defaults/default_fuel.cpp            | 13 +++
+ firmware/controllers/algo/fuel_math.cpp       | 51 ++++++++++
+ firmware/controllers/algo/fuel_math.h         |  7 ++
+ firmware/integration/rusefi_config.txt        |  9 +-
+ .../rusefi_config_enums_definitions.json      |  3 +-
+ firmware/tunerstudio/top_level_menu.ini       |  1 +
+ firmware/tunerstudio/tunerstudio.template.ini | 14 +++
+ .../test_injection_time_map.cpp               | 99 +++++++++++++++++++
+ unit_tests/tests/tests.mk                     |  1 +
+ 9 files changed, 196 insertions(+), 2 deletions(-)
+ create mode 100644 unit_tests/tests/ignition_injection/test_injection_time_map.cpp
+
+diff --git a/firmware/controllers/algo/defaults/default_fuel.cpp b/firmware/controllers/algo/defaults/default_fuel.cpp
+index 9bf2ebd..3f95bc9 100644
+--- a/firmware/controllers/algo/defaults/default_fuel.cpp
++++ b/firmware/controllers/algo/defaults/default_fuel.cpp
+@@ -365,6 +365,18 @@ static void setDefaultPriming() {
+ 	}
+ }
+ 
++static void setDefaultInjTimeTable() {
++	setRpmTableBin(config->injTimeRpmBins);
++	setLinearCurve(config->injTimeLoadBins, 20, 250, 1);
++
++	// Placeholder only: roughly 1 ms deadtime plus a pulse proportional to load
++	for (size_t loadIndex = 0; loadIndex < INJ_TIME_LOAD_COUNT; loadIndex++) {
++		for (size_t rpmIndex = 0; rpmIndex < INJ_TIME_RPM_COUNT; rpmIndex++) {
++			config->injTimeTable[loadIndex][rpmIndex] = 1.0f + config->injTimeLoadBins[loadIndex] * 0.03f;
++		}
++	}
++}
++
+ void setDefaultFuel() {
+ 	// Base injection configuration
+ 	engineConfiguration->isInjectionEnabled = true;
+@@ -395,6 +407,7 @@ void setDefaultFuel() {
+ 	setLinearCurve(config->predictiveMapBlendDurationValues, 1, 1);
+ 
+ 	setDefaultVETable();
++	setDefaultInjTimeTable();
+ 	setDefaultLambdaTable();
+ 
+ 	setLinearCurve(config->injectorStagingLoadBins, 0, 100, 10);
+diff --git a/firmware/controllers/algo/fuel_math.cpp b/firmware/controllers/algo/fuel_math.cpp
+index 7fb31b5..cb71ed2 100644
+--- a/firmware/controllers/algo/fuel_math.cpp
++++ b/firmware/controllers/algo/fuel_math.cpp
+@@ -170,6 +170,10 @@ AirmassModelBase* getAirmassModel(engine_load_mode_e mode) {
+ 	case engine_load_mode_e::LM_SPEED_DENSITY: return &sdAirmass;
+ 	case engine_load_mode_e::LM_REAL_MAF: return &mafAirmass;
+ 	case engine_load_mode_e::LM_ALPHA_N: return &alphaNAirmass;
++	// The ms table sets the fuel; airmass is still estimated for load, ignition and airflow
++	case engine_load_mode_e::LM_INJ_TIME: return engineConfiguration->injTimeUseTps
++		? static_cast<AirmassModelBase*>(&alphaNAirmass)
++		: static_cast<AirmassModelBase*>(&sdAirmass);
+ #if EFI_LUA
+ 	case engine_load_mode_e::LM_LUA: return &(getLuaAirmassModel());
+ #endif
+@@ -186,6 +190,47 @@ float getMaxAirflowAtMap(float map) {
+ 
+ #if EFI_ENGINE_CONTROL
+ 
++floatms_t getInjectionTimeReferenceDeadtime() {
++	const auto& inj = engineConfiguration->injector;
++	float pressure = engineConfiguration->fuelReferencePressure;
++	if (engineConfiguration->useAbsolutePressureForLagTime) {
++		pressure += STD_ATMOSPHERE;
++	}
++
++	return interpolate3d(
++		inj.battLagCorrTable,
++		inj.battLagCorrPressBins, pressure,
++		inj.battLagCorrBattBins, INJ_TIME_REFERENCE_VOLTAGE
++	);
++}
++
++mass_t convertInjectionTimeToFuelMass(floatms_t pulseMs) {
++	// The table pulse includes the deadtime at 14 V; only the rest of it delivers fuel
++	floatms_t effectiveMs = pulseMs - getInjectionTimeReferenceDeadtime();
++	if (!(effectiveMs > 0)) {
++		return 0;
++	}
++
++	// Base flow (no pressure ratio), so the injector model still compensates fuel pressure
++	return effectiveMs * engine->module<InjectorModelPrimary>()->getBaseFlowRate() * 0.001f;
++}
++
++float getInjectionTimeTableLoad() {
++	return engineConfiguration->injTimeUseTps
++		? Sensor::getOrZero(SensorType::Tps1)
++		: Sensor::getOrZero(SensorType::Map);
++}
++
++mass_t getInjectionTimeTableFuelMass(float rpm) {
++	floatms_t pulseMs = interpolate3d(
++		config->injTimeTable,
++		config->injTimeLoadBins, getInjectionTimeTableLoad(),
++		config->injTimeRpmBins, rpm
++	);
++
++	return convertInjectionTimeToFuelMass(pulseMs);
++}
++
+ // Per-cylinder base fuel mass
+ static float getBaseFuelMass(float rpm) {
+ 	ScopePerf perf(PE::GetBaseFuel);
+@@ -210,8 +255,14 @@ static float getBaseFuelMass(float rpm) {
+ 	// convert g/s -> kg/h
+ 	engine->engineState.airflowEstimate = gramPerMs * 3600000 /* milliseconds per hour */ / 1000 /* grams per kg */;
+ 
++	// Always run the fuel computer: it publishes the lambda target used by closed loop
+ 	float baseFuelMass = engine->fuelComputer.getCycleFuel(airmass.CylinderAirmass, rpm, airmass.EngineLoadPercent);
+ 
++	if (engineConfiguration->fuelAlgorithm == engine_load_mode_e::LM_INJ_TIME) {
++		// pro-style: the ms table is the base fuel, the lambda table only steers closed loop
++		baseFuelMass = getInjectionTimeTableFuelMass(rpm);
++	}
++
+ 	engine->engineState.baseFuel = baseFuelMass;
+ 
+ 	if (std::isnan(baseFuelMass)) {
+diff --git a/firmware/controllers/algo/fuel_math.h b/firmware/controllers/algo/fuel_math.h
+index 7496f9d..f778d03 100644
+--- a/firmware/controllers/algo/fuel_math.h
++++ b/firmware/controllers/algo/fuel_math.h
+@@ -37,6 +37,13 @@ percent_t getInjectorDutyCycleStage2(float rpm);
+ float getStage2InjectionFraction(float rpm, float fuelLoad);
+ 
+ float getStandardAirCharge();
++
++// Injection time (ms) fuel strategy, see LM_INJ_TIME
++#define INJ_TIME_REFERENCE_VOLTAGE 14.0f
++floatms_t getInjectionTimeReferenceDeadtime();
++mass_t convertInjectionTimeToFuelMass(floatms_t pulseMs);
++float getInjectionTimeTableLoad();
++mass_t getInjectionTimeTableFuelMass(float rpm);
+ float getCylinderFuelTrim(size_t cylinderNumber, float rpm, float fuelLoad);
+ 
+ struct AirmassModelBase;
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 526b410..d3cc6bf 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -289,6 +289,8 @@ struct_no_prefix engine_configuration_s
+ 
+ #define FUEL_RPM_COUNT 16
+ #define FUEL_LOAD_COUNT 16
++#define INJ_TIME_RPM_COUNT 16
++#define INJ_TIME_LOAD_COUNT 16
+ 
+ #define BOOST_RPM_COUNT 8
+ #define BOOST_LOAD_COUNT 8
+@@ -1883,7 +1885,7 @@ uint8_t autoscale knockFuelTrim;Maximum Amount of Fuel trim when knock;"%", 1, 0
+ 	bit unusedBit_Fancy16
+ 	bit gearDetectionUseOutputShaftSpeed,"Output Shaft Speed","Main Vehicle Speed";Driveshaft reference for gear detection. Main Vehicle Speed uses wheel revolutions/km and final drive ratio. Output Shaft Speed reads shaft RPM directly and requires an OSS provider.
+ 	bit gearDetectionRpmSourceIsInputShaftSpeed,"Input Shaft Speed","Engine RPM";RPM source when Speed Source is Output Shaft Speed. Main Vehicle Speed retains automatic input-shaft selection when that sensor is registered.
+-	bit unusedBit_Fancy19
++	bit injTimeUseTps,"TPS","MAP";Load axis of the Injection time (ms) table. MAP is in kPa, TPS in %.
+ 	bit unusedBit_Fancy20
+ 	bit unusedBit_Fancy21
+ 	bit transmissionSlipDetectionEnabled,"enabled","disabled";Compare the selected Slip RPM Source with expected RPM for the detected gear. Requires Speed Source = Output Shaft Speed, a valid gear and the minimum vehicle speed. Wheel-based references cannot identify transmission slip.
+@@ -2599,6 +2601,11 @@ split_lines@@BOARD_CONFIG_FROM_FILE@@
+ 
+ 	KnockGain[MAX_CYLINDER_COUNT iterate] knockGains
+ include_file controllers/modules/fuel_pump/fuel_pump_tables.txt
++
++! pro-style main fuel map, used when Fuel strategy = Injection time (ms)
++uint16_t[INJ_TIME_LOAD_COUNT x INJ_TIME_RPM_COUNT] autoscale injTimeTable;Injector pulse per cylinder per cycle at 14 V, deadtime included. All usual fuel corrections are applied on top.;"ms", 0.001, 0, 0, 65, 3
++uint16_t[INJ_TIME_LOAD_COUNT] injTimeLoadBins;;{injTimeUseTps ? "%" : "kPa"}, 1, 0, 0, 1000, 0
++uint16_t[INJ_TIME_RPM_COUNT] injTimeRpmBins;;"RPM", 1, 0, 0, 18000, 0
+ end_struct
+ 
+ #define PPS_OK_INDICATOR "Pedal OK"
+diff --git a/firmware/integration/rusefi_config_enums_definitions.json b/firmware/integration/rusefi_config_enums_definitions.json
+index 54f7434..a99ac44 100644
+--- a/firmware/integration/rusefi_config_enums_definitions.json
++++ b/firmware/integration/rusefi_config_enums_definitions.json
+@@ -7,7 +7,8 @@
+       {"i":0,"v":"LM_SPEED_DENSITY","n":"Speed Density", "c":"Speed Density algorithm - Engine Load is a function of MAP, VE and target AFR\nhttp://articles.sae.org/8539/"},
+       {"i":1,"v":"LM_REAL_MAF","n":"MAF Air Charge", "c":"MAF with a known kg/hour function"},
+       {"i":2,"v":"LM_ALPHA_N","n":"Alpha-N"},
+-      {"i":3,"v":"LM_LUA","n":"Lua"}
++      {"i":3,"v":"LM_LUA","n":"Lua"},
++      {"i":4,"v":"LM_INJ_TIME","n":"Injection time (ms)", "c":"pro-style main map: injector pulse in ms per cylinder per cycle at 14 V, deadtime included"}
+     ]
+   }
+ }
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index 30ed93c..7b21f9e 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -1,6 +1,7 @@
+ 	menu = "Fuel"
+ 		# Air mass model
+ 		subMenu = veTableDialog,			@@VE_MENU_NAME@@, 0, {isInjectionEnabled == 1}
++		subMenu = injTimeTableDialog,		"Injection time (ms)", 0, {isInjectionEnabled == 1 && fuelAlgorithm == @@engine_load_mode_e_LM_INJ_TIME@@}
+ 		subMenu = veTableMap,    @@VE_MENU_MAP_NAME@@, 0, {isInjectionEnabled}@@if_ts_show_ve_table_map
+ 		subMenu = secondVeTableDialog,		@@SECOND_VE_TABLE@@, 0, {isInjectionEnabled == 1}
+ 		@@BOARD_VE_MENU_FROM_FILE@@
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index b5b0d21..d2eb74e 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -354,6 +354,7 @@ include_file @@TUNING_SECTION_FILE@@
+ 	; Table pointers must use the same display scale as their load bins.
+ 	; Only MAP axes convert to psi; other load sources keep their original units.
+ 	veTableYAxisDisplay = { !(veOverrideMode == 1 || (veOverrideMode == 0 && fuelAlgorithm == 0)) || useMetricOnInterface ? veTableYAxis : veTableYAxis * @@UNITS_KPA_TO_PSI@@ }
++	injTimeTableYAxis = { injTimeUseTps ? TPSValue : MAPValue }
+ 	loadForIgnitionTableDotDisplay = { !(ignOverrideMode == 1 || (ignOverrideMode == 0 && fuelAlgorithm == 0)) || useMetricOnInterface ? loadForIgnitionTableDot : loadForIgnitionTableDot * @@UNITS_KPA_TO_PSI@@ }
+ 	afrTableYAxisDisplay = { !(afrOverrideMode == 1 || (afrOverrideMode == 0 && fuelAlgorithm == 0)) || useMetricOnInterface ? afrTableYAxis : afrTableYAxis * @@UNITS_KPA_TO_PSI@@ }
+ 	fuelingLoadDisplay = { !(veOverrideMode == 1 || (veOverrideMode == 0 && fuelAlgorithm == 0)) || useMetricOnInterface ? fuelingLoad : fuelingLoad * @@UNITS_KPA_TO_PSI@@ }
+@@ -1561,6 +1562,14 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 		gridOrient	= 250,	0, 340 ; Space 123 rotation of grid in degrees.
+ 		upDownLabel	= "(RICHER)", "(LEANER)"
+ 
++	table = injTimeTableTbl, injTimeTableMap, "Injection time (ms)", 1
++		xyLabels	= "RPM", {injTimeUseTps ? "TPS" : "MAP"}
++		xBins		= injTimeRpmBins, RPMValue
++		yBins		= injTimeLoadBins, injTimeTableYAxis
++		zBins		= injTimeTable
++		gridOrient	= 250,	0, 340
++		upDownLabel	= "(RICHER)", "(LEANER)"
++
+ 	table = idleVeTableTbl, idleVeTable, "Idle VE"
+ 		xyLabels = "RPM", "load"
+ 		xBins		= idleVeRpmBins,  RPMValue
+@@ -4834,6 +4843,7 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "!https://rusefi.com/s/fuel"
+ 		field = "Fuel strategy",						fuelAlgorithm
+ 		field = "Baro-compensated MAP load axis",		useCompensatedMap, { fuelAlgorithm == @@engine_load_mode_e_LM_SPEED_DENSITY@@ }
++		field = "Injection time table load axis",		injTimeUseTps, { fuelAlgorithm == @@engine_load_mode_e_LM_INJ_TIME@@ }
+ 
+ 	dialog = dutyCycleLimiting, "Injector Duty Cycle Limiter"
+ 		field = "Instantaneous injector duty cycle limit",	maxInjectorDutyInstant, {isInjectionEnabled}
+@@ -5350,6 +5360,10 @@ dialog = tcuControls, "Transmission Settings"
+ 		panel = veOverrideModeSelector
+ 		panel = veTableTbl
+ 
++	dialog = injTimeTableDialog, "Injection time (ms)"
++		panel = fuelStrategyPanel
++		panel = injTimeTableTbl
++
+ 	dialog = veTableDialog3D, @@VE_TABLE_NAME@@
+ 		topicHelp = "veTableDialogHelp"
+ 		panel = veTableMap, South
+diff --git a/unit_tests/tests/ignition_injection/test_injection_time_map.cpp b/unit_tests/tests/ignition_injection/test_injection_time_map.cpp
+new file mode 100644
+index 0000000..66fa2fc
+--- /dev/null
++++ b/unit_tests/tests/ignition_injection/test_injection_time_map.cpp
+@@ -0,0 +1,99 @@
++#include "pch.h"
++#include "fuel_math.h"
++#include "injector_model.h"
++
++// Injection time (ms) fuel strategy: the main table holds the injector pulse,
++// pro-style, and every usual correction still applies on top of it.
++class InjectionTimeMap : public testing::Test {
++protected:
++	EngineTestHelper eth{engine_type_e::TEST_ENGINE};
++
++	void SetUp() override {
++		engineConfiguration->fuelAlgorithm = engine_load_mode_e::LM_INJ_TIME;
++		engineConfiguration->injTimeUseTps = false;
++		engineConfiguration->injectionMode = IM_SEQUENTIAL;
++		engineConfiguration->cylindersCount = 4;
++		engineConfiguration->displacement = 2.0f;
++		engineConfiguration->coastingFuelCutEnabled = false;
++		engineConfiguration->injectorCompensationMode = ICM_None;
++		engineConfiguration->useAbsolutePressureForLagTime = false;
++		// 1 ms deadtime at every voltage and pressure
++		setTable(engineConfiguration->injector.battLagCorrTable, 1.0f);
++
++		setTable(config->veTable, 80);
++		setTable(config->lambdaTable, 1.0f);
++		setArrayValues(config->cltFuelCorr, 1.0f);
++		setArrayValues(config->iatFuelCorr, 1.0f);
++		setTable(config->postCrankingFactor, 1.0f);
++
++		Sensor::setMockValue(SensorType::BatteryVoltage, INJ_TIME_REFERENCE_VOLTAGE);
++		Sensor::setMockValue(SensorType::Clt, 70);
++		Sensor::setMockValue(SensorType::Iat, 20);
++		Sensor::setMockValue(SensorType::Tps1, 0);
++		Sensor::setMockValue(SensorType::Map, 100);
++		Sensor::setMockValue(SensorType::BarometricPressure, STD_ATMOSPHERE);
++		engine->rpmCalculator.setRpmValue(3000);
++	}
++
++	float flowGramPerMs() {
++		return engine->module<InjectorModelPrimary>()->getBaseFlowRate() * 0.001f;
++	}
++};
++
++TEST_F(InjectionTimeMap, PulseToMassRemovesDeadtime) {
++	EXPECT_NEAR(1.0f, getInjectionTimeReferenceDeadtime(), EPS4D);
++	EXPECT_NEAR(4.0f * flowGramPerMs(), convertInjectionTimeToFuelMass(5.0f), 1e-7f);
++
++	// Pulse at or below the deadtime delivers no fuel
++	EXPECT_EQ(0, convertInjectionTimeToFuelMass(1.0f));
++	EXPECT_EQ(0, convertInjectionTimeToFuelMass(0.5f));
++	EXPECT_EQ(0, convertInjectionTimeToFuelMass(0));
++}
++
++TEST_F(InjectionTimeMap, RoundTripAt14Volts) {
++	auto injector = engine->module<InjectorModelPrimary>();
++	injector->prepare();
++
++	for (float ms : {1.5f, 3.0f, 6.0f, 12.5f, 25.0f}) {
++		EXPECT_NEAR(ms, injector->getInjectionDuration(convertInjectionTimeToFuelMass(ms)), 1e-3f) << ms;
++	}
++}
++
++TEST_F(InjectionTimeMap, TableLookupByMapAndTps) {
++	setLinearCurve(config->injTimeLoadBins, 0, 150, 1);
++	setRpmTableBin(config->injTimeRpmBins);
++	for (size_t loadIndex = 0; loadIndex < INJ_TIME_LOAD_COUNT; loadIndex++) {
++		for (size_t rpmIndex = 0; rpmIndex < INJ_TIME_RPM_COUNT; rpmIndex++) {
++			// 0.05 ms per kPa (or % TPS), whatever the RPM
++			config->injTimeTable[loadIndex][rpmIndex] = 1.0f + config->injTimeLoadBins[loadIndex] * 0.05f;
++		}
++	}
++
++	Sensor::setMockValue(SensorType::Map, 100);
++	EXPECT_NEAR(100, getInjectionTimeTableLoad(), EPS4D);
++	EXPECT_NEAR(5.0f * flowGramPerMs(), getInjectionTimeTableFuelMass(3000), 1e-5f);
++
++	engineConfiguration->injTimeUseTps = true;
++	Sensor::setMockValue(SensorType::Tps1, 40);
++	EXPECT_NEAR(40, getInjectionTimeTableLoad(), EPS4D);
++	EXPECT_NEAR(2.0f * flowGramPerMs(), getInjectionTimeTableFuelMass(3000), 1e-5f);
++}
++
++TEST_F(InjectionTimeMap, FinalPulseMatchesTableWhenCorrectionsAreNeutral) {
++	setTable(config->injTimeTable, 6.0f);
++	engine->periodicFastCallback();
++
++	EXPECT_NEAR(6.0f, engine->engineState.injectionDuration, 0.01f);
++	EXPECT_NEAR(5.0f * flowGramPerMs(), engine->engineState.injectionMass[0], 1e-5f);
++	// Lambda target is still published for closed loop
++	EXPECT_NEAR(1.0f, engine->fuelComputer.targetLambda, EPS4D);
++}
++
++TEST_F(InjectionTimeMap, CorrectionsScaleOnlyTheEffectivePulse) {
++	setTable(config->injTimeTable, 6.0f);
++	setArrayValues(config->cltFuelCorr, 1.1f);
++	engine->periodicFastCallback();
++
++	// 1 ms deadtime + 5 ms * 1.1
++	EXPECT_NEAR(6.5f, engine->engineState.injectionDuration, 0.01f);
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index ffe367e..0d6a08f 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -86,6 +86,7 @@ TESTS_SRC_CPP = \
+ 	tests/ignition_injection/test_fuelCut.cpp \
+ 	tests/ignition_injection/test_fuel_computer.cpp \
+ 	tests/ignition_injection/test_injector_model.cpp \
++	tests/ignition_injection/test_injection_time_map.cpp \
+ 	tests/ignition_injection/test_odd_firing_engine.cpp \
+ 	tests/ignition_injection/test_three_cylinder.cpp \
+ 	testa/ignition_injection/test_staged_injection.cpp \
+-- 
+2.43.0
+

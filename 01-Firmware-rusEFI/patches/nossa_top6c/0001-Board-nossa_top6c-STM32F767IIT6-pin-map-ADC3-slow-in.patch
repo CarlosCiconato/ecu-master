@@ -1,0 +1,1290 @@
+From 502527fc24970567a673e111a41fa3663a2d5b81 Mon Sep 17 00:00:00 2001
+From: Carlos Ciconato <354919267+CarlosCiconato@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 17:19:41 +0000
+Subject: [PATCH 1/2] Board nossa_top6c (STM32F767IIT6): pin map, ADC3 slow
+ inputs, TS on UART4
+
+Also: STM32 ADC IRQ priority follows EFI_ADC3_SLOW, ADC3-only MAP falls back to slow,
+fast ADC token 0xFF is invalid, fatal LED guarded for boards without LED.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../boards/nossa_top6c/adc3_slow_config.h     |  14 +
+ firmware/config/boards/nossa_top6c/board.mk   |  59 +++
+ .../nossa_top6c/board_configuration.cpp       | 174 ++++++++
+ .../boards/nossa_top6c/compile_nossa_top6c.sh |   2 +
+ .../connectors/generated_board_pin_names.h    |   5 +
+ .../connectors/generated_outputs.h            |  77 ++++
+ .../connectors/generated_ts_name_by_pin.cpp   | 149 +++++++
+ .../boards/nossa_top6c/connectors/main.yaml   | 413 ++++++++++++++++++
+ .../config/boards/nossa_top6c/knock_config.h  |  33 ++
+ .../nossa_top6c/meta-info-nossa_top6c.env     |   4 +
+ .../boards/nossa_top6c/nossa_top6c_meta.h     | 115 +++++
+ .../config/boards/nossa_top6c/prepend.txt     |  31 ++
+ .../nossa_top6c/prepend_nossa_top6c.txt       |  22 +
+ .../controllers/core/error_handling_led.h     |   3 +-
+ firmware/hw_layer/adc/adc_inputs.cpp          |   9 +
+ firmware/hw_layer/adc/adc_onchip_fast.cpp     |   4 +-
+ .../hw_layer/ports/stm32/interrupt_priority.h |   7 +
+ 17 files changed, 1119 insertions(+), 2 deletions(-)
+ create mode 100644 firmware/config/boards/nossa_top6c/adc3_slow_config.h
+ create mode 100644 firmware/config/boards/nossa_top6c/board.mk
+ create mode 100644 firmware/config/boards/nossa_top6c/board_configuration.cpp
+ create mode 100755 firmware/config/boards/nossa_top6c/compile_nossa_top6c.sh
+ create mode 100644 firmware/config/boards/nossa_top6c/connectors/generated_board_pin_names.h
+ create mode 100644 firmware/config/boards/nossa_top6c/connectors/generated_outputs.h
+ create mode 100644 firmware/config/boards/nossa_top6c/connectors/generated_ts_name_by_pin.cpp
+ create mode 100644 firmware/config/boards/nossa_top6c/connectors/main.yaml
+ create mode 100644 firmware/config/boards/nossa_top6c/knock_config.h
+ create mode 100644 firmware/config/boards/nossa_top6c/meta-info-nossa_top6c.env
+ create mode 100644 firmware/config/boards/nossa_top6c/nossa_top6c_meta.h
+ create mode 100644 firmware/config/boards/nossa_top6c/prepend.txt
+ create mode 100644 firmware/config/boards/nossa_top6c/prepend_nossa_top6c.txt
+
+diff --git a/firmware/config/boards/nossa_top6c/adc3_slow_config.h b/firmware/config/boards/nossa_top6c/adc3_slow_config.h
+new file mode 100644
+index 00000000000..d076fe6a342
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/adc3_slow_config.h
+@@ -0,0 +1,14 @@
++/**
++ * @file adc3_slow_config.h
++ *
++ * ADC3-only pins read as normal slow analog inputs (EFI_ADC3_SLOW, see stm32_adc_v2_adc3.cpp).
++ * ADC3 is shared with software knock (PF4/PF5): a knock window preempts a slow batch.
++ */
++
++#pragma once
++
++#define ADC3_SLOW_CHANNELS { \
++	EFI_ADC_35, /* PF9  ADC3_IN7, AV11 */ \
++	EFI_ADC_36, /* PF10 ADC3_IN8, AIN14 internal MAP */ \
++	EFI_ADC_37, /* PF3  ADC3_IN9, AIN13 */ \
++}
+diff --git a/firmware/config/boards/nossa_top6c/board.mk b/firmware/config/boards/nossa_top6c/board.mk
+new file mode 100644
+index 00000000000..a5c09c3a8b4
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/board.mk
+@@ -0,0 +1,59 @@
++# Board "nossa top 6c": STM32F767IIT6 (LQFP176, 2 MB flash), based on Proteus F7.
++BOARDCPPSRC = $(BOARD_DIR)/board_configuration.cpp
++
++ifneq ($(PROJECT_CPU),ARCH_STM32F7)
++$(error nossa_top6c is STM32F7 only, got [$(PROJECT_CPU)])
++endif
++
++# No LEDs on this board (PE3 is LS18, PD14 is IGN1).
++DDEFS += -DLED_CRITICAL_ERROR_BRAIN_PIN=Gpio::Unassigned
++DDEFS += -DFIRMWARE_ID=\"nossa_top6c\"
++DDEFS += $(VAR_DEF_ENGINE_TYPE)
++
++DDEFS += -DBOOT_COM_RS232_RX_MAX_DATA=120
++DDEFS += -DOPEN_BLT_TEST_COMMAND=1
++DDEFS += -DBOOT_BACKDOOR_ENTRY_TIMEOUT_MS=0
++
++DDEFS += -DVR_SUPPLY_VOLTAGE=5
++
++# ADC3: software knock on PF4/PF5 plus ADC3-only slow inputs PF9/PF10/PF3 (adc3_slow_config.h)
++DDEFS += -DSTM32_ADC_USE_ADC3=TRUE
++DDEFS += -DEFI_SOFTWARE_KNOCK=TRUE
++DDEFS += -DEFI_ADC3_SLOW=TRUE
++
++# TunerStudio on UART4 (PH13 TX / PH14 RX, AF8) for the ESP32-S3, at the same time as USB.
++DDEFS += -DTS_PRIMARY_UxART_PORT=SD4 -DEFI_TS_PRIMARY_IS_SERIAL=TRUE -DSTM32_SERIAL_USE_UART4=TRUE
++DDEFS += -DEFI_CONSOLE_TX_BRAIN_PIN=Gpio::H13 -DEFI_CONSOLE_RX_BRAIN_PIN=Gpio::H14 -DEFI_CONSOLE_AF=8
++
++# CAN1 PD0/PD1 for OpenBLT
++DDEFS += -DBOOT_COM_CAN_CHANNEL_INDEX=0
++DDEFS += -DOPENBLT_CAN_RX_PORT=GPIOD
++DDEFS += -DOPENBLT_CAN_RX_PIN=0
++DDEFS += -DOPENBLT_CAN_TX_PORT=GPIOD
++DDEFS += -DOPENBLT_CAN_TX_PIN=1
++
++DDEFS += -DHW_NOSSA_TOP6C=1
++
++DDEFS += -DKNOCK_SPECTROGRAM=TRUE
++DDEFS += -DLUA_RX_MAX_FILTER_COUNT=96
++# Reuses the Proteus F7 static id (TS/console identification only)
++DDEFS += -DSTATIC_BOARD_ID=STATIC_BOARD_ID_PROTEUS_F7
++# OTG2 has enough endpoints for a second CDC ACM for the CAN sniffer.
++DDEFS += -DHAL_USE_USB_CDC_2=TRUE
++DDEFS += -DEFI_HD_ACR=TRUE
++# technical debt: UI uses separate ts_show_tcu flag
++DDEFS += -DEFI_TCU=TRUE
++
++ifeq ($(EFI_LUA_LOOKUP),)
++  EFI_LUA_LOOKUP = TRUE
++endif
++DDEFS += -DEFI_LUA_LOOKUP=$(EFI_LUA_LOOKUP)
++
++ifeq ($(DEBUG_LEVEL_OPT),)
++  DEBUG_LEVEL_OPT = -Os -ggdb -g
++endif
++
++# STM32F767IIT6 has 2 MB of flash
++include $(PROJECT_DIR)/hw_layer/ports/stm32/2mb_flash.mk
++
++DDEFS += -DBOARD_SERIAL="\"000000000000010000000000\""
+diff --git a/firmware/config/boards/nossa_top6c/board_configuration.cpp b/firmware/config/boards/nossa_top6c/board_configuration.cpp
+new file mode 100644
+index 00000000000..42e61cc9836
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/board_configuration.cpp
+@@ -0,0 +1,174 @@
++/**
++ * @file boards/nossa_top6c/board_configuration.cpp
++ *
++ * @brief Configuration defaults for the "nossa top 6c" board (STM32F767IIT6).
++ *
++ * Based on the Proteus board configuration.
++ * This board has no LEDs: status LED getters return Gpio::Unassigned and
++ * LED_CRITICAL_ERROR_BRAIN_PIN is Gpio::Unassigned (board.mk).
++ * PB2 is hard-wired to GND: never configure it as an output.
++ */
++
++#include "pch.h"
++#include "basic_configuration.h"
++#include "nossa_top6c_meta.h"
++#include "board_overrides.h"
++
++static const brain_pin_e injPins[] = {
++	Gpio::TOP6C_LS_1,
++	Gpio::TOP6C_LS_2,
++	Gpio::TOP6C_LS_3,
++	Gpio::TOP6C_LS_4,
++	Gpio::TOP6C_LS_5,
++	Gpio::TOP6C_LS_6,
++	Gpio::TOP6C_LS_7,
++	Gpio::TOP6C_LS_8,
++};
++
++static const brain_pin_e ignPins[] = {
++	Gpio::TOP6C_IGN_1,
++	Gpio::TOP6C_IGN_2,
++	Gpio::TOP6C_IGN_3,
++	Gpio::TOP6C_IGN_4,
++	Gpio::TOP6C_IGN_5,
++	Gpio::TOP6C_IGN_6,
++	Gpio::TOP6C_IGN_7,
++	Gpio::TOP6C_IGN_8,
++};
++
++static void setInjectorPins() {
++	for (size_t i = 0; i < efi::size(engineConfiguration->injectionPins); i++) {
++		engineConfiguration->injectionPins[i] = i < efi::size(injPins) ? injPins[i] : Gpio::Unassigned;
++	}
++}
++
++static void setIgnitionPins() {
++	for (size_t i = 0; i < efi::size(engineConfiguration->ignitionPins); i++) {
++		engineConfiguration->ignitionPins[i] = i < efi::size(ignPins) ? ignPins[i] : Gpio::Unassigned;
++	}
++}
++
++// No LEDs on this board
++Gpio getCommsLedPin() {
++	return Gpio::Unassigned;
++}
++
++Gpio getRunningLedPin() {
++	return Gpio::Unassigned;
++}
++
++Gpio getWarningLedPin() {
++	return Gpio::Unassigned;
++}
++
++static void setupVbatt() {
++	// Analog input divider: copied from Proteus (5.6k high side/10k low side). CHECK against the PCB.
++	engineConfiguration->analogInputDividerCoefficient = 1.56f;
++
++	// 82k high side/10k low side = 9.2
++	engineConfiguration->vbattDividerCoeff = (92.0f / 10.0f);
++
++	// Battery sense on PA7
++	engineConfiguration->vbattAdcChannel = TOP6C_IN_VBATT;
++
++	engineConfiguration->adcVcc = 3.3f;
++}
++
++static void setupEtb() {
++	setupTLE9201IncludingStepper(Gpio::TOP6C_ETB1_PWM, Gpio::TOP6C_ETB1_DIR, Gpio::TOP6C_ETB1_DIS);
++	setupTLE9201IncludingStepper(Gpio::TOP6C_ETB2_PWM, Gpio::TOP6C_ETB2_DIR, Gpio::TOP6C_ETB2_DIS, 1);
++}
++
++static bool applyTop6cBasicConfiguration(BasicConfigurationAction action) {
++	return applyBasicConfiguration(action,
++		setupEtb,
++		TOP6C_IN_TPS,
++		TOP6C_IN_TPS1_2,
++		TOP6C_IN_PPS,
++		TOP6C_IN_PPS2);
++}
++
++static void setupDefaultSensorInputs() {
++	// VR1 = crank, VR2 = cam
++	engineConfiguration->triggerInputPins[0] = Gpio::TOP6C_VR_1;
++	engineConfiguration->triggerInputPins[1] = Gpio::Unassigned;
++	engineConfiguration->camInputs[0] = Gpio::TOP6C_VR_2;
++
++	// Hall pull-up enable outputs (turned on only when the input type is Hall)
++	engineConfiguration->hallPullupCrank1Pin = Gpio::TOP6C_VR1_PULLUP;
++	engineConfiguration->hallPullupCam1Pin = Gpio::TOP6C_VR2_PULLUP;
++	// VR3 (PA10) is not assigned by default; its pull-up is offered as cam input 2
++	engineConfiguration->hallPullupCam2Pin = Gpio::TOP6C_VR3_PULLUP;
++
++	engineConfiguration->clt.adcChannel = TOP6C_IN_CLT;
++	engineConfiguration->iat.adcChannel = TOP6C_IN_IAT;
++	engineConfiguration->tps1_1AdcChannel = TOP6C_IN_TPS;
++
++	// Internal MAP sensor MPXH6400A (4 bar) on AIN14 / PF10 (ADC3 only: no crank-synced MAP averaging)
++	engineConfiguration->map.sensor.hwChannel = TOP6C_IN_MAP;
++	engineConfiguration->map.sensor.type = MT_MPXH6400;
++
++	// Both onboard rusEFI wideband controllers are on CAN1
++	engineConfiguration->enableAemXSeries = true;
++	engineConfiguration->widebandOnSecondBus = false;
++}
++
++static void setupSdCard() {
++	engineConfiguration->sdCardSpiDevice = SPI_DEVICE_3;
++	engineConfiguration->sdCardCsPin = Gpio::D2;
++
++	engineConfiguration->is_enabled_spi_3 = true;
++	engineConfiguration->spi3sckPin = Gpio::C10;
++	engineConfiguration->spi3misoPin = Gpio::C11;
++	engineConfiguration->spi3mosiPin = Gpio::C12;
++}
++
++static void top6c_boardConfigOverrides() {
++	setupSdCard();
++	setupVbatt();
++
++	engineConfiguration->clt.config.bias_resistor = TOP6C_DEFAULT_AT_PULLUP;
++	engineConfiguration->iat.config.bias_resistor = TOP6C_DEFAULT_AT_PULLUP;
++
++	engineConfiguration->canTxPin = Gpio::D1;
++	engineConfiguration->canRxPin = Gpio::D0;
++	engineConfiguration->can2RxPin = Gpio::B12;
++	engineConfiguration->can2TxPin = Gpio::B13;
++
++	engineConfiguration->lps25BaroSensorScl = Gpio::B10;
++	engineConfiguration->lps25BaroSensorSda = Gpio::B11;
++}
++
++static void top6c_boardDefaultConfiguration() {
++	setInjectorPins();
++	setIgnitionPins();
++	setupEtb();
++
++	engineConfiguration->isSdCardEnabled = true;
++
++	setupDefaultSensorInputs();
++
++	engineConfiguration->enableSoftwareKnock = true;
++}
++
++// ESP32-S3: IO0 high = normal boot from flash, EN high = run.
++static void top6c_boardInitHardware() {
++#if EFI_PROD_CODE
++	palSetLine(PAL_LINE(GPIOI, 5));
++	palSetLineMode(PAL_LINE(GPIOI, 5), PAL_MODE_OUTPUT_PUSHPULL);
++	palSetLine(PAL_LINE(GPIOI, 4));
++	palSetLineMode(PAL_LINE(GPIOI, 4), PAL_MODE_OUTPUT_PUSHPULL);
++#endif // EFI_PROD_CODE
++}
++
++void boardPrepareForStop() {
++	// Wake on the CAN RX pin
++	palEnableLineEvent(PAL_LINE(GPIOD, 0), PAL_EVENT_MODE_RISING_EDGE);
++}
++
++void setup_custom_board_overrides() {
++	custom_board_DefaultConfiguration = top6c_boardDefaultConfiguration;
++	custom_board_ConfigOverrides = top6c_boardConfigOverrides;
++	custom_board_applyBasicConfiguration = applyTop6cBasicConfiguration;
++	custom_board_InitHardware = top6c_boardInitHardware;
++}
+diff --git a/firmware/config/boards/nossa_top6c/compile_nossa_top6c.sh b/firmware/config/boards/nossa_top6c/compile_nossa_top6c.sh
+new file mode 100755
+index 00000000000..a8297142bfc
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/compile_nossa_top6c.sh
+@@ -0,0 +1,2 @@
++#!/usr/bin/env bash
++cd ../../.. && bash bin/compile.sh config/boards/nossa_top6c/meta-info-nossa_top6c.env
+diff --git a/firmware/config/boards/nossa_top6c/connectors/generated_board_pin_names.h b/firmware/config/boards/nossa_top6c/connectors/generated_board_pin_names.h
+new file mode 100644
+index 00000000000..3abb859dbe8
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/connectors/generated_board_pin_names.h
+@@ -0,0 +1,5 @@
++// DO NOT EDIT MANUALLY, let automation work hard.
++
++// auto-generated by PinoutLogic.java based on config/boards/nossa_top6c/connectors/main.yaml
++#pragma once
++
+diff --git a/firmware/config/boards/nossa_top6c/connectors/generated_outputs.h b/firmware/config/boards/nossa_top6c/connectors/generated_outputs.h
+new file mode 100644
+index 00000000000..916e7913531
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/connectors/generated_outputs.h
+@@ -0,0 +1,77 @@
++// DO NOT EDIT MANUALLY, let automation work hard.
++
++// auto-generated by PinoutLogic.java based on config/boards/nossa_top6c/connectors/main.yaml
++#pragma once
++
++Gpio GENERATED_OUTPUTS[] = {
++	Gpio::H6, // Lowside 1
++	Gpio::B14, // Lowside 2
++	Gpio::B15, // Lowside 3
++	Gpio::D9, // Lowside 4
++	Gpio::G3, // Lowside 5
++	Gpio::G4, // Lowside 6
++	Gpio::G5, // Lowside 7
++	Gpio::G6, // Lowside 8
++	Gpio::G8, // Lowside 9
++	Gpio::C7, // Lowside 10
++	Gpio::C8, // Lowside 11
++	Gpio::A8, // Lowside 12
++	Gpio::D10, // Lowside 13
++	Gpio::D11, // Lowside 14
++	Gpio::D15, // Lowside 15
++	Gpio::G2, // Lowside 16
++	Gpio::E2, // Lowside 17
++	Gpio::E3, // Lowside 18
++	Gpio::E4, // Lowside 19
++	Gpio::E5, // Lowside 20
++	Gpio::G9, // VR1 Hall pullup
++	Gpio::G14, // VR2 Hall pullup
++	Gpio::D6, // VR3 Hall pullup
++	Gpio::D14, // Ignition 1
++	Gpio::H8, // Ignition 2
++	Gpio::H10, // Ignition 3
++	Gpio::H11, // Ignition 4
++	Gpio::D3, // Ignition 5
++	Gpio::I0, // Ignition 6
++	Gpio::H15, // Ignition 7
++	Gpio::G7, // Ignition 8
++	Gpio::H9, // Highside 1
++	Gpio::H7, // Highside 2
++	Gpio::H12, // Highside 3
++	Gpio::D8, // Highside 4
++// "Lowside 1",
++// "Lowside 2",
++// "Lowside 3",
++// "Lowside 4",
++// "Lowside 5",
++// "Lowside 6",
++// "Lowside 7",
++// "Lowside 8",
++// "Lowside 9",
++// "Lowside 10",
++// "Lowside 11",
++// "Lowside 12",
++// "Lowside 13",
++// "Lowside 14",
++// "Lowside 15",
++// "Lowside 16",
++// "Lowside 17",
++// "Lowside 18",
++// "Lowside 19",
++// "Lowside 20",
++// "VR1 Hall pullup",
++// "VR2 Hall pullup",
++// "VR3 Hall pullup",
++// "Ignition 1",
++// "Ignition 2",
++// "Ignition 3",
++// "Ignition 4",
++// "Ignition 5",
++// "Ignition 6",
++// "Ignition 7",
++// "Ignition 8",
++// "Highside 1",
++// "Highside 2",
++// "Highside 3",
++// "Highside 4",
++}
+diff --git a/firmware/config/boards/nossa_top6c/connectors/generated_ts_name_by_pin.cpp b/firmware/config/boards/nossa_top6c/connectors/generated_ts_name_by_pin.cpp
+new file mode 100644
+index 00000000000..e4b4a3bc8dc
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/connectors/generated_ts_name_by_pin.cpp
+@@ -0,0 +1,149 @@
++// DO NOT EDIT MANUALLY, let automation work hard.
++
++// auto-generated by PinoutLogic.java based on config/boards/nossa_top6c/connectors/main.yaml
++#include "pch.h"
++
++// see comments at declaration in pin_repository.h
++const char* getBoardSpecificPinName(brain_pin_e brainPin) {
++	switch (brainPin) {
++		case Gpio::A0:
++			return "Analog Volt 5";
++		case Gpio::A1:
++			return "Analog Volt 6";
++		case Gpio::A10:
++			return "VR 3";
++		case Gpio::A2:
++			return "Analog Volt 7";
++		case Gpio::A3:
++			return "Analog Volt 8";
++		case Gpio::A4:
++			return "Analog Volt 9";
++		case Gpio::A5:
++			return "Analog Volt 10";
++		case Gpio::A7:
++			return "Battery Sense";
++		case Gpio::A8:
++			return "Lowside 12";
++		case Gpio::B0:
++			return "Analog Temp 3";
++		case Gpio::B1:
++			return "Analog Temp 4";
++		case Gpio::B14:
++			return "Lowside 2";
++		case Gpio::B15:
++			return "Lowside 3";
++		case Gpio::C0:
++			return "Analog Volt 1";
++		case Gpio::C1:
++			return "Analog Volt 2";
++		case Gpio::C2:
++			return "Analog Volt 3";
++		case Gpio::C3:
++			return "Analog Volt 4";
++		case Gpio::C4:
++			return "Analog Temp 1";
++		case Gpio::C5:
++			return "Analog Temp 2";
++		case Gpio::C6:
++			return "Digital 1";
++		case Gpio::C7:
++			return "Lowside 10";
++		case Gpio::C8:
++			return "Lowside 11";
++		case Gpio::D10:
++			return "Lowside 13";
++		case Gpio::D11:
++			return "Lowside 14";
++		case Gpio::D14:
++			return "Ignition 1";
++		case Gpio::D15:
++			return "Lowside 15";
++		case Gpio::D3:
++			return "Ignition 5";
++		case Gpio::D6:
++			return "VR3 Hall pullup";
++		case Gpio::D8:
++			return "Highside 4";
++		case Gpio::D9:
++			return "Lowside 4";
++		case Gpio::E11:
++			return "Digital 2";
++		case Gpio::E12:
++			return "Digital 3";
++		case Gpio::E13:
++			return "Digital 5";
++		case Gpio::E14:
++			return "Digital 4";
++		case Gpio::E15:
++			return "Digital 6";
++		case Gpio::E2:
++			return "Lowside 17";
++		case Gpio::E3:
++			return "Lowside 18";
++		case Gpio::E4:
++			return "Lowside 19";
++		case Gpio::E5:
++			return "Lowside 20";
++		case Gpio::E7:
++			return "VR 1";
++		case Gpio::E8:
++			return "VR 2";
++		case Gpio::F0:
++			return "Switch 1";
++		case Gpio::F1:
++			return "Switch 2";
++		case Gpio::F10:
++			return "Analog In 14 MAP";
++		case Gpio::F11:
++			return "Switch 4";
++		case Gpio::F2:
++			return "Switch 3";
++		case Gpio::F3:
++			return "Analog In 13";
++		case Gpio::F9:
++			return "Analog Volt 11";
++		case Gpio::G14:
++			return "VR2 Hall pullup";
++		case Gpio::G2:
++			return "Lowside 16";
++		case Gpio::G3:
++			return "Lowside 5";
++		case Gpio::G4:
++			return "Lowside 6";
++		case Gpio::G5:
++			return "Lowside 7";
++		case Gpio::G6:
++			return "Lowside 8";
++		case Gpio::G7:
++			return "Ignition 8";
++		case Gpio::G8:
++			return "Lowside 9";
++		case Gpio::G9:
++			return "VR1 Hall pullup";
++		case Gpio::H10:
++			return "Ignition 3";
++		case Gpio::H11:
++			return "Ignition 4";
++		case Gpio::H12:
++			return "Highside 3";
++		case Gpio::H15:
++			return "Ignition 7";
++		case Gpio::H2:
++			return "5V supply 1 OK";
++		case Gpio::H3:
++			return "5V supply 2 OK";
++		case Gpio::H6:
++			return "Lowside 1";
++		case Gpio::H7:
++			return "Highside 2";
++		case Gpio::H8:
++			return "Ignition 2";
++		case Gpio::H9:
++			return "Highside 1";
++		case Gpio::I0:
++			return "Ignition 6";
++		default:
++			return nullptr;
++	}
++	return nullptr;
++}
+diff --git a/firmware/config/boards/nossa_top6c/connectors/main.yaml b/firmware/config/boards/nossa_top6c/connectors/main.yaml
+new file mode 100644
+index 00000000000..b774589fd0c
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/connectors/main.yaml
+@@ -0,0 +1,413 @@
++pins:
++  - id: H6
++    class: outputs
++    ts_name: Lowside 1
++    function: "Injector 1 / Lowside 1"
++    type: inj
++
++  - id: B14
++    class: outputs
++    ts_name: Lowside 2
++    function: "Injector 2 / Lowside 2"
++    type: inj
++
++  - id: B15
++    class: outputs
++    ts_name: Lowside 3
++    function: "Injector 3 / Lowside 3"
++    type: inj
++
++  - id: D9
++    class: outputs
++    ts_name: Lowside 4
++    function: "Injector 4 / Lowside 4"
++    type: inj
++
++  - id: G3
++    class: outputs
++    ts_name: Lowside 5
++    function: "Injector 5 / Lowside 5"
++    type: inj
++
++  - id: G4
++    class: outputs
++    ts_name: Lowside 6
++    function: "Injector 6 / Lowside 6"
++    type: inj
++
++  - id: G5
++    class: outputs
++    ts_name: Lowside 7
++    function: "Injector 7 / Lowside 7"
++    type: inj
++
++  - id: G6
++    class: outputs
++    ts_name: Lowside 8
++    function: "Injector 8 / Lowside 8"
++    type: inj
++
++  - id: G8
++    class: outputs
++    ts_name: Lowside 9
++    function: "Lowside 9"
++    type: ls
++
++  - id: C7
++    class: outputs
++    ts_name: Lowside 10
++    function: "Lowside 10"
++    type: ls
++
++  - id: C8
++    class: outputs
++    ts_name: Lowside 11
++    function: "Lowside 11"
++    type: ls
++
++  - id: A8
++    class: outputs
++    ts_name: Lowside 12
++    function: "Lowside 12"
++    type: ls
++
++  - id: D10
++    class: outputs
++    ts_name: Lowside 13
++    function: "Lowside 13"
++    type: ls
++
++  - id: D11
++    class: outputs
++    ts_name: Lowside 14
++    function: "Lowside 14"
++    type: ls
++
++  - id: D15
++    class: outputs
++    ts_name: Lowside 15
++    function: "Lowside 15"
++    type: ls
++
++  - id: G2
++    class: outputs
++    ts_name: Lowside 16
++    function: "Lowside 16"
++    type: ls
++
++  - id: E2
++    class: outputs
++    ts_name: Lowside 17
++    function: "Lowside 17"
++    type: ls
++
++  - id: E3
++    class: outputs
++    ts_name: Lowside 18
++    function: "Lowside 18"
++    type: ls
++
++  - id: E4
++    class: outputs
++    ts_name: Lowside 19
++    function: "Lowside 19"
++    type: ls
++
++  - id: E5
++    class: outputs
++    ts_name: Lowside 20
++    function: "Lowside 20"
++    type: ls
++
++  - id: D14
++    class: outputs
++    ts_name: Ignition 1
++    function: "Ignition 1 (logic level, smart coil)"
++    type: ign
++
++  - id: H8
++    class: outputs
++    ts_name: Ignition 2
++    function: "Ignition 2 (logic level, smart coil)"
++    type: ign
++
++  - id: H10
++    class: outputs
++    ts_name: Ignition 3
++    function: "Ignition 3 (logic level, smart coil)"
++    type: ign
++
++  - id: H11
++    class: outputs
++    ts_name: Ignition 4
++    function: "Ignition 4 (logic level, smart coil)"
++    type: ign
++
++  - id: D3
++    class: outputs
++    ts_name: Ignition 5
++    function: "Ignition 5 (logic level, smart coil)"
++    type: ign
++
++  - id: I0
++    class: outputs
++    ts_name: Ignition 6
++    function: "Ignition 6 (logic level, smart coil)"
++    type: ign
++
++  - id: H15
++    class: outputs
++    ts_name: Ignition 7
++    function: "Ignition 7 (logic level, smart coil)"
++    type: ign
++
++  - id: G7
++    class: outputs
++    ts_name: Ignition 8
++    function: "Ignition 8 (logic level, smart coil)"
++    type: ign
++
++  - id: H9
++    class: outputs
++    ts_name: Highside 1
++    function: "Highside 1 12V"
++    type: hs
++
++  - id: H7
++    class: outputs
++    ts_name: Highside 2
++    function: "Highside 2 12V"
++    type: hs
++
++  - id: H12
++    class: outputs
++    ts_name: Highside 3
++    function: "Highside 3 12V"
++    type: hs
++
++  - id: D8
++    class: outputs
++    ts_name: Highside 4
++    function: "Highside 4 12V"
++    type: hs
++
++  - id: G9
++    class: outputs
++    ts_name: VR1 Hall pullup
++    function: "Hall pull-up enable for VR1 input"
++    type: ls
++
++  - id: G14
++    class: outputs
++    ts_name: VR2 Hall pullup
++    function: "Hall pull-up enable for VR2 input"
++    type: ls
++
++  - id: D6
++    class: outputs
++    ts_name: VR3 Hall pullup
++    function: "Hall pull-up enable for VR3 input"
++    type: ls
++
++  - id: E7
++    class: event_inputs
++    ts_name: VR 1
++    function: "VR1 trigger input (crank)"
++    type: vr
++
++  - id: E8
++    class: event_inputs
++    ts_name: VR 2
++    function: "VR2 trigger input (cam)"
++    type: vr
++
++  - id: A10
++    class: event_inputs
++    ts_name: VR 3
++    function: "VR3 trigger input"
++    type: vr
++
++  - id: [C6, C6]
++    class: [event_inputs, switch_inputs]
++    ts_name: Digital 1
++    function: "Digital input 1"
++    type: din
++
++  - id: [E11, E11]
++    class: [event_inputs, switch_inputs]
++    ts_name: Digital 2
++    function: "Digital input 2"
++    type: din
++
++  - id: [E12, E12]
++    class: [event_inputs, switch_inputs]
++    ts_name: Digital 3
++    function: "Digital input 3"
++    type: din
++
++  - id: [E14, E14]
++    class: [event_inputs, switch_inputs]
++    ts_name: Digital 4
++    function: "Digital input 4"
++    type: din
++
++  - id: [E13, E13]
++    class: [event_inputs, switch_inputs]
++    ts_name: Digital 5
++    function: "Digital input 5"
++    type: din
++
++  - id: [E15, E15]
++    class: [event_inputs, switch_inputs]
++    ts_name: Digital 6
++    function: "Digital input 6"
++    type: din
++
++  - id: F0
++    class: switch_inputs
++    ts_name: Switch 1
++    function: "Switch 1"
++    type: din
++
++  - id: F1
++    class: switch_inputs
++    ts_name: Switch 2
++    function: "Switch 2"
++    type: din
++
++  - id: F2
++    class: switch_inputs
++    ts_name: Switch 3
++    function: "Switch 3"
++    type: din
++
++  - id: F11
++    class: switch_inputs
++    ts_name: Switch 4
++    function: "Switch 4"
++    type: din
++
++  - id: H2
++    class: switch_inputs
++    ts_name: 5V supply 1 OK
++    function: "5V supply 1 OK"
++    type: din
++
++  - id: H3
++    class: switch_inputs
++    ts_name: 5V supply 2 OK
++    function: "5V supply 2 OK"
++    type: din
++
++  - id: [C0, EFI_ADC_10]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 1
++    function: "Analog Volt 1 (PC0)"
++    type: av
++
++  - id: [C1, EFI_ADC_11]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 2
++    function: "Analog Volt 2 (PC1)"
++    type: av
++
++  - id: [C2, EFI_ADC_12]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 3
++    function: "Analog Volt 3 (PC2)"
++    type: av
++
++  - id: [C3, EFI_ADC_13]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 4
++    function: "Analog Volt 4 (PC3)"
++    type: av
++
++  - id: [A0, EFI_ADC_0]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 5
++    function: "Analog Volt 5 (PA0)"
++    type: av
++
++  - id: [A1, EFI_ADC_1]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 6
++    function: "Analog Volt 6 (PA1)"
++    type: av
++
++  - id: [A2, EFI_ADC_2]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 7
++    function: "Analog Volt 7 (PA2)"
++    type: av
++
++  - id: [A3, EFI_ADC_3]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 8
++    function: "Analog Volt 8 (PA3)"
++    type: av
++
++  - id: [A4, EFI_ADC_4]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 9
++    function: "Analog Volt 9 (PA4)"
++    type: av
++
++  - id: [A5, EFI_ADC_5]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 10
++    function: "Analog Volt 10 (PA5)"
++    type: av
++
++  - id: [F9, EFI_ADC_35]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Volt 11
++    function: "Analog Volt 11 (PF9)"
++    type: av
++
++  - id: [C4, EFI_ADC_14]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Temp 1
++    function: "Analog Temp 1 (PC4)"
++    type: at
++
++  - id: [C5, EFI_ADC_15]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Temp 2
++    function: "Analog Temp 2 (PC5)"
++    type: at
++
++  - id: [B0, EFI_ADC_8]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Temp 3
++    function: "Analog Temp 3 (PB0)"
++    type: at
++
++  - id: [B1, EFI_ADC_9]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog Temp 4
++    function: "Analog Temp 4 (PB1)"
++    type: at
++
++  - id: [F3, EFI_ADC_37]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog In 13
++    function: "Analog In 13 (PF3)"
++    type: av
++
++  - id: [F10, EFI_ADC_36]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Analog In 14 MAP
++    function: "Analog In 14 MAP (PF10)"
++    type: av
++
++  - id: [A7, EFI_ADC_7]
++    class: [switch_inputs, analog_inputs]
++    ts_name: Battery Sense
++    function: "Battery Sense (PA7)"
++    type: av
++
++info:
++  title: Nossa Top 6C
++  name: Main
++  cid: main
+diff --git a/firmware/config/boards/nossa_top6c/knock_config.h b/firmware/config/boards/nossa_top6c/knock_config.h
+new file mode 100644
+index 00000000000..7edc5b1f5c1
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/knock_config.h
+@@ -0,0 +1,33 @@
++/**
++ * @file knock_config.h
++ */
++
++#pragma once
++
++// Knock is on ADC3
++#define KNOCK_ADC ADCD3
++
++// knock 1 - pin PF4
++#define KNOCK_PIN_CH1 Gpio::F4
++
++// knock 2 - pin PF5
++#define KNOCK_HAS_CH2 true
++#define KNOCK_PIN_CH2 Gpio::F5
++
++// Sample rate & time - depends on the exact MCU
++#if defined(STM32H7XX)
++	// H7
++	#define KNOCK_ADC_CH1 9
++	#define KNOCK_ADC_CH2 4
++
++	#define H7_KNOCK_OVERSAMPLE 4
++	#define KNOCK_SAMPLE_TIME ADC_SMPR_SMP_8P5
++	#define KNOCK_SAMPLE_RATE (STM32_ADC3_CLOCK / (H7_KNOCK_OVERSAMPLE * (8 + 8)))
++#else
++	// F4/F7
++	#define KNOCK_ADC_CH1 ADC_CHANNEL_IN14
++	#define KNOCK_ADC_CH2 ADC_CHANNEL_IN15
++
++	#define KNOCK_SAMPLE_TIME ADC_SAMPLE_84
++	#define KNOCK_SAMPLE_RATE (STM32_PCLK2 / (4 * (84 + 12)))
++#endif
+\ No newline at end of file
+diff --git a/firmware/config/boards/nossa_top6c/meta-info-nossa_top6c.env b/firmware/config/boards/nossa_top6c/meta-info-nossa_top6c.env
+new file mode 100644
+index 00000000000..5dc4171f7a5
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/meta-info-nossa_top6c.env
+@@ -0,0 +1,4 @@
++SHORT_BOARD_NAME=nossa_top6c
++PROJECT_CPU=ARCH_STM32F7
++USE_OPENBLT=yes
++EFI_LUA_LOOKUP=TRUE
+diff --git a/firmware/config/boards/nossa_top6c/nossa_top6c_meta.h b/firmware/config/boards/nossa_top6c/nossa_top6c_meta.h
+new file mode 100644
+index 00000000000..4a9badbe4db
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/nossa_top6c_meta.h
+@@ -0,0 +1,115 @@
++/**
++ * @file nossa_top6c_meta.h
++ *
++ * Pin map of the "nossa top 6c" board (STM32F767IIT6, LQFP176, 2 MB flash).
++ * Source: the board PCB (MCU pins).
++ */
++
++#pragma once
++
++#include "defaults.h"
++
++// Low side outputs (LS1..LS8 are the default injectors 1..8)
++#define TOP6C_LS_1 H6
++#define TOP6C_LS_2 B14
++#define TOP6C_LS_3 B15
++#define TOP6C_LS_4 D9
++#define TOP6C_LS_5 G3
++#define TOP6C_LS_6 G4
++#define TOP6C_LS_7 G5
++#define TOP6C_LS_8 G6
++#define TOP6C_LS_9 G8
++#define TOP6C_LS_10 C7
++#define TOP6C_LS_11 C8
++#define TOP6C_LS_12 A8
++#define TOP6C_LS_13 D10
++#define TOP6C_LS_14 D11
++#define TOP6C_LS_15 D15
++#define TOP6C_LS_16 G2
++#define TOP6C_LS_17 E2
++#define TOP6C_LS_18 E3
++#define TOP6C_LS_19 E4
++#define TOP6C_LS_20 E5
++
++// Ignition, logic level for smart coils. Max 8 cylinders on this board.
++#define TOP6C_IGN_1 D14
++#define TOP6C_IGN_2 H8
++#define TOP6C_IGN_3 H10
++#define TOP6C_IGN_4 H11
++#define TOP6C_IGN_5 D3
++#define TOP6C_IGN_6 I0
++#define TOP6C_IGN_7 H15
++#define TOP6C_IGN_8 G7
++
++// High side 12 V
++#define TOP6C_HS_1 H9
++#define TOP6C_HS_2 H7
++#define TOP6C_HS_3 H12
++#define TOP6C_HS_4 D8
++
++// ETB, two TLE9201
++#define TOP6C_ETB1_PWM D12
++#define TOP6C_ETB1_DIR A9
++#define TOP6C_ETB1_DIS I2
++#define TOP6C_ETB2_PWM D13
++#define TOP6C_ETB2_DIR D7
++#define TOP6C_ETB2_DIS I3
++
++// Hall pull-up enable outputs
++#define TOP6C_VR1_PULLUP G9
++#define TOP6C_VR2_PULLUP G14
++#define TOP6C_VR3_PULLUP D6
++
++// Trigger and digital inputs
++#define TOP6C_VR_1 E7
++#define TOP6C_VR_2 E8
++#define TOP6C_VR_3 A10
++#define TOP6C_DIGITAL_1 C6
++#define TOP6C_DIGITAL_2 E11
++#define TOP6C_DIGITAL_3 E12
++#define TOP6C_DIGITAL_4 E14
++#define TOP6C_DIGITAL_5 E13
++#define TOP6C_DIGITAL_6 E15
++#define TOP6C_SW_1 F0
++#define TOP6C_SW_2 F1
++#define TOP6C_SW_3 F2
++#define TOP6C_SW_4 F11
++// 5 V sensor supply power-good inputs
++#define TOP6C_5V1_GOOD H2
++#define TOP6C_5V2_GOOD H3
++
++// ESP32-S3 on UART4 (PH13 TX / PH14 RX)
++#define TOP6C_ESP_EN I4
++#define TOP6C_ESP_IO0 I5
++
++// Analog inputs
++#define TOP6C_IN_AV_1 EFI_ADC_10   // PC0
++#define TOP6C_IN_AV_2 EFI_ADC_11   // PC1
++#define TOP6C_IN_AV_3 EFI_ADC_12   // PC2
++#define TOP6C_IN_AV_4 EFI_ADC_13   // PC3
++#define TOP6C_IN_AV_5 EFI_ADC_0    // PA0
++#define TOP6C_IN_AV_6 EFI_ADC_1    // PA1
++#define TOP6C_IN_AV_7 EFI_ADC_2    // PA2
++#define TOP6C_IN_AV_8 EFI_ADC_3    // PA3
++#define TOP6C_IN_AV_9 EFI_ADC_4    // PA4
++#define TOP6C_IN_AV_10 EFI_ADC_5   // PA5
++#define TOP6C_IN_AV_11 EFI_ADC_35  // PF9, ADC3 only
++#define TOP6C_IN_AT_1 EFI_ADC_14   // PC4
++#define TOP6C_IN_AT_2 EFI_ADC_15   // PC5
++#define TOP6C_IN_AT_3 EFI_ADC_8    // PB0
++#define TOP6C_IN_AT_4 EFI_ADC_9    // PB1
++#define TOP6C_IN_AIN_13 EFI_ADC_37 // PF3, ADC3 only
++#define TOP6C_IN_AIN_14 EFI_ADC_36 // PF10, ADC3 only: internal MAP MPXH6400A (or external MAP)
++#define TOP6C_IN_VBATT EFI_ADC_7   // PA7, divider 82k/10k
++
++// Suggested defaults
++#define TOP6C_IN_MAP TOP6C_IN_AIN_14
++#define TOP6C_IN_CLT TOP6C_IN_AT_1
++#define TOP6C_IN_IAT TOP6C_IN_AT_2
++#define TOP6C_IN_TPS TOP6C_IN_AV_1
++#define TOP6C_IN_TPS1_2 TOP6C_IN_AV_2
++#define TOP6C_IN_PPS TOP6C_IN_AV_3
++#define TOP6C_IN_PPS2 TOP6C_IN_AV_4
++
++// Thermistor pull-up, copied from Proteus. CHECK against the PCB.
++#define TOP6C_DEFAULT_AT_PULLUP 2700
+diff --git a/firmware/config/boards/nossa_top6c/prepend.txt b/firmware/config/boards/nossa_top6c/prepend.txt
+new file mode 100644
+index 00000000000..73c16d15b98
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/prepend.txt
+@@ -0,0 +1,31 @@
++#define MAIN_HELP_URL "https://wiki.rusefi.com/"
++
++#define PINOUT_URL "https://rusefi.com/docs/pinouts/"
++
++#define ts_show_egt false
++
++#define ts_show_analog_divider false
++#define ts_show_spi true
++#define ts_show_sd_card true
++#define ts_show_can_pins false
++#define ts_show_tunerstudio_port false
++#define ts_show_can2 true
++#define ts_show_software_knock true
++#define ts_show_hardware_simulator false
++#define ts_show_sd_pins false
++#define ts_show_vbatt false
++#define ts_show_clt_iat_pullup false
++#define ts_show_basic_configurations true
++#define ts_show_gdi true
++#define ts_show_ign_key_analog_input true
++
++#define ts_show_vvt_frequency true
++
++! in case of direct Lua control we need UI to undo defaults
++#define ts_show_etb_pins true
++
++! just for a test does not mean EFI_ONBOARD_MEMS
++#define ts_show_onboard_accelerometer true
++
++#define CLT_TIMING_CURVE_SIZE 3
++#define IAT_IGN_CORR_TEMP_COUNT 4
+diff --git a/firmware/config/boards/nossa_top6c/prepend_nossa_top6c.txt b/firmware/config/boards/nossa_top6c/prepend_nossa_top6c.txt
+new file mode 100644
+index 00000000000..8f26ac4ad20
+--- /dev/null
++++ b/firmware/config/boards/nossa_top6c/prepend_nossa_top6c.txt
+@@ -0,0 +1,22 @@
++#define ts_show_canbus_sniffer true
++
++#define LUA_SCRIPT_SIZE 48000
++
++! huge buffer for happier remote TCP/IP connector - see also 'blockingFactorOverride' in console source code
++#define CUSTOM_TS_BUFFER_SIZE 32000
++
++#define TMF_SIZE 8
++
++#define CLT_IDLE_TABLE_RPM_SIZE 6
++
++! pro-style bigger main tables on the F7 (more flash and RAM than the F4):
++! 24 RPM x 20 load points for VE, Injection time (ms), ignition and lambda tables.
++! The extra tunes and the LTFT tables follow the same sizes.
++#define VE_RPM_COUNT 24
++#define VE_LOAD_COUNT 20
++#define INJ_TIME_RPM_COUNT 24
++#define INJ_TIME_LOAD_COUNT 20
++#define IGN_RPM_COUNT 24
++#define IGN_LOAD_COUNT 20
++#define FUEL_RPM_COUNT 24
++#define FUEL_LOAD_COUNT 20
+diff --git a/firmware/controllers/core/error_handling_led.h b/firmware/controllers/core/error_handling_led.h
+index 813e1885e0d..5047a678148 100644
+--- a/firmware/controllers/core/error_handling_led.h
++++ b/firmware/controllers/core/error_handling_led.h
+@@ -6,6 +6,7 @@ extern ioportid_t criticalErrorLedPort;
+ extern ioportmask_t criticalErrorLedPin;
+ extern uint8_t criticalErrorLedState;
+ 
+-#define TURN_FATAL_LED() palWritePad(criticalErrorLedPort, criticalErrorLedPin, criticalErrorLedState);
++// Boards without an error LED use Gpio::Unassigned: the port is then nullptr.
++#define TURN_FATAL_LED() do { if (criticalErrorLedPort != nullptr) { palWritePad(criticalErrorLedPort, criticalErrorLedPin, criticalErrorLedState); } } while (0);
+ 
+ #endif /* EFI_PROD_CODE */
+diff --git a/firmware/hw_layer/adc/adc_inputs.cpp b/firmware/hw_layer/adc/adc_inputs.cpp
+index b5b1c345daf..6ee2b95e857 100644
+--- a/firmware/hw_layer/adc/adc_inputs.cpp
++++ b/firmware/hw_layer/adc/adc_inputs.cpp
+@@ -244,6 +244,15 @@ void addFastAdcChannel(const char*, adc_channel_e hwChannel) {
+ 		return;
+ 	}
+ 
++#if EFI_ADC3_SLOW
++	// ADC3-only pins cannot be sampled by the fast ADC (ADC2): read them as slow
++	// inputs through the ADC3 slow sampler. MAP on such a pin has no crank-synced averaging.
++	if (hwChannel >= EFI_ADC_32 && hwChannel <= EFI_ADC_39) {
++		adcHwChannelMode[hwChannel] = AdcChannelMode::Slow;
++		return;
++	}
++#endif
++
+ #if EFI_USE_FAST_ADC
+ 	if (fastAdc.enableChannel(hwChannel) < 0) {
+ 		return;
+diff --git a/firmware/hw_layer/adc/adc_onchip_fast.cpp b/firmware/hw_layer/adc/adc_onchip_fast.cpp
+index daf6d5d7233..520d5c44e0f 100644
+--- a/firmware/hw_layer/adc/adc_onchip_fast.cpp
++++ b/firmware/hw_layer/adc/adc_onchip_fast.cpp
+@@ -321,7 +321,9 @@ adc_channel_e AdcDevice::getAdcChannelByInternalIndex(int hwChannel) const {
+ }
+ 
+ AdcToken AdcDevice::getAdcChannelToken(adc_channel_e hwChannel) {
+-	return fastAdc.internalAdcIndexByHardwareIndex[hwChannel];
++	uint8_t index = fastAdc.internalAdcIndexByHardwareIndex[hwChannel];
++	// 0xFF: this input is not sampled by the fast ADC (never read samples[255])
++	return index == 0xFF ? invalidAdcToken : index;
+ }
+ 
+ #endif // EFI_USE_FAST_ADC
+diff --git a/firmware/hw_layer/ports/stm32/interrupt_priority.h b/firmware/hw_layer/ports/stm32/interrupt_priority.h
+index 60d967dc02b..8ea70662340 100644
+--- a/firmware/hw_layer/ports/stm32/interrupt_priority.h
++++ b/firmware/hw_layer/ports/stm32/interrupt_priority.h
+@@ -28,7 +28,14 @@
+ #define EFI_IRQ_SCHEDULING_TIMER_PRIORITY 4
+ 
+ // Relatively high priority for ADC - needed for MAP sensor sampling
++// ADCv2 shares its error IRQ between all ADCs. When ADC3 also serves slow inputs
++// (EFI_ADC3_SLOW) and can be preempted by a knock window, keep all ADC state
++// transitions at the scheduler priority (same rule as the AT32 port).
++#if EFI_ADC3_SLOW
++#define EFI_IRQ_ADC_PRIORITY EFI_IRQ_SCHEDULING_TIMER_PRIORITY
++#else
+ #define EFI_IRQ_ADC_PRIORITY 5
++#endif
+ 
+ // Hardware UART serial
+ #define EFI_IRQ_UART_PRIORITY 6
+-- 
+2.39.5 (Apple Git-154)
+

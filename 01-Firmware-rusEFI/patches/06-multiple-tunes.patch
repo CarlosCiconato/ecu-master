@@ -1,0 +1,746 @@
+From ce95d3d63248a16473a03d3cf86b25d6e851ad0b Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 19:19:58 +0000
+Subject: [PATCH] Three tunes switched by a button or by the app
+ (pro-style ajustes)
+
+Tune 1 is the main tables. Tunes 2 and 3 (config->extraTunes) each have their own
+injection time (ms), VE, ignition, target lambda and boost tables on the main axes.
+A button cycles through tuneCount tunes and writing activeTune picks one, also with the
+engine running. A tune with an empty fuel or lambda table is never selected.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ firmware/console/binary/output_channels.txt   |   2 +-
+ .../controllers/actuators/boost_control.cpp   |   8 +-
+ .../controllers/actuators/boost_control.h     |   2 +
+ firmware/controllers/algo/engine.h            |   2 +
+ .../controllers/algo/fuel/fuel_computer.cpp   |   2 +-
+ firmware/controllers/algo/fuel_math.cpp       |   2 +-
+ .../algo/ignition/ignition_state.cpp          |   2 +-
+ firmware/controllers/long_term_fuel_trim.cpp  |  10 +-
+ firmware/controllers/math/speed_density.cpp   |   2 +-
+ firmware/controllers/modules/modules.mk       |   1 +
+ .../modules/tune_selector/tune_selector.cpp   | 130 +++++++++++++++
+ .../modules/tune_selector/tune_selector.h     |  49 ++++++
+ .../modules/tune_selector/tune_selector.mk    |   3 +
+ firmware/integration/rusefi_config.txt        |  17 ++
+ firmware/tunerstudio/top_level_menu.ini       |  16 ++
+ firmware/tunerstudio/tunerstudio.template.ini |  90 ++++++++++
+ .../tests/controllers/test_tune_selector.cpp  | 154 ++++++++++++++++++
+ unit_tests/tests/tests.mk                     |   1 +
+ 18 files changed, 483 insertions(+), 10 deletions(-)
+ create mode 100644 firmware/controllers/modules/tune_selector/tune_selector.cpp
+ create mode 100644 firmware/controllers/modules/tune_selector/tune_selector.h
+ create mode 100644 firmware/controllers/modules/tune_selector/tune_selector.mk
+ create mode 100644 unit_tests/tests/controllers/test_tune_selector.cpp
+
+diff --git a/firmware/console/binary/output_channels.txt b/firmware/console/binary/output_channels.txt
+index 7b6cfe0..e33954a 100644
+--- a/firmware/console/binary/output_channels.txt
++++ b/firmware/console/binary/output_channels.txt
+@@ -505,5 +505,5 @@ float mapFast
+ 	uint8_t alertActiveMask;Alerts: active now;"", 1, 0, 0, 255, 0
+ 	uint8_t alertLatchedMask;Alerts: tripped since start;"", 1, 0, 0, 255, 0
+ 	uint8_t alertLevel;Alerts: level (0-3);"", 1, 0, 0, 3, 0
+-	uint8_t alertUnused;;"", 1, 0, 0, 0, 0
++	uint8_t tuneInUse;Tune: in use;"", 1, 0, 0, 3, 0
+ end_struct
+diff --git a/firmware/controllers/actuators/boost_control.cpp b/firmware/controllers/actuators/boost_control.cpp
+index 5095c5f..571c481 100644
+--- a/firmware/controllers/actuators/boost_control.cpp
++++ b/firmware/controllers/actuators/boost_control.cpp
+@@ -338,6 +338,11 @@ void startBoostPin() {
+ #endif /* EFI_UNIT_TEST */
+ }
+ 
++void updateBoostTablesForTune() {
++	boostMapOpen.initTable(getActiveBoostOpenLoopTable(), config->boostRpmBins, config->boostOpenLoopLoadBins);
++	boostMapClosed.initTable(getActiveBoostClosedLoopTable(), config->boostRpmBins, config->boostClosedLoopLoadBins);
++}
++
+ void initBoostCtrl() {
+ #if EFI_PROD_CODE
+ 	if (engine->module<BoostController>().unmock().hasInitBoost) {
+@@ -363,8 +368,7 @@ void initBoostCtrl() {
+ #endif
+ 
+ 	// Set up open & closed loop tables
+-	boostMapOpen.initTable(config->boostTableOpenLoop, config->boostRpmBins, config->boostOpenLoopLoadBins);
+-	boostMapClosed.initTable(config->boostTableClosedLoop, config->boostRpmBins, config->boostClosedLoopLoadBins);
++	updateBoostTablesForTune();
+ 	boostCltCorr.initTable(config->cltBoostCorr, config->cltBoostCorrBins);
+ 	boostIatCorr.initTable(config->iatBoostCorr, config->iatBoostCorrBins);
+ 	boostCltAdder.initTable(config->cltBoostAdder, config->cltBoostAdderBins);
+diff --git a/firmware/controllers/actuators/boost_control.h b/firmware/controllers/actuators/boost_control.h
+index a637d26..b342bd6 100644
+--- a/firmware/controllers/actuators/boost_control.h
++++ b/firmware/controllers/actuators/boost_control.h
+@@ -67,4 +67,6 @@ private:
+ 
+ void startBoostPin();
+ void initBoostCtrl();
++// Points the open and closed loop maps to the tables of the tune in use, see TuneSelector
++void updateBoostTablesForTune();
+ void setDefaultBoostParameters();
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index 0483789..ba97f59 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -34,6 +34,7 @@
+ #include "launch_control.h"
+ #include "rolling_launch.h"
+ #include "alert_manager.h"
++#include "tune_selector.h"
+ #include "shift_torque_reduction_controller.h"
+ #include "nitrous_controller.h"
+ #include "antilag_system.h"
+@@ -199,6 +200,7 @@ public:
+ #endif // EFI_BOOST_CONTROL
+         TpsAccelEnrichment,
+         AlertManager,
++        TuneSelector,
+ #if EFI_LAUNCH_CONTROL
+ #if EFI_ENGINE_CONTROL
+         NitrousController,
+diff --git a/firmware/controllers/algo/fuel/fuel_computer.cpp b/firmware/controllers/algo/fuel/fuel_computer.cpp
+index 06ea408..b0d7d8c 100644
+--- a/firmware/controllers/algo/fuel/fuel_computer.cpp
++++ b/firmware/controllers/algo/fuel/fuel_computer.cpp
+@@ -73,7 +73,7 @@ float FuelComputer::getStoichiometricRatio() const {
+ 
+ float FuelComputer::getTargetLambda(float rpm, float load) const {
+ 	float target = interpolate3d(
+-		config->lambdaTable,
++		getActiveLambdaTable(),
+ 		config->lambdaLoadBins, load,
+ 		config->lambdaRpmBins, rpm
+ 	);
+diff --git a/firmware/controllers/algo/fuel_math.cpp b/firmware/controllers/algo/fuel_math.cpp
+index a2df5b2..a391d6d 100644
+--- a/firmware/controllers/algo/fuel_math.cpp
++++ b/firmware/controllers/algo/fuel_math.cpp
+@@ -223,7 +223,7 @@ float getInjectionTimeTableLoad() {
+ 
+ mass_t getInjectionTimeTableFuelMass(float rpm) {
+ 	floatms_t pulseMs = interpolate3d(
+-		config->injTimeTable,
++		getActiveInjTimeTable(),
+ 		config->injTimeLoadBins, getInjectionTimeTableLoad(),
+ 		config->injTimeRpmBins, rpm
+ 	);
+diff --git a/firmware/controllers/algo/ignition/ignition_state.cpp b/firmware/controllers/algo/ignition/ignition_state.cpp
+index e4f7b17..07bd730 100644
+--- a/firmware/controllers/algo/ignition/ignition_state.cpp
++++ b/firmware/controllers/algo/ignition/ignition_state.cpp
+@@ -421,7 +421,7 @@ angle_t IgnitionState::getSparkHardwareLatencyCorrection(){
+ 
+ angle_t IgnitionState::getInterpolatedIgnitionAngle(const float rpm, const float ignitionLoad) {
+ 	return interpolate3d(
+-		config->ignitionTable,
++		getActiveIgnitionTable(),
+ 		config->ignitionLoadBins, ignitionLoad,
+ 		config->ignitionRpmBins, rpm
+ 	);
+diff --git a/firmware/controllers/long_term_fuel_trim.cpp b/firmware/controllers/long_term_fuel_trim.cpp
+index f3ab189..c931085 100644
+--- a/firmware/controllers/long_term_fuel_trim.cpp
++++ b/firmware/controllers/long_term_fuel_trim.cpp
+@@ -97,6 +97,10 @@ void LtftState::applyToVe() {
+ 	// the same way the trims are applied at runtime
+ 	floatms_t deadtime = isInjectionTimeFueling() ? getInjectionTimeReferenceDeadtime() : 0;
+ 
++	// Trims go to the main fuel table of the tune in use
++	auto& injTimeTable = getActiveInjTimeTable();
++	auto& veTable = getActiveVeTable();
++
+ 	for (size_t loadIndex = 0; loadIndex < VE_LOAD_COUNT; loadIndex++) {
+ 		for (size_t rpmIndex = 0; rpmIndex < VE_RPM_COUNT; rpmIndex++) {
+ 			float k = 0;
+@@ -108,14 +112,14 @@ void LtftState::applyToVe() {
+ 			k = k / FT_BANK_COUNT;
+ 
+ 			if (isInjectionTimeFueling()) {
+-				float pulseMs = config->injTimeTable[loadIndex][rpmIndex];
++				float pulseMs = injTimeTable[loadIndex][rpmIndex];
+ 				if (pulseMs > deadtime) {
+-					config->injTimeTable[loadIndex][rpmIndex] = deadtime + (pulseMs - deadtime) * k;
++					injTimeTable[loadIndex][rpmIndex] = deadtime + (pulseMs - deadtime) * k;
+ 				}
+ 				continue;
+ 			}
+ 
+-			config->veTable[loadIndex][rpmIndex] = config->veTable[loadIndex][rpmIndex] * k;
++			veTable[loadIndex][rpmIndex] = veTable[loadIndex][rpmIndex] * k;
+ 		}
+ 	}
+ }
+diff --git a/firmware/controllers/math/speed_density.cpp b/firmware/controllers/math/speed_density.cpp
+index 46c9a72..5756902 100644
+--- a/firmware/controllers/math/speed_density.cpp
++++ b/firmware/controllers/math/speed_density.cpp
+@@ -107,5 +107,5 @@ temperature_t IFuelComputer::getTCharge(float rpm, float tps) {
+ }
+ 
+ void initSpeedDensity() {
+-	veMap.initTable(config->veTable, config->veRpmBins, config->veLoadBins);
++	veMap.initTable(getActiveVeTable(), config->veRpmBins, config->veLoadBins);
+ }
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index e74a6fd..8ed7182 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -20,6 +20,7 @@ include $(PROJECT_DIR)/controllers/modules/fuel_pump/fuel_pump.mk
+ include $(PROJECT_DIR)/controllers/modules/gear_detector/gear_detector.mk
+ include $(PROJECT_DIR)/controllers/modules/rolling_launch/rolling_launch.mk
+ include $(PROJECT_DIR)/controllers/modules/alerts/alerts.mk
++include $(PROJECT_DIR)/controllers/modules/tune_selector/tune_selector.mk
+ include $(PROJECT_DIR)/controllers/modules/burst_knock/burst_knock.mk
+ include $(PROJECT_DIR)/controllers/modules/engine_state_machine/engine_state_machine.mk
+ include $(PROJECT_DIR)/controllers/modules/wot_enrichment/wot_enrichment.mk
+diff --git a/firmware/controllers/modules/tune_selector/tune_selector.cpp b/firmware/controllers/modules/tune_selector/tune_selector.cpp
+new file mode 100644
+index 0000000..0f2c7c0
+--- /dev/null
++++ b/firmware/controllers/modules/tune_selector/tune_selector.cpp
+@@ -0,0 +1,130 @@
++#include "pch.h"
++
++#include "tune_selector.h"
++#include "speed_density.h"
++#include "boost_control.h"
++
++static_assert(std::is_same_v<decltype(tune_set_s::injTimeTable), inj_time_table_t>);
++static_assert(std::is_same_v<decltype(tune_set_s::veTable), ve_table_t>);
++static_assert(std::is_same_v<decltype(tune_set_s::ignitionTable), ignition_table_t>);
++static_assert(std::is_same_v<decltype(tune_set_s::lambdaTable), lambda_table_t>);
++static_assert(std::is_same_v<decltype(tune_set_s::boostTableOpenLoop), boost_open_table_t>);
++static_assert(std::is_same_v<decltype(tune_set_s::boostTableClosedLoop), boost_closed_table_t>);
++
++static tune_set_s* getExtraTune(uint8_t tune) {
++	if (tune < 2 || tune - 2 >= EXTRA_TUNE_COUNT) {
++		return nullptr;
++	}
++	return &config->extraTunes[tune - 2];
++}
++
++static tune_set_s* getActiveExtraTune() {
++	return getExtraTune(engine->module<TuneSelector>()->getActiveTune());
++}
++
++inj_time_table_t& getActiveInjTimeTable() {
++	auto tune = getActiveExtraTune();
++	return tune ? tune->injTimeTable : config->injTimeTable;
++}
++
++ve_table_t& getActiveVeTable() {
++	auto tune = getActiveExtraTune();
++	return tune ? tune->veTable : config->veTable;
++}
++
++ignition_table_t& getActiveIgnitionTable() {
++	auto tune = getActiveExtraTune();
++	return tune ? tune->ignitionTable : config->ignitionTable;
++}
++
++lambda_table_t& getActiveLambdaTable() {
++	auto tune = getActiveExtraTune();
++	return tune ? tune->lambdaTable : config->lambdaTable;
++}
++
++boost_open_table_t& getActiveBoostOpenLoopTable() {
++	auto tune = getActiveExtraTune();
++	return tune ? tune->boostTableOpenLoop : config->boostTableOpenLoop;
++}
++
++boost_closed_table_t& getActiveBoostClosedLoopTable() {
++	auto tune = getActiveExtraTune();
++	return tune ? tune->boostTableClosedLoop : config->boostTableClosedLoop;
++}
++
++template<typename TTable>
++static bool isEmptyTable(const TTable& table) {
++	for (const auto& row : table) {
++		for (const auto& cell : row) {
++			if ((float)cell != 0) {
++				return false;
++			}
++		}
++	}
++	return true;
++}
++
++bool TuneSelector::isTuneUsable(uint8_t tune) const {
++	if (tune == 1) {
++		return true;
++	}
++	auto set = getExtraTune(tune);
++	if (!set) {
++		return false;
++	}
++
++	bool fuelEmpty = engineConfiguration->fuelAlgorithm == engine_load_mode_e::LM_INJ_TIME
++		? isEmptyTable(set->injTimeTable)
++		: isEmptyTable(set->veTable);
++	return !fuelEmpty && !isEmptyTable(set->lambdaTable);
++}
++
++uint8_t TuneSelector::getTuneCount() const {
++	return std::clamp<int>(engineConfiguration->tuneCount, 1, 1 + EXTRA_TUNE_COUNT);
++}
++
++void TuneSelector::selectTune(uint8_t tune) {
++	if (isTuneUsable(tune)) {
++		m_activeTune = tune;
++	}
++}
++
++void TuneSelector::update(bool buttonPressed) {
++	uint8_t count = getTuneCount();
++
++	// The app (or TunerStudio) picks a tune by writing activeTune
++	uint8_t configTune = std::clamp<int>(engineConfiguration->activeTune, 1, count);
++	if (configTune != m_lastConfigTune) {
++		m_lastConfigTune = configTune;
++		selectTune(configTune);
++	} else if (buttonPressed && !m_wasPressed) {
++		// Next usable tune, skipping empty ones
++		uint8_t tune = m_activeTune;
++		for (uint8_t i = 0; i < count; i++) {
++			tune = tune % count + 1;
++			if (isTuneUsable(tune)) {
++				m_activeTune = tune;
++				break;
++			}
++		}
++	}
++	m_wasPressed = buttonPressed;
++
++	if (m_activeTune > count || !isTuneUsable(m_activeTune)) {
++		m_activeTune = 1;
++	}
++
++	// Point the VE and boost maps to the tables of the tune in use
++	initSpeedDensity();
++#if EFI_BOOST_CONTROL
++	updateBoostTablesForTune();
++#endif // EFI_BOOST_CONTROL
++
++	engine->outputChannels.tuneInUse = m_activeTune;
++}
++
++void TuneSelector::onSlowCallback() {
++	bool pressed = isBrainPinValid(engineConfiguration->tuneSwitchPin)
++		&& efiReadPin(engineConfiguration->tuneSwitchPin, engineConfiguration->tuneSwitchPinMode);
++	update(pressed);
++}
+diff --git a/firmware/controllers/modules/tune_selector/tune_selector.h b/firmware/controllers/modules/tune_selector/tune_selector.h
+new file mode 100644
+index 0000000..83a9c72
+--- /dev/null
++++ b/firmware/controllers/modules/tune_selector/tune_selector.h
+@@ -0,0 +1,49 @@
++/*
++ * @file tune_selector.h
++ *
++ * pro-style tunes ("ajustes"): tune 1 is the main tables, tunes 2 and 3 are
++ * config->extraTunes, each with its own main fuel (ms or VE), ignition, lambda and boost
++ * tables on the main tables axes. A button cycles through the tunes, and the app can pick
++ * one by writing activeTune, also with the engine running.
++ */
++
++#pragma once
++
++using inj_time_table_t = decltype(persistent_config_s::injTimeTable);
++using ve_table_t = decltype(persistent_config_s::veTable);
++using ignition_table_t = decltype(persistent_config_s::ignitionTable);
++using lambda_table_t = decltype(persistent_config_s::lambdaTable);
++using boost_open_table_t = decltype(persistent_config_s::boostTableOpenLoop);
++using boost_closed_table_t = decltype(persistent_config_s::boostTableClosedLoop);
++
++class TuneSelector : public EngineModule {
++public:
++	using interface_t = TuneSelector;
++
++	void onSlowCallback() override;
++
++	void update(bool buttonPressed);
++
++	// 1 is the main tables, 2 and 3 are config->extraTunes
++	uint8_t getActiveTune() const {
++		return m_activeTune;
++	}
++	// A tune with an empty main fuel table or lambda table is never selected
++	bool isTuneUsable(uint8_t tune) const;
++
++private:
++	uint8_t getTuneCount() const;
++	void selectTune(uint8_t tune);
++
++	uint8_t m_activeTune = 1;
++	uint8_t m_lastConfigTune = 0;
++	bool m_wasPressed = false;
++};
++
++// Tables of the tune in use
++inj_time_table_t& getActiveInjTimeTable();
++ve_table_t& getActiveVeTable();
++ignition_table_t& getActiveIgnitionTable();
++lambda_table_t& getActiveLambdaTable();
++boost_open_table_t& getActiveBoostOpenLoopTable();
++boost_closed_table_t& getActiveBoostClosedLoopTable();
+diff --git a/firmware/controllers/modules/tune_selector/tune_selector.mk b/firmware/controllers/modules/tune_selector/tune_selector.mk
+new file mode 100644
+index 0000000..37ee900
+--- /dev/null
++++ b/firmware/controllers/modules/tune_selector/tune_selector.mk
+@@ -0,0 +1,3 @@
++# pro-style tunes ("ajustes") switched by a button or by the app
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/tune_selector
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/tune_selector/tune_selector.cpp
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 131e1f2..7aac380 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -1982,6 +1982,10 @@ end_struct
+ 	output_pin_e alertOutputPin;Alert lamp or buzzer. Turns on when any alert trips and stays on until the next engine start.
+ 	pin_output_mode_e alertOutputPinMode;
+ 	uint16_t alertSafeModeRpm;RPM limit (fuel cut) while an alert with the Safe mode action is tripped.;"RPM", 1, 0, 0, 15000, 0
++	switch_input_pin_e tuneSwitchPin;Button that switches to the next tune (1, 2, 3, then back to 1), also with the engine running.
++	pin_input_mode_e tuneSwitchPinMode;
++	uint8_t tuneCount;How many tunes the tune button cycles through. 1 means tune switching is off.;"", 1, 0, 1, 3, 0
++	uint8_t activeTune;Tune in use at start-up. Changing it switches right away, also with the engine running.;"", 1, 0, 1, 3, 0
+ 
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+@@ -2640,6 +2644,19 @@ int16_t[ETB_SPEED_CURVE_SIZE] etbSpeedCltBins;;"C", 1, 0, -40, 150, 0
+ uint16_t[ETB_SPEED_CURVE_SIZE] etbOpenSpeed;Maximum throttle opening speed. 0 means no limit.;"%/s", 1, 0, 0, 5000, 0
+ uint16_t[ETB_SPEED_CURVE_SIZE] etbCloseSpeed;Maximum throttle closing speed. 0 means no limit.;"%/s", 1, 0, 0, 5000, 0
+ 
++! Extra tunes (pro-style "ajustes"), see tuneSwitchPin and activeTune. Tune 1 is the main tables.
++! Each extra tune has its own main fuel, ignition, lambda and boost tables, on the main tables axes.
++#define EXTRA_TUNE_COUNT 2
++struct tune_set_s
++	uint16_t[INJ_TIME_LOAD_COUNT x INJ_TIME_RPM_COUNT] autoscale injTimeTable;;"ms", 0.001, 0, 0, 65, 3
++	uint16_t[VE_LOAD_COUNT x VE_RPM_COUNT] autoscale veTable;;"%", 0.1, 0, 0, 999, 1
++	int16_t[IGN_LOAD_COUNT x IGN_RPM_COUNT] autoscale ignitionTable;;"deg", 0.1, 0, -20, 90, 1
++	uint8_t[FUEL_LOAD_COUNT x FUEL_RPM_COUNT] autoscale lambdaTable;{useLambdaOnInterface ? "lambda" : "afr"}, { useLambdaOnInterface ? 1/@@PACK_MULT_LAMBDA_CFG@@ : 1/@@PACK_MULT_AFR_CFG@@ }, 0, {useLambdaOnInterface ? 0.6 : 0}, {useLambdaOnInterface ? 1.5 : 25}, {useLambdaOnInterface ? 2 : 1}
++	uint8_t[BOOST_LOAD_COUNT x BOOST_RPM_COUNT] autoscale boostTableOpenLoop;;"", {1/2}, 0, 0, 100, 1
++	uint8_t[BOOST_LOAD_COUNT x BOOST_RPM_COUNT] autoscale boostTableClosedLoop;;"", 2, 0, 0, 510, 0
++end_struct
++tune_set_s[EXTRA_TUNE_COUNT iterate] extraTunes;
++
+ ! Generic cam decoder, used by cams with vvtMode "Generic window"
+ int16_t[CAM_INPUTS_COUNT iterate] camSyncWindowStart;Start of the window where the sync tooth must show up, in crank degrees (0 to 360) as shown by "Primary Position". Teeth outside the window are ignored for sync.;"deg", 1, 0, 0, 360, 0
+ uint8_t[CAM_INPUTS_COUNT iterate] camSyncWindowWidth;Width of the detection window. This is the tolerance for the sync tooth position.;"deg", 1, 0, 1, 180, 0
+diff --git a/firmware/tunerstudio/top_level_menu.ini b/firmware/tunerstudio/top_level_menu.ini
+index 7e5e9ac..6acf115 100644
+--- a/firmware/tunerstudio/top_level_menu.ini
++++ b/firmware/tunerstudio/top_level_menu.ini
+@@ -195,6 +195,22 @@
+ 			groupChildMenu = boostClosedBlend1Cfg, "Closed Loop Blend 1", { isBoostControlEnabled && boostType == 1 }
+ 			groupChildMenu = boostClosedBlend2Cfg, "Closed Loop Blend 2", { isBoostControlEnabled && boostType == 1 }
+ 
++		subMenu = std_separator
++		groupMenu = "Tunes"
++			groupChildMenu = tuneSettings, "Tunes and tune button"
++			groupChildMenu = tune2InjTimeTbl, "Tune 2: Injection time (ms)", { tuneCount >= 2 && fuelAlgorithm == @@engine_load_mode_e_LM_INJ_TIME@@ }
++			groupChildMenu = tune2VeTbl, "Tune 2: VE", { tuneCount >= 2 && fuelAlgorithm != @@engine_load_mode_e_LM_INJ_TIME@@ }
++			groupChildMenu = tune2IgnitionTbl, "Tune 2: Ignition advance", { tuneCount >= 2 }
++			groupChildMenu = tune2LambdaTbl, "Tune 2: Target lambda / AFR", { tuneCount >= 2 }
++			groupChildMenu = tune2BoostOpenTbl, "Tune 2: Boost duty (open loop)", { tuneCount >= 2 && isBoostControlEnabled }
++			groupChildMenu = tune2BoostClosedTbl, "Tune 2: Boost target (closed loop)", { tuneCount >= 2 && isBoostControlEnabled && boostType == 1 }
++			groupChildMenu = tune3InjTimeTbl, "Tune 3: Injection time (ms)", { tuneCount >= 3 && fuelAlgorithm == @@engine_load_mode_e_LM_INJ_TIME@@ }
++			groupChildMenu = tune3VeTbl, "Tune 3: VE", { tuneCount >= 3 && fuelAlgorithm != @@engine_load_mode_e_LM_INJ_TIME@@ }
++			groupChildMenu = tune3IgnitionTbl, "Tune 3: Ignition advance", { tuneCount >= 3 }
++			groupChildMenu = tune3LambdaTbl, "Tune 3: Target lambda / AFR", { tuneCount >= 3 }
++			groupChildMenu = tune3BoostOpenTbl, "Tune 3: Boost duty (open loop)", { tuneCount >= 3 && isBoostControlEnabled }
++			groupChildMenu = tune3BoostClosedTbl, "Tune 3: Boost target (closed loop)", { tuneCount >= 3 && isBoostControlEnabled && boostType == 1 }
++
+ 		subMenu = std_separator
+ 		groupMenu = "Alerts"
+ 			groupChildMenu = alertSettings, "Alert output and safe mode"
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 2d6981c..4935c44 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -1642,6 +1642,88 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 		gridOrient	= 250,	0, 340
+ 		upDownLabel	= "(RICHER)", "(LEANER)"
+ 
++	table = tune2InjTimeTbl, tune2InjTimeMap, "Tune 2: Injection time (ms)", 1
++		xyLabels	= "RPM", {injTimeUseTps ? "TPS" : "MAP"}
++		xBins		= injTimeRpmBins, RPMValue
++		yBins		= injTimeLoadBins, injTimeTableYAxis
++		zBins		= extraTunes1_injTimeTable
++		gridOrient	= 250,	0, 340
++		upDownLabel	= "(RICHER)", "(LEANER)"
++
++	table = tune2VeTbl, tune2VeMap, "Tune 2: VE", 1
++		xyLabels	= "RPM", {bitStringValue(veAxisLabels, veLoadSrc)}
++		xBins		= veRpmBins,  RPMValue
++		yBins		= veLoadBins, veTableYAxisDisplay
++		zBins		= extraTunes1_veTable
++		gridOrient	= 250,	0, 340
++		upDownLabel	= "(RICHER)", "(LEANER)"
++
++	table = tune2IgnitionTbl, tune2IgnitionMap, "Tune 2: Ignition advance", 1
++		xyLabels = "RPM", {bitStringValue(ignAxisLabels, ignLoadSrc)}
++		xBins		= ignitionRpmBins,  rpmForIgnitionTableDot
++		yBins		= ignitionLoadBins,  loadForIgnitionTableDotDisplay
++		zBins		= extraTunes1_ignitionTable
++		gridOrient  = 250,	0, 340
++
++	table = tune2LambdaTbl, tune2LambdaMap, "Tune 2: Target lambda / AFR", 1
++		xyLabels	= "RPM", {bitStringValue(targetAfrAxisLabels, afrLoadSrc)}
++		xBins		= lambdaRpmBins,  RPMValue
++		yBins		= lambdaLoadBins, afrTableYAxisDisplay
++		zBins		= extraTunes1_lambdaTable
++		gridOrient  = 250,	0, 340
++
++	table = tune2BoostOpenTbl, tune2BoostOpenMap, "Tune 2: Boost duty (open loop)", 1
++		xyLabels	= "RPMValue", {bitStringValue(pwmAxisLabels, boostOpenLoopYAxis)}
++		xBins		= boostRpmBins,  RPMValue
++		yBins		= boostOpenLoopLoadBins,  openLoopYAxis
++		zBins		= extraTunes1_boostTableOpenLoop
++
++	table = tune2BoostClosedTbl, tune2BoostClosedMap, "Tune 2: Boost target (closed loop)", 1
++		xBins		= boostRpmBins,  RPMValue
++		yBins		= boostClosedLoopLoadBins,  TPSValue
++		zBins		= extraTunes1_boostTableClosedLoop
++
++	table = tune3InjTimeTbl, tune3InjTimeMap, "Tune 3: Injection time (ms)", 1
++		xyLabels	= "RPM", {injTimeUseTps ? "TPS" : "MAP"}
++		xBins		= injTimeRpmBins, RPMValue
++		yBins		= injTimeLoadBins, injTimeTableYAxis
++		zBins		= extraTunes2_injTimeTable
++		gridOrient	= 250,	0, 340
++		upDownLabel	= "(RICHER)", "(LEANER)"
++
++	table = tune3VeTbl, tune3VeMap, "Tune 3: VE", 1
++		xyLabels	= "RPM", {bitStringValue(veAxisLabels, veLoadSrc)}
++		xBins		= veRpmBins,  RPMValue
++		yBins		= veLoadBins, veTableYAxisDisplay
++		zBins		= extraTunes2_veTable
++		gridOrient	= 250,	0, 340
++		upDownLabel	= "(RICHER)", "(LEANER)"
++
++	table = tune3IgnitionTbl, tune3IgnitionMap, "Tune 3: Ignition advance", 1
++		xyLabels = "RPM", {bitStringValue(ignAxisLabels, ignLoadSrc)}
++		xBins		= ignitionRpmBins,  rpmForIgnitionTableDot
++		yBins		= ignitionLoadBins,  loadForIgnitionTableDotDisplay
++		zBins		= extraTunes2_ignitionTable
++		gridOrient  = 250,	0, 340
++
++	table = tune3LambdaTbl, tune3LambdaMap, "Tune 3: Target lambda / AFR", 1
++		xyLabels	= "RPM", {bitStringValue(targetAfrAxisLabels, afrLoadSrc)}
++		xBins		= lambdaRpmBins,  RPMValue
++		yBins		= lambdaLoadBins, afrTableYAxisDisplay
++		zBins		= extraTunes2_lambdaTable
++		gridOrient  = 250,	0, 340
++
++	table = tune3BoostOpenTbl, tune3BoostOpenMap, "Tune 3: Boost duty (open loop)", 1
++		xyLabels	= "RPMValue", {bitStringValue(pwmAxisLabels, boostOpenLoopYAxis)}
++		xBins		= boostRpmBins,  RPMValue
++		yBins		= boostOpenLoopLoadBins,  openLoopYAxis
++		zBins		= extraTunes2_boostTableOpenLoop
++
++	table = tune3BoostClosedTbl, tune3BoostClosedMap, "Tune 3: Boost target (closed loop)", 1
++		xBins		= boostRpmBins,  RPMValue
++		yBins		= boostClosedLoopLoadBins,  TPSValue
++		zBins		= extraTunes2_boostTableClosedLoop
++
+ 	table = idleVeTableTbl, idleVeTable, "Idle VE"
+ 		xyLabels = "RPM", "load"
+ 		xBins		= idleVeRpmBins,  RPMValue
+@@ -4951,6 +5033,14 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "Sustained injector duty cycle limit",	maxInjectorDutySustained, {isInjectionEnabled}
+ 		field = "Sustained injector duty cycle delay",	maxInjectorDutySustainedTimeout, {isInjectionEnabled}
+ 
++	dialog = tuneSettings, "Tunes"
++		field = "Tune 1 is the main tables. Tunes 2 and 3 have their own fuel, ignition, lambda and boost tables, on the same axes."
++		field = "A tune with an empty fuel or lambda table is skipped. Copy tune 1 into it first."
++		field = "Number of tunes",					tuneCount
++		field = "Tune in use at start-up",			activeTune
++		field = "Tune button",						tuneSwitchPin, { tuneCount > 1 }
++		field = "Tune button mode",					tuneSwitchPinMode, { tuneCount > 1 && tuneSwitchPin != 0 }
++
+ 	dialog = alertSettings, "Alerts"
+ 		field = "Each alert watches one sensor. When it stays past its limit for the delay, the action runs and the alert output stays on until the next start."
+ 		field = "Alert output",						alertOutputPin
+diff --git a/unit_tests/tests/controllers/test_tune_selector.cpp b/unit_tests/tests/controllers/test_tune_selector.cpp
+new file mode 100644
+index 0000000..6157a26
+--- /dev/null
++++ b/unit_tests/tests/controllers/test_tune_selector.cpp
+@@ -0,0 +1,154 @@
++#include "pch.h"
++
++#include "tune_selector.h"
++#include "fuel_math.h"
++
++extern ve_Map3D_t veMap;
++
++// pro-style tunes: tune 1 is the main tables, tunes 2 and 3 are config->extraTunes,
++// switched by a button or by writing activeTune, also with the engine running.
++
++class TuneSelectorTest : public testing::Test {
++protected:
++	EngineTestHelper eth{engine_type_e::TEST_ENGINE};
++
++	TuneSelector& tunes() {
++		return engine->module<TuneSelector>().unmock();
++	}
++
++	void press() {
++		tunes().update(true);
++		tunes().update(false);
++	}
++
++	void fillTune(size_t index, float ve, float ignition, float lambda) {
++		auto& tune = config->extraTunes[index];
++		setTable(tune.veTable, ve);
++		setTable(tune.injTimeTable, 0);
++		setTable(tune.ignitionTable, ignition);
++		setTable(tune.lambdaTable, lambda);
++	}
++
++	void SetUp() override {
++		setTable(config->veTable, 80);
++		setTable(config->ignitionTable, 10);
++		setTable(config->lambdaTable, 1.0f);
++		engineConfiguration->tuneCount = 3;
++		engineConfiguration->activeTune = 1;
++		fillTune(0, 60, 20, 0.9f);
++		fillTune(1, 40, 30, 0.8f);
++		tunes().update(false);
++	}
++};
++
++TEST_F(TuneSelectorTest, StartsOnMainTables) {
++	EXPECT_EQ(1, tunes().getActiveTune());
++	EXPECT_EQ(&config->veTable, &getActiveVeTable());
++	EXPECT_EQ(&config->ignitionTable, &getActiveIgnitionTable());
++	EXPECT_EQ(&config->lambdaTable, &getActiveLambdaTable());
++	EXPECT_EQ(&config->injTimeTable, &getActiveInjTimeTable());
++	EXPECT_EQ(1, engine->outputChannels.tuneInUse);
++}
++
++TEST_F(TuneSelectorTest, ButtonCyclesThroughTunes) {
++	press();
++	EXPECT_EQ(2, tunes().getActiveTune());
++	EXPECT_EQ(&config->extraTunes[0].veTable, &getActiveVeTable());
++	EXPECT_EQ(&config->extraTunes[0].boostTableOpenLoop, &getActiveBoostOpenLoopTable());
++	EXPECT_EQ(&config->extraTunes[0].boostTableClosedLoop, &getActiveBoostClosedLoopTable());
++
++	press();
++	EXPECT_EQ(3, tunes().getActiveTune());
++	EXPECT_EQ(&config->extraTunes[1].ignitionTable, &getActiveIgnitionTable());
++	EXPECT_EQ(3, engine->outputChannels.tuneInUse);
++
++	press();
++	EXPECT_EQ(1, tunes().getActiveTune());
++
++	// holding the button does not keep switching
++	tunes().update(true);
++	tunes().update(true);
++	tunes().update(true);
++	EXPECT_EQ(2, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, TuneCountLimitsTheButton) {
++	engineConfiguration->tuneCount = 2;
++	press();
++	EXPECT_EQ(2, tunes().getActiveTune());
++	press();
++	EXPECT_EQ(1, tunes().getActiveTune());
++
++	engineConfiguration->tuneCount = 1;
++	press();
++	EXPECT_EQ(1, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, EmptyTuneIsSkipped) {
++	// tune 2 has no lambda table, tune 3 has no VE table
++	setTable(config->extraTunes[0].lambdaTable, 0);
++	press();
++	EXPECT_EQ(3, tunes().getActiveTune());
++
++	setTable(config->extraTunes[1].veTable, 0);
++	tunes().update(false);
++	// the tune in use got emptied: back to the main tables
++	EXPECT_EQ(1, tunes().getActiveTune());
++	press();
++	EXPECT_EQ(1, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, EmptyMsTableIsSkippedInMsMode) {
++	engineConfiguration->fuelAlgorithm = engine_load_mode_e::LM_INJ_TIME;
++	// VE is filled but the ms table of tune 2 is empty
++	setTable(config->extraTunes[1].injTimeTable, 3.0f);
++	press();
++	EXPECT_EQ(3, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, AppSelectsTune) {
++	engineConfiguration->activeTune = 3;
++	tunes().update(false);
++	EXPECT_EQ(3, tunes().getActiveTune());
++
++	// the button still works from there
++	press();
++	EXPECT_EQ(1, tunes().getActiveTune());
++
++	// out of range is clamped to the number of tunes
++	engineConfiguration->tuneCount = 2;
++	engineConfiguration->activeTune = 3;
++	tunes().update(false);
++	EXPECT_EQ(2, tunes().getActiveTune());
++}
++
++TEST_F(TuneSelectorTest, TablesOfTheTuneAreUsed) {
++	float rpm = 3000;
++	float load = 50;
++	EXPECT_NEAR(80, veMap.getValue(rpm, load), 0.1);
++	EXPECT_NEAR(10, IgnitionState::getInterpolatedIgnitionAngle(rpm, load), 0.1);
++	EXPECT_NEAR(1.0, engine->fuelComputer.getTargetLambda(rpm, load), 0.01);
++
++	press();
++	EXPECT_NEAR(60, veMap.getValue(rpm, load), 0.1);
++	EXPECT_NEAR(20, IgnitionState::getInterpolatedIgnitionAngle(rpm, load), 0.1);
++	EXPECT_NEAR(0.9, engine->fuelComputer.getTargetLambda(rpm, load), 0.01);
++
++	press();
++	EXPECT_NEAR(40, veMap.getValue(rpm, load), 0.1);
++	EXPECT_NEAR(30, IgnitionState::getInterpolatedIgnitionAngle(rpm, load), 0.1);
++	EXPECT_NEAR(0.8, engine->fuelComputer.getTargetLambda(rpm, load), 0.01);
++}
++
++TEST_F(TuneSelectorTest, MsTableOfTheTuneIsUsed) {
++	engineConfiguration->fuelAlgorithm = engine_load_mode_e::LM_INJ_TIME;
++	setTable(config->injTimeTable, 4.0f);
++	setTable(config->extraTunes[0].injTimeTable, 6.0f);
++	tunes().update(false);
++
++	float mainMass = getInjectionTimeTableFuelMass(3000);
++	press();
++	EXPECT_EQ(2, tunes().getActiveTune());
++	float tune2Mass = getInjectionTimeTableFuelMass(3000);
++	EXPECT_GT(tune2Mass, mainMass);
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 3969b1c..166b9d8 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -269,6 +269,7 @@ TESTS_SRC_CPP = \
+ 	tests/controllers/test_long_term_fuel_trim.cpp \
+ 	tests/controllers/test_ltft_injection_time.cpp \
+ 	tests/controllers/test_alert_manager.cpp \
++	tests/controllers/test_tune_selector.cpp \
+ 	tests/ignition_injection/test_ignition_state.cpp \
+ 	tests/core/test_main_loop.cpp \
+ 	tests/test_trip_odometer.cpp \
+-- 
+2.43.0
+

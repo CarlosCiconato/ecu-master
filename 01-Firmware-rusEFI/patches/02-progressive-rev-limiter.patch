@@ -1,0 +1,232 @@
+From 97db28e0b4bf74d27b78f2f2d9be445aca89c57b Mon Sep 17 00:00:00 2001
+From: Carlos Ciconato <354919267+CarlosCiconato@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:06:55 +0000
+Subject: [PATCH] Progressive rev limiter (pro-style spark cut ramp)
+
+When enabled, spark cut ramps linearly from the start cut % to 100%
+inside a window below the RPM limit (constant or CLT based), through the
+hard spark limiter. The existing hard cut at the limit is unchanged.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ .../algo/defaults/default_base_engine.cpp     |  3 +
+ firmware/controllers/algo/engine2.cpp         |  1 +
+ firmware/controllers/limp_manager.cpp         | 15 ++++
+ firmware/controllers/limp_manager.h           |  3 +
+ firmware/integration/rusefi_config.txt        |  6 +-
+ firmware/tunerstudio/tunerstudio.template.ini |  3 +
+ .../tests/test_progressive_rev_limiter.cpp    | 77 +++++++++++++++++++
+ unit_tests/tests/tests.mk                     |  1 +
+ 8 files changed, 108 insertions(+), 1 deletion(-)
+ create mode 100644 unit_tests/tests/test_progressive_rev_limiter.cpp
+
+diff --git a/firmware/controllers/algo/defaults/default_base_engine.cpp b/firmware/controllers/algo/defaults/default_base_engine.cpp
+index 740c2f5..f432539 100644
+--- a/firmware/controllers/algo/defaults/default_base_engine.cpp
++++ b/firmware/controllers/algo/defaults/default_base_engine.cpp
+@@ -431,6 +431,9 @@ void setDefaultBaseEngine() {
+ 	// Limits and Fallbacks
+ 	engineConfiguration->rpmHardLimit = 7000;
+ 	engineConfiguration->rpmHardLimitHyst = 50;
++	// Progressive rev limiter is off by default
++	config->progressiveRevLimitWindow = 300;
++	config->progressiveRevLimitStartCut = 20;
+ 	engineConfiguration->cutFuelOnHardLimit = true;
+ 	engineConfiguration->cutSparkOnHardLimit = true;
+ 	engineConfiguration->etbRevLimitRange = 250;
+diff --git a/firmware/controllers/algo/engine2.cpp b/firmware/controllers/algo/engine2.cpp
+index d0d2529..6c332a2 100644
+--- a/firmware/controllers/algo/engine2.cpp
++++ b/firmware/controllers/algo/engine2.cpp
+@@ -39,6 +39,7 @@ void EngineState::updateSparkSkip() {
+ 			 */
+ 			engine->launchController.getSparkSkipRatio() + engine->shiftTorqueReductionController.getSparkSkipRatio()
+ 				+ engine->module<RollingLaunchControl>().unmock().getSparkSkipRatio()
++				+ getLimpManager()->getRevLimitSparkSkipRatio()
+ 		);
+ #endif // EFI_LAUNCH_CONTROL
+ }
+diff --git a/firmware/controllers/limp_manager.cpp b/firmware/controllers/limp_manager.cpp
+index 8b994cb..b23d5d1 100644
+--- a/firmware/controllers/limp_manager.cpp
++++ b/firmware/controllers/limp_manager.cpp
+@@ -77,6 +77,21 @@ void LimpManager::updateRevLimit(float rpm) {
+ 
+ 	percent_t fuelAdded = interpolateClamped(resumeRpm, 0, m_revLimit, engineConfiguration->rpmSoftLimitFuelAdded, rpm);
+ 	m_fuelCorrection = 1.0f + fuelAdded / 100;
++
++	// Progressive rev limiter: random spark cut ramps up inside the window below the limit
++	float windowStart = m_revLimit - config->progressiveRevLimitWindow;
++	if (engineConfiguration->progressiveRevLimitEnabled && rpm >= windowStart) {
++		float startRatio = config->progressiveRevLimitStartCut / 100.0f;
++		m_revLimitSparkSkipRatio = config->progressiveRevLimitWindow > 0
++			? interpolateClamped(windowStart, startRatio, m_revLimit, 1.0f, rpm)
++			: 1.0f;
++	} else {
++		m_revLimitSparkSkipRatio = 0;
++	}
++}
++
++float LimpManager::getRevLimitSparkSkipRatio() const {
++	return m_revLimitSparkSkipRatio;
+ }
+ 
+ bool LimpManager::shouldReportCutWarning(efitick_t nowNt) {
+diff --git a/firmware/controllers/limp_manager.h b/firmware/controllers/limp_manager.h
+index 26c6ee5..81e3a96 100644
+--- a/firmware/controllers/limp_manager.h
++++ b/firmware/controllers/limp_manager.h
+@@ -115,6 +115,8 @@ public:
+ 
+ 	void updateRevLimit(float rpm);
+ 	angle_t getLimitingTimingRetard() const;
++	// Spark skip ratio (0..1) from the progressive rev limiter
++	float getRevLimitSparkSkipRatio() const;
+ 	float getLimitingFuelCorrection() const;
+ 
+ 	// Other subsystems call these APIs to indicate a problem has occurred
+@@ -148,6 +150,7 @@ private:
+ 
+ 	angle_t m_timingRetard = 0;
+ 	float m_fuelCorrection = 1.0f;
++	float m_revLimitSparkSkipRatio = 0;
+ 
+ 	// todo: migrate to engineState->desiredRpmLimit to get this variable logged
+ 	float m_revLimit;
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index d3cc6bf..c53af54 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -1886,7 +1886,7 @@ uint8_t autoscale knockFuelTrim;Maximum Amount of Fuel trim when knock;"%", 1, 0
+ 	bit gearDetectionUseOutputShaftSpeed,"Output Shaft Speed","Main Vehicle Speed";Driveshaft reference for gear detection. Main Vehicle Speed uses wheel revolutions/km and final drive ratio. Output Shaft Speed reads shaft RPM directly and requires an OSS provider.
+ 	bit gearDetectionRpmSourceIsInputShaftSpeed,"Input Shaft Speed","Engine RPM";RPM source when Speed Source is Output Shaft Speed. Main Vehicle Speed retains automatic input-shaft selection when that sensor is registered.
+ 	bit injTimeUseTps,"TPS","MAP";Load axis of the Injection time (ms) table. MAP is in kPa, TPS in %.
+-	bit unusedBit_Fancy20
++	bit progressiveRevLimitEnabled;pro-style progressive rev limiter: spark cut ramps from the start cut % to 100% inside the window below the RPM limit.
+ 	bit unusedBit_Fancy21
+ 	bit transmissionSlipDetectionEnabled,"enabled","disabled";Compare the selected Slip RPM Source with expected RPM for the detected gear. Requires Speed Source = Output Shaft Speed, a valid gear and the minimum vehicle speed. Wheel-based references cannot identify transmission slip.
+ 	bit transmissionSlipRpmSourceIsInputShaftSpeed,"Input Shaft Speed","Engine RPM";Input Shaft Speed measures internal gearbox slip. Engine RPM also includes clutch or torque-converter slip. Accurate gear ratios are required.
+@@ -2606,6 +2606,10 @@ include_file controllers/modules/fuel_pump/fuel_pump_tables.txt
+ uint16_t[INJ_TIME_LOAD_COUNT x INJ_TIME_RPM_COUNT] autoscale injTimeTable;Injector pulse per cylinder per cycle at 14 V, deadtime included. All usual fuel corrections are applied on top.;"ms", 0.001, 0, 0, 65, 3
+ uint16_t[INJ_TIME_LOAD_COUNT] injTimeLoadBins;;{injTimeUseTps ? "%" : "kPa"}, 1, 0, 0, 1000, 0
+ uint16_t[INJ_TIME_RPM_COUNT] injTimeRpmBins;;"RPM", 1, 0, 0, 18000, 0
++
++! Progressive rev limiter, see progressiveRevLimitEnabled
++uint16_t progressiveRevLimitWindow;RPM below the rev limit where the progressive spark cut starts.;"RPM", 1, 0, 0, 3000, 0
++uint8_t progressiveRevLimitStartCut;Spark cut at the start of the window. It rises linearly to 100% at the rev limit.;"%", 1, 0, 0, 100, 0
+ end_struct
+ 
+ #define PPS_OK_INDICATOR "Pedal OK"
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 60e8e66..4159707 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -4873,6 +4873,9 @@ include_file @@SECONDARY_PANELS_FILE@@
+ 		field = "Use Engine Temperature RPM limit curve",		useCltBasedRpmLimit, { cutFuelOnHardLimit || cutSparkOnHardLimit }
+ 		field = "RPM hard limit",						rpmHardLimit, { (cutFuelOnHardLimit || cutSparkOnHardLimit) &&  !useCltBasedRpmLimit }
+ 		field = "RPM limit hysteresis",					rpmHardLimitHyst
++		field = "Progressive rev limiter (spark cut)",	progressiveRevLimitEnabled
++		field = "Progressive window below limit",		progressiveRevLimitWindow, { progressiveRevLimitEnabled }
++		field = "Spark cut at window start",			progressiveRevLimitStartCut, { progressiveRevLimitEnabled }
+ 		field = "Boost cut pressure",					boostCutPressure
+ 		field = "Boost cut pressure hysteresis",		boostCutPressureHyst
+ 		panel = dutyCycleLimiting
+diff --git a/unit_tests/tests/test_progressive_rev_limiter.cpp b/unit_tests/tests/test_progressive_rev_limiter.cpp
+new file mode 100644
+index 0000000..d748494
+--- /dev/null
++++ b/unit_tests/tests/test_progressive_rev_limiter.cpp
+@@ -0,0 +1,77 @@
++#include "pch.h"
++
++#include "limp_manager.h"
++
++// pro-style progressive rev limiter: spark cut ramps from the start %
++// to 100% inside the window below the rev limit.
++
++TEST(ProgressiveRevLimiter, RampsInsideWindow) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->useCltBasedRpmLimit = false;
++	engineConfiguration->rpmHardLimit = 7000;
++	engineConfiguration->progressiveRevLimitEnabled = true;
++	config->progressiveRevLimitWindow = 500;
++	config->progressiveRevLimitStartCut = 20;
++
++	auto limp = getLimpManager();
++
++	limp->updateRevLimit(6400);
++	EXPECT_FLOAT_EQ(0, limp->getRevLimitSparkSkipRatio());
++
++	limp->updateRevLimit(6500);
++	EXPECT_NEAR(0.2f, limp->getRevLimitSparkSkipRatio(), EPS4D);
++
++	limp->updateRevLimit(6750);
++	EXPECT_NEAR(0.6f, limp->getRevLimitSparkSkipRatio(), EPS4D);
++
++	limp->updateRevLimit(7000);
++	EXPECT_NEAR(1.0f, limp->getRevLimitSparkSkipRatio(), EPS4D);
++
++	// Above the limit stays at full cut
++	limp->updateRevLimit(7300);
++	EXPECT_NEAR(1.0f, limp->getRevLimitSparkSkipRatio(), EPS4D);
++}
++
++TEST(ProgressiveRevLimiter, DisabledMeansNoCut) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->useCltBasedRpmLimit = false;
++	engineConfiguration->rpmHardLimit = 7000;
++	engineConfiguration->progressiveRevLimitEnabled = false;
++	config->progressiveRevLimitWindow = 500;
++	config->progressiveRevLimitStartCut = 20;
++
++	getLimpManager()->updateRevLimit(6900);
++	EXPECT_FLOAT_EQ(0, getLimpManager()->getRevLimitSparkSkipRatio());
++}
++
++TEST(ProgressiveRevLimiter, FollowsCltBasedLimit) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->useCltBasedRpmLimit = true;
++	setArrayValues(config->cltRevLimitRpm, 4000);
++	Sensor::setMockValue(SensorType::Clt, 20);
++	engineConfiguration->progressiveRevLimitEnabled = true;
++	config->progressiveRevLimitWindow = 400;
++	config->progressiveRevLimitStartCut = 0;
++
++	getLimpManager()->updateRevLimit(3800);
++	EXPECT_NEAR(0.5f, getLimpManager()->getRevLimitSparkSkipRatio(), EPS4D);
++}
++
++TEST(ProgressiveRevLimiter, FeedsHardSparkLimiter) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	engineConfiguration->useCltBasedRpmLimit = false;
++	engineConfiguration->rpmHardLimit = 7000;
++	engineConfiguration->progressiveRevLimitEnabled = true;
++	config->progressiveRevLimitWindow = 500;
++	config->progressiveRevLimitStartCut = 20;
++
++	Sensor::setMockValue(SensorType::Rpm, 6750);
++	eth.engine.periodicFastCallback();
++
++	EXPECT_NEAR(0.6f, engine->hardSparkLimiter.getTargetSkipRatio(), EPS4D);
++
++	// Below the window nothing is cut
++	Sensor::setMockValue(SensorType::Rpm, 3000);
++	eth.engine.periodicFastCallback();
++	EXPECT_FLOAT_EQ(0, engine->hardSparkLimiter.getTargetSkipRatio());
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 626a284..fa2534e 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -230,6 +230,7 @@ TESTS_SRC_CPP = \
+ 	tests/test_gpio.cpp \
+ 	tests/test_digital_input_exti.cpp \
+ 	tests/test_limp.cpp \
++	tests/test_progressive_rev_limiter.cpp \
+ 	tests/test_tcu.cpp \
+ 	tests/test_hellen_board_id.cpp \
+ 	tests/sensor/test_frequency_sensor.cpp \
+-- 
+2.43.0
+

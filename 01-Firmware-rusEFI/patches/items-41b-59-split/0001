@@ -1,0 +1,410 @@
+From c425b47325827d1c972b95a930f8fdceb75c3c2d Mon Sep 17 00:00:00 2001
+From: Claude <c@local>
+Date: Sat, 31 Oct 2026 22:02:20 +0000
+Subject: [PATCH] Alert sensor: EGT rise rate, pro-style fast EGT rise
+ alert
+
+Plan item 41b (the "fast heating" part of item 41).
+- new module EgtRiseMonitor: how fast each EGT goes up, in C per second;
+  sampled every 0.5 s and smoothed over about 1 s so thermocouple noise
+  does not trip the alert; a sensor that stops working is forgotten
+- new alert / GPPWM sensor 47 "EGT rise rate" = the fastest rising EGT
+  (unexpected when no EGT works)
+- output channel / log: EGT rise rate (fastest)
+- TS lists updated, ve/afr blend axis label offset moved from 47 to 48
+- 5 new tests
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_012qcg6EYkigZc99xZ8xdABd
+---
+ firmware/console/binary/output_channels.txt   |  1 +
+ .../actuators/gppwm_channel_reader.cpp        |  3 +
+ firmware/controllers/algo/engine.h            |  2 +
+ firmware/controllers/algo/rusefi_enums.h      |  2 +
+ .../controllers/modules/egt_rise/egt_rise.mk  |  3 +
+ .../modules/egt_rise/egt_rise_monitor.cpp     | 77 +++++++++++++++++++
+ .../modules/egt_rise/egt_rise_monitor.h       | 39 ++++++++++
+ firmware/controllers/modules/modules.mk       |  1 +
+ firmware/tunerstudio/tunerstudio.template.ini | 16 ++--
+ unit_tests/tests/test_egt_rise.cpp            | 64 +++++++++++++++
+ unit_tests/tests/tests.mk                     |  1 +
+ 11 files changed, 201 insertions(+), 8 deletions(-)
+ create mode 100644 firmware/controllers/modules/egt_rise/egt_rise.mk
+ create mode 100644 firmware/controllers/modules/egt_rise/egt_rise_monitor.cpp
+ create mode 100644 firmware/controllers/modules/egt_rise/egt_rise_monitor.h
+ create mode 100644 unit_tests/tests/test_egt_rise.cpp
+
+diff --git a/firmware/console/binary/output_channels.txt b/firmware/console/binary/output_channels.txt
+index 3c47c40a8c..62b13cc15b 100644
+--- a/firmware/console/binary/output_channels.txt
++++ b/firmware/console/binary/output_channels.txt
+@@ -518,4 +518,5 @@ float mapFast
+ 	uint8_t pinLastResult;Password: last result;"", 1, 0, 0, 4, 0
+ 	uint8_t pinLockoutLeft;Password: lockout left;"s", 1, 0, 0, 30, 0
+ 	int8_t[8 iterate] autoscale cylLambdaTrim;Lambda trim cyl;"%", 0.2, 0, -25, 25, 1
++	int16_t egtRiseRate;EGT rise rate (fastest);"C/s", 1, 0, -1000, 1000, 0
+ end_struct
+diff --git a/firmware/controllers/actuators/gppwm_channel_reader.cpp b/firmware/controllers/actuators/gppwm_channel_reader.cpp
+index cbe41eca84..1d206c16fa 100644
+--- a/firmware/controllers/actuators/gppwm_channel_reader.cpp
++++ b/firmware/controllers/actuators/gppwm_channel_reader.cpp
+@@ -5,6 +5,7 @@
+ #include "pch.h"
+ #include "throttle_model.h"
+ #include "gppwm_channel_reader.h"
++#include "egt_rise_monitor.h"
+ 
+ // fuel pressure above manifold pressure, from the fuel pressure sensor whatever the injector compensation mode
+ static expected<float> readFuelPressureDiff() {
+@@ -164,6 +165,8 @@ expected<float> readGppwmChannel(gppwm_channel_e channel) {
+ 		return Sensor::get(SensorType::TurbochargerSpeed);
+ 	case GPPWM_MapOverEthanolLimit:
+ 		return readMapOverEthanolLimit();
++	case GPPWM_EgtRiseRate:
++		return engine->module<EgtRiseMonitor>()->getMaxRiseRate();
+ 	case GPPWM_ThrottleRatio:
+ #if EFI_ENGINE_CONTROL
+ 		return getThrottlePressureRatio(Sensor::getOrZero(SensorType::Map));
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index d582604a42..4944d021b4 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -37,6 +37,7 @@
+ #include "tune_selector.h"
+ #include "rgb_status_led.h"
+ #include "cylinder_lambda_trim.h"
++#include "egt_rise_monitor.h"
+ #include "ecu_passwords.h"
+ #include "hall_pullup.h"
+ #include "cold_start_injector.h"
+@@ -212,6 +213,7 @@ public:
+         EcuPasswords,
+         RgbStatusLed,
+         CylinderLambdaTrim,
++        EgtRiseMonitor,
+         HallPullupController,
+         ColdStartInjector,
+         GearShiftDetector,
+diff --git a/firmware/controllers/algo/rusefi_enums.h b/firmware/controllers/algo/rusefi_enums.h
+index c73b3b04de..d0527b5be6 100644
+--- a/firmware/controllers/algo/rusefi_enums.h
++++ b/firmware/controllers/algo/rusefi_enums.h
+@@ -769,6 +769,8 @@ typedef enum __attribute__ ((__packed__)) {
+ 	GPPWM_TurboSpeed = 45,
+ 	// MAP above the max boost allowed for the ethanol % right now
+ 	GPPWM_MapOverEthanolLimit = 46,
++	// fastest rising EGT, C per second (pro-style fast EGT rise alert)
++	GPPWM_EgtRiseRate = 47,
+ 	// remember to manually sync 'pwmAxisLabels' in tunerstudio.template.ini
+ 	// todo: rename 'pwmAxisLabels' and maybe even gppwm_channel_e since we now use wider than just 'gppwm'?
+ } gppwm_channel_e;
+diff --git a/firmware/controllers/modules/egt_rise/egt_rise.mk b/firmware/controllers/modules/egt_rise/egt_rise.mk
+new file mode 100644
+index 0000000000..39d98bc10e
+--- /dev/null
++++ b/firmware/controllers/modules/egt_rise/egt_rise.mk
+@@ -0,0 +1,3 @@
++# pro-style alert sensor: how fast the EGT is rising
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/egt_rise
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/egt_rise/egt_rise_monitor.cpp
+diff --git a/firmware/controllers/modules/egt_rise/egt_rise_monitor.cpp b/firmware/controllers/modules/egt_rise/egt_rise_monitor.cpp
+new file mode 100644
+index 0000000000..c33764ec4b
+--- /dev/null
++++ b/firmware/controllers/modules/egt_rise/egt_rise_monitor.cpp
+@@ -0,0 +1,77 @@
++#include "pch.h"
++
++#include "egt_rise_monitor.h"
++
++void EgtRiseMonitor::update(const SensorResult* egts, size_t count, float dtSeconds) {
++	count = std::min<size_t>(count, EGT_RISE_COUNT);
++
++	for (size_t i = 0; i < count; i++) {
++		if (!egts[i]) {
++			// sensor not working: forget its history
++			m_valid[i] = false;
++			m_hasWindowStart[i] = false;
++			m_rate[i] = 0;
++		} else {
++			m_valid[i] = true;
++		}
++	}
++
++	m_elapsed += dtSeconds;
++	if (m_elapsed < sampleTime) {
++		return;
++	}
++
++	float elapsed = m_elapsed;
++	m_elapsed = 0;
++
++	// first order smoothing, about smoothTime long
++	float alpha = elapsed / (smoothTime + elapsed);
++
++	for (size_t i = 0; i < count; i++) {
++		if (!egts[i]) {
++			continue;
++		}
++
++		float temp = egts[i].Value;
++		if (m_hasWindowStart[i]) {
++			float raw = (temp - m_windowStart[i]) / elapsed;
++			m_rate[i] += alpha * (raw - m_rate[i]);
++		}
++		m_windowStart[i] = temp;
++		m_hasWindowStart[i] = true;
++	}
++}
++
++expected<float> EgtRiseMonitor::getMaxRiseRate() const {
++	expected<float> result = unexpected;
++	for (size_t i = 0; i < EGT_RISE_COUNT; i++) {
++		if (m_valid[i] && (!result || m_rate[i] > result.Value)) {
++			result = m_rate[i];
++		}
++	}
++	return result;
++}
++
++float EgtRiseMonitor::getRiseRate(size_t index) const {
++	return index < EGT_RISE_COUNT ? m_rate[index] : 0;
++}
++
++void EgtRiseMonitor::onSlowCallback() {
++	efitick_t nowNt = getTimeNowNt();
++	float dt = m_timerStarted ? m_timer.getElapsedSecondsAndReset(nowNt) : 0;
++	if (!m_timerStarted) {
++		m_timer.reset(nowNt);
++		m_timerStarted = true;
++	}
++	// a long pause (debugger, first call) must not look like a slow rise
++	dt = std::min(dt, 1.0f);
++
++	SensorResult egts[EGT_RISE_COUNT] = {unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected};
++	for (size_t i = 0; i < EGT_RISE_COUNT; i++) {
++		egts[i] = Sensor::get(static_cast<SensorType>(static_cast<int>(SensorType::EGT1) + i));
++	}
++	update(egts, EGT_RISE_COUNT, dt);
++
++	auto maxRate = getMaxRiseRate();
++	engine->outputChannels.egtRiseRate = maxRate ? maxRate.Value : 0;
++}
+diff --git a/firmware/controllers/modules/egt_rise/egt_rise_monitor.h b/firmware/controllers/modules/egt_rise/egt_rise_monitor.h
+new file mode 100644
+index 0000000000..be324fd292
+--- /dev/null
++++ b/firmware/controllers/modules/egt_rise/egt_rise_monitor.h
+@@ -0,0 +1,39 @@
++/*
++ * @file egt_rise_monitor.h
++ *
++ * pro-style "fast EGT rise" alert sensor: how fast each EGT is going up, in C per
++ * second. The temperature is sampled every half second and the rate is smoothed over about
++ * a second, so thermocouple noise does not trip the alert. The fastest rising EGT is the
++ * alert sensor "EGT rise rate".
++ */
++
++#pragma once
++
++#define EGT_RISE_COUNT 8 // initializers below list 8 entries
++
++class EgtRiseMonitor : public EngineModule {
++public:
++	using interface_t = EgtRiseMonitor;
++
++	void onSlowCallback() override;
++
++	// egts: one reading per EGT input (invalid = sensor not working); dtSeconds since the last call
++	void update(const SensorResult* egts, size_t count, float dtSeconds);
++
++	// fastest rising EGT in C/s, unexpected when no EGT works
++	expected<float> getMaxRiseRate() const;
++	float getRiseRate(size_t index) const;
++
++	// sample window and smoothing time
++	static constexpr float sampleTime = 0.5f;
++	static constexpr float smoothTime = 1.0f;
++
++private:
++	float m_elapsed = 0;
++	float m_windowStart[EGT_RISE_COUNT] = {};
++	bool m_hasWindowStart[EGT_RISE_COUNT] = {};
++	float m_rate[EGT_RISE_COUNT] = {};
++	bool m_valid[EGT_RISE_COUNT] = {};
++	Timer m_timer;
++	bool m_timerStarted = false;
++};
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index 178f3b78dd..5429bbd590 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -23,6 +23,7 @@ include $(PROJECT_DIR)/controllers/modules/alerts/alerts.mk
+ include $(PROJECT_DIR)/controllers/modules/tune_selector/tune_selector.mk
+ include $(PROJECT_DIR)/controllers/modules/rgb_status_led/rgb_status_led.mk
+ include $(PROJECT_DIR)/controllers/modules/cylinder_lambda_trim/cylinder_lambda_trim.mk
++include $(PROJECT_DIR)/controllers/modules/egt_rise/egt_rise.mk
+ include $(PROJECT_DIR)/controllers/modules/hall_pullup/hall_pullup.mk
+ include $(PROJECT_DIR)/controllers/modules/cold_start_injector/cold_start_injector.mk
+ include $(PROJECT_DIR)/controllers/modules/gear_shift/gear_shift.mk
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index b6f3ac1364..207af117d8 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -116,7 +116,7 @@ enable2ndByteCanID = false
+ #define pin_mode_e_enum="default", "INVALID", "INVALID", "INVALID", "opendrain", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "PULLUP", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "INVALID", "PULLDOWN"
+ #define pin_input_mode_e_enum="DEFAULT", "PULLUP", "PULLDOWN", "INVALID", "INVERTED DEFAULT", "INVERTED PULLUP", "INVERTED PULLDOWN", "INVALID
+ #define pin_output_mode_e_enum="default", "default inverted", "open collector", "open collector inverted"
+-#define gppwm_channel_e_enum="Zero", "TPS", "MAP", "CLT", "IAT", "Fuel Load", "Ignition Load", "Aux Temp 1", "Aux Temp 2", "Accel Pedal", "Battery Voltage", "VVT 1 In Actual", "VVT 1 Ex Actual", "VVT 2 In Actual", "VVT 2 Ex Actual", "Ethanol (Flex) %", "Aux Linear 1", "Aux Linear 2", "GPPWM Output 1", "GPPWM Output 2", "GPPWM Output 3", "GPPWM Output 4", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure", "EGT 1", "EGT 2", "Aux Linear 3", "Aux Linear 4", "Vehicle speed", "Oil pressure", "Oil temp", "Fuel Pressure", "Throttle Ratio", "EGT 3", "EGT 4", "EGT 5", "EGT 6", "EGT 7", "EGT 8", "Fuel Pressure Diff", "EGT max", "Closed loop trim", "Turbo speed", "MAP over ethanol limit"
++#define gppwm_channel_e_enum="Zero", "TPS", "MAP", "CLT", "IAT", "Fuel Load", "Ignition Load", "Aux Temp 1", "Aux Temp 2", "Accel Pedal", "Battery Voltage", "VVT 1 In Actual", "VVT 1 Ex Actual", "VVT 2 In Actual", "VVT 2 Ex Actual", "Ethanol (Flex) %", "Aux Linear 1", "Aux Linear 2", "GPPWM Output 1", "GPPWM Output 2", "GPPWM Output 3", "GPPWM Output 4", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure", "EGT 1", "EGT 2", "Aux Linear 3", "Aux Linear 4", "Vehicle speed", "Oil pressure", "Oil temp", "Fuel Pressure", "Throttle Ratio", "EGT 3", "EGT 4", "EGT 5", "EGT 6", "EGT 7", "EGT 8", "Fuel Pressure Diff", "EGT max", "Closed loop trim", "Turbo speed", "MAP over ethanol limit", "EGT rise rate"
+ #define spi_device_e_enum="Off", "SPI1", "SPI2", "SPI3", "SPI4", "SPI5", "SPI6"
+ 
+ ; Remove next line when Java toolset gets adjusted to load those from json config into VariablesRegistry
+@@ -396,7 +396,7 @@ include_file @@TUNING_SECTION_FILE@@
+ 	targetMixtureFinalTargetLabels = bits, U08, [0:1], "Final target AFR (fuel)", "Final target lambda"
+ 	; [tag:ve_blend_default_axis] Display-only entries 36..39 follow veLoadSrc; 36..41 follow afrLoadSrc.
+ 	; The first 36 entries retain their GPPWM channel indices.
+-	pwmAxisLabels = bits, U08, [0:5], "Zero", "TPS %", "MAP kPa", "CLT C", "IAT C", "Fuel Load", "Ignition Load", "Aux Temp 1 C", "Aux Temp 2 C", "Accel Pedal %", "Battery Voltage Volts", "VVT 1 I Deg", "VVT 1 E Deg", "VVT 2 I Deg", "VVT 2 E Deg", "Ethanol (Flex) %", "Aux Linear 1 *", "Aux Linear 2 *", "GPPWM Output 1 %", "GPPWM Output 2 %", "GPPWM Output 3 %", "GPPWM Output 4 %", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure kPa", "EGT 1 C", "EGT 2 C", "Aux Linear 3", "Aux Linear 4", "Vehicle Speed KPH", "Oil pressure kPa", "Oil temp C", "Fuel Pressure", "Throttle Pressure Ratio", "EGT 3 C", "EGT 4 C", "EGT 5 C", "EGT 6 C", "EGT 7 C", "EGT 8 C", "Fuel Pressure Diff kPa", "EGT max C", "Closed loop trim %", "Turbo speed RPM", "MAP over E% limit kPa", "MAP kPa", "TPS %", "Air Charge %", "Lua load", "Accel Pedal %", "Cylinder Filling %"
++	pwmAxisLabels = bits, U08, [0:5], "Zero", "TPS %", "MAP kPa", "CLT C", "IAT C", "Fuel Load", "Ignition Load", "Aux Temp 1 C", "Aux Temp 2 C", "Accel Pedal %", "Battery Voltage Volts", "VVT 1 I Deg", "VVT 1 E Deg", "VVT 2 I Deg", "VVT 2 E Deg", "Ethanol (Flex) %", "Aux Linear 1 *", "Aux Linear 2 *", "GPPWM Output 1 %", "GPPWM Output 2 %", "GPPWM Output 3 %", "GPPWM Output 4 %", "Lua Gauge 1", "Lua Gauge 2", "RPM", "Gear (detected)", "Baro pressure kPa", "EGT 1 C", "EGT 2 C", "Aux Linear 3", "Aux Linear 4", "Vehicle Speed KPH", "Oil pressure kPa", "Oil temp C", "Fuel Pressure", "Throttle Pressure Ratio", "EGT 3 C", "EGT 4 C", "EGT 5 C", "EGT 6 C", "EGT 7 C", "EGT 8 C", "Fuel Pressure Diff kPa", "EGT max C", "Closed loop trim %", "Turbo speed RPM", "MAP over E% limit kPa", "EGT rise C/s", "MAP kPa", "TPS %", "Air Charge %", "Lua load", "Accel Pedal %", "Cylinder Filling %"
+ 	veAxisLabels = bits, U08, [0:1], "MAP", "TPS", "Air Charge", "Lua"
+ 	targetAfrAxisLabels = bits, U08, [0:2], "MAP", "TPS", "Air Charge", "Lua", "Acc Pedal", "Cyl Filling"
+ 	; [tag:ignition_blend_load_axis] Native-unit labels follow ignLoadSrc without changing GPPWM indices.
+@@ -1586,7 +1586,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend1Table, veBlend1Map, @@VE_BLEND1_TABLE_NAME@@, 1
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends1_yAxisOverride ? veBlends1_yAxisOverride : 47 + veLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends1_yAxisOverride ? veBlends1_yAxisOverride : 48 + veLoadSrc)}
+ 		xBins		= veBlends1_rpmBins, RPMValue
+ 		yBins		= veBlends1_loadBins, veBlendYAxis1
+ 		zBins		= veBlends1_table
+@@ -1594,7 +1594,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend2Table, veBlend2Map, "VE blend 2", 1@@if_ts_show_veBlends2
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends2
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends2_yAxisOverride ? veBlends2_yAxisOverride : 47 + veLoadSrc)}@@if_ts_show_veBlends2
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends2_yAxisOverride ? veBlends2_yAxisOverride : 48 + veLoadSrc)}@@if_ts_show_veBlends2
+ 		xBins		= veBlends2_rpmBins, RPMValue@@if_ts_show_veBlends2
+ 		yBins		= veBlends2_loadBins, veBlendYAxis2@@if_ts_show_veBlends2
+ 		zBins		= veBlends2_table@@if_ts_show_veBlends2
+@@ -1602,7 +1602,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend3Table, veBlend3Map, "VE blend 3", 1@@if_ts_show_veBlends3
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends3
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends3_yAxisOverride ? veBlends3_yAxisOverride : 47 + veLoadSrc)}@@if_ts_show_veBlends3
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends3_yAxisOverride ? veBlends3_yAxisOverride : 48 + veLoadSrc)}@@if_ts_show_veBlends3
+ 		xBins		= veBlends3_rpmBins, RPMValue@@if_ts_show_veBlends3
+ 		yBins		= veBlends3_loadBins, veBlendYAxis3@@if_ts_show_veBlends3
+ 		zBins		= veBlends3_table@@if_ts_show_veBlends3
+@@ -1610,7 +1610,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 
+ 	table = veBlend4Table, veBlend4Map, "VE blend 4", 1@@if_ts_show_veBlends4
+ 		; [tag:ve_blend_default_axis] Zero inherits VE load; labels 36..39 describe that source.@@if_ts_show_veBlends4
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends4_yAxisOverride ? veBlends4_yAxisOverride : 47 + veLoadSrc)}@@if_ts_show_veBlends4
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, veBlends4_yAxisOverride ? veBlends4_yAxisOverride : 48 + veLoadSrc)}@@if_ts_show_veBlends4
+ 		xBins		= veBlends4_rpmBins, RPMValue@@if_ts_show_veBlends4
+ 		yBins		= veBlends4_loadBins, veBlendYAxis4@@if_ts_show_veBlends4
+ 		zBins		= veBlends4_table@@if_ts_show_veBlends4
+@@ -1653,7 +1653,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 	table = targetAfrBlend1Table, targetAfrBlend1Map, "Target Mixture Adder 1", 1
+ 		topicHelp = "targetMixtureAdderHelp"
+ 		; [tag:ve_blend_default_axis] Zero inherits the main target-table load source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends1_yAxisOverride ? targetAfrBlends1_yAxisOverride : 47 + afrLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends1_yAxisOverride ? targetAfrBlends1_yAxisOverride : 48 + afrLoadSrc)}
+ 		xBins = targetAfrBlends1_rpmBins, RPMValue
+ 		yBins = targetAfrBlends1_loadBins, targetAfrBlendYAxis1
+ 		; [tag:target_adder_display] Both unit modes share this editor and the native saved table.
+@@ -1664,7 +1664,7 @@ curve = rangeMatrix, "Range Switch Input Matrix"
+ 	table = targetAfrBlend2Table, targetAfrBlend2Map, "Target Mixture Adder 2", 1
+ 		topicHelp = "targetMixtureAdderHelp"
+ 		; [tag:ve_blend_default_axis] Zero inherits the main target-table load source.
+-		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends2_yAxisOverride ? targetAfrBlends2_yAxisOverride : 47 + afrLoadSrc)}
++		xyLabels = "RPM", {bitStringValue(pwmAxisLabels, targetAfrBlends2_yAxisOverride ? targetAfrBlends2_yAxisOverride : 48 + afrLoadSrc)}
+ 		xBins = targetAfrBlends2_rpmBins, RPMValue
+ 		yBins = targetAfrBlends2_loadBins, targetAfrBlendYAxis2
+ 		; [tag:target_adder_display] Both unit modes share this editor and the native saved table.
+diff --git a/unit_tests/tests/test_egt_rise.cpp b/unit_tests/tests/test_egt_rise.cpp
+new file mode 100644
+index 0000000000..68c93745d5
+--- /dev/null
++++ b/unit_tests/tests/test_egt_rise.cpp
+@@ -0,0 +1,64 @@
++#include "pch.h"
++
++#include "egt_rise_monitor.h"
++#include "gppwm_channel_reader.h"
++
++// pro-style "fast EGT rise" alert sensor
++
++static void feed(EgtRiseMonitor& mon, float startTemp, float ratePerSecond, float seconds, size_t cylinder = 0) {
++	const float dt = 0.05f;
++	float temp = startTemp;
++	for (float t = 0; t < seconds; t += dt) {
++		SensorResult egts[EGT_RISE_COUNT] = {unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected};
++		for (size_t i = 0; i < EGT_RISE_COUNT; i++) {
++			egts[i] = (i == cylinder) ? SensorResult(temp) : SensorResult(500.0f);
++		}
++		mon.update(egts, EGT_RISE_COUNT, dt);
++		temp += ratePerSecond * dt;
++	}
++}
++
++TEST(EgtRise, steadyTemperatureIsZero) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EgtRiseMonitor mon;
++	feed(mon, 700, 0, 5);
++	EXPECT_NEAR(0, mon.getMaxRiseRate().value_or(-1), 0.5);
++}
++
++TEST(EgtRise, fastRiseIsSeen) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EgtRiseMonitor mon;
++	// cylinder 3 heats up 100 C per second, the others stay
++	feed(mon, 600, 100, 6, 2);
++	EXPECT_NEAR(100, mon.getRiseRate(2), 5);
++	EXPECT_NEAR(0, mon.getRiseRate(0), 0.5);
++	EXPECT_NEAR(100, mon.getMaxRiseRate().value_or(0), 5);
++}
++
++TEST(EgtRise, coolingIsNegative) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EgtRiseMonitor mon;
++	feed(mon, 900, -50, 6, 1);
++	EXPECT_NEAR(-50, mon.getRiseRate(1), 3);
++	// the fastest rising is one of the steady ones
++	EXPECT_NEAR(0, mon.getMaxRiseRate().value_or(-1), 0.5);
++}
++
++TEST(EgtRise, noWorkingSensor) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	EgtRiseMonitor mon;
++	SensorResult egts[EGT_RISE_COUNT] = {unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected, unexpected};
++	for (auto& e : egts) {
++		e = unexpected;
++	}
++	mon.update(egts, EGT_RISE_COUNT, 1);
++	EXPECT_FALSE(mon.getMaxRiseRate().Valid);
++}
++
++TEST(EgtRise, alertSensorReadsModule) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	auto& mon = engine->module<EgtRiseMonitor>().unmock();
++	EXPECT_FALSE(readGppwmChannel(GPPWM_EgtRiseRate).Valid);
++	feed(mon, 600, 80, 6, 4);
++	EXPECT_NEAR(80, readGppwmChannel(GPPWM_EgtRiseRate).value_or(0), 5);
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 2e637b27e9..7aac7c08c1 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -281,6 +281,7 @@ TESTS_SRC_CPP = \
+ 	tests/test_ecu_passwords.cpp \
+ 	tests/test_rgb_status_led.cpp \
+ 	tests/test_cylinder_lambda_trim.cpp \
++	tests/test_egt_rise.cpp \
+ 	tests/controllers/modules/map_averaging/test_map_averaging.cpp \
+ 	tests/util/test_utils.cpp \
+ 	tests/controllers/algo/test_engine_cylinder.cpp \
+-- 
+2.43.0
+

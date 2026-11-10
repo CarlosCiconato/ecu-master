@@ -1,0 +1,303 @@
+From 8bd7b56103322ea3e50770f5f152359cbbca92af Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sun, 25 Oct 2026 20:15:27 +0000
+Subject: [PATCH] VR or Hall sensor chosen in software on crank and cam inputs
+ (pro-style)
+
+New triggerSensorType[] and camSensorType[] settings. Each crank and cam input has an
+output (hallPullupCrank1..2, hallPullupCam1..4) that turns on the Hall pull-up of that
+input on our board when its sensor type is Hall.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TkhsyMr5ndz2MBCxuDZhPC
+---
+ firmware/controllers/algo/engine.h            |  2 +
+ firmware/controllers/algo/rusefi_enums.h      |  6 +++
+ .../modules/hall_pullup/hall_pullup.cpp       | 22 ++++++++++
+ .../modules/hall_pullup/hall_pullup.h         | 17 ++++++++
+ .../modules/hall_pullup/hall_pullup.mk        |  3 ++
+ firmware/controllers/modules/modules.mk       |  1 +
+ firmware/controllers/system/efi_gpio.cpp      |  6 +++
+ firmware/controllers/system/efi_gpio.h        |  7 ++++
+ firmware/integration/rusefi_config.txt        | 18 ++++++++
+ firmware/tunerstudio/tunerstudio.template.ini | 12 ++++++
+ .../tests/controllers/test_hall_pullup.cpp    | 41 +++++++++++++++++++
+ unit_tests/tests/tests.mk                     |  1 +
+ 12 files changed, 136 insertions(+)
+ create mode 100644 firmware/controllers/modules/hall_pullup/hall_pullup.cpp
+ create mode 100644 firmware/controllers/modules/hall_pullup/hall_pullup.h
+ create mode 100644 firmware/controllers/modules/hall_pullup/hall_pullup.mk
+ create mode 100644 unit_tests/tests/controllers/test_hall_pullup.cpp
+
+diff --git a/firmware/controllers/algo/engine.h b/firmware/controllers/algo/engine.h
+index ba97f59..428ec1e 100644
+--- a/firmware/controllers/algo/engine.h
++++ b/firmware/controllers/algo/engine.h
+@@ -35,6 +35,7 @@
+ #include "rolling_launch.h"
+ #include "alert_manager.h"
+ #include "tune_selector.h"
++#include "hall_pullup.h"
+ #include "shift_torque_reduction_controller.h"
+ #include "nitrous_controller.h"
+ #include "antilag_system.h"
+@@ -201,6 +202,7 @@ public:
+         TpsAccelEnrichment,
+         AlertManager,
+         TuneSelector,
++        HallPullupController,
+ #if EFI_LAUNCH_CONTROL
+ #if EFI_ENGINE_CONTROL
+         NitrousController,
+diff --git a/firmware/controllers/algo/rusefi_enums.h b/firmware/controllers/algo/rusefi_enums.h
+index 08a7da4..8bb3e94 100644
+--- a/firmware/controllers/algo/rusefi_enums.h
++++ b/firmware/controllers/algo/rusefi_enums.h
+@@ -382,6 +382,12 @@ typedef enum __attribute__ ((__packed__)) {
+ 	UART_DEVICE_4 = 4,
+ } uart_device_e;
+ 
++// Crank or cam sensor type, see HallPullupController
++typedef enum __attribute__ ((__packed__)) {
++	INPUT_SENSOR_VR = 0,
++	INPUT_SENSOR_HALL = 1,
++} input_sensor_type_e;
++
+ // Action of a tripped alert, in order of severity, see AlertManager
+ typedef enum __attribute__ ((__packed__)) {
+ 	ALERT_OFF = 0,
+diff --git a/firmware/controllers/modules/hall_pullup/hall_pullup.cpp b/firmware/controllers/modules/hall_pullup/hall_pullup.cpp
+new file mode 100644
+index 0000000..652f688
+--- /dev/null
++++ b/firmware/controllers/modules/hall_pullup/hall_pullup.cpp
+@@ -0,0 +1,22 @@
++#include "pch.h"
++
++#include "hall_pullup.h"
++
++template<typename TTypes>
++static bool isHall(const TTypes& types, size_t index) {
++	// boards with one bank have only 2 cam inputs
++	return index < efi::size(types) && types[index] == INPUT_SENSOR_HALL;
++}
++
++void HallPullupController::update() {
++	enginePins.hallPullupCrank1.setValue(isHall(engineConfiguration->triggerSensorType, 0));
++	enginePins.hallPullupCrank2.setValue(isHall(engineConfiguration->triggerSensorType, 1));
++	enginePins.hallPullupCam1.setValue(isHall(engineConfiguration->camSensorType, 0));
++	enginePins.hallPullupCam2.setValue(isHall(engineConfiguration->camSensorType, 1));
++	enginePins.hallPullupCam3.setValue(isHall(engineConfiguration->camSensorType, 2));
++	enginePins.hallPullupCam4.setValue(isHall(engineConfiguration->camSensorType, 3));
++}
++
++void HallPullupController::onSlowCallback() {
++	update();
++}
+diff --git a/firmware/controllers/modules/hall_pullup/hall_pullup.h b/firmware/controllers/modules/hall_pullup/hall_pullup.h
+new file mode 100644
+index 0000000..409aa77
+--- /dev/null
++++ b/firmware/controllers/modules/hall_pullup/hall_pullup.h
+@@ -0,0 +1,17 @@
++/*
++ * @file hall_pullup.h
++ *
++ * pro-style crank and cam inputs that take a VR or a Hall sensor, chosen in software:
++ * each input has an output that turns on its Hall pull-up when its sensor type is Hall.
++ */
++
++#pragma once
++
++class HallPullupController : public EngineModule {
++public:
++	using interface_t = HallPullupController;
++
++	void onSlowCallback() override;
++
++	void update();
++};
+diff --git a/firmware/controllers/modules/hall_pullup/hall_pullup.mk b/firmware/controllers/modules/hall_pullup/hall_pullup.mk
+new file mode 100644
+index 0000000..53e8540
+--- /dev/null
++++ b/firmware/controllers/modules/hall_pullup/hall_pullup.mk
+@@ -0,0 +1,3 @@
++# pro-style VR or Hall sensor chosen in software on crank and cam inputs
++MODULES_INC += $(PROJECT_DIR)/controllers/modules/hall_pullup
++MODULES_CPPSRC += $(PROJECT_DIR)/controllers/modules/hall_pullup/hall_pullup.cpp
+diff --git a/firmware/controllers/modules/modules.mk b/firmware/controllers/modules/modules.mk
+index 8ed7182..afd2342 100644
+--- a/firmware/controllers/modules/modules.mk
++++ b/firmware/controllers/modules/modules.mk
+@@ -21,6 +21,7 @@ include $(PROJECT_DIR)/controllers/modules/gear_detector/gear_detector.mk
+ include $(PROJECT_DIR)/controllers/modules/rolling_launch/rolling_launch.mk
+ include $(PROJECT_DIR)/controllers/modules/alerts/alerts.mk
+ include $(PROJECT_DIR)/controllers/modules/tune_selector/tune_selector.mk
++include $(PROJECT_DIR)/controllers/modules/hall_pullup/hall_pullup.mk
+ include $(PROJECT_DIR)/controllers/modules/burst_knock/burst_knock.mk
+ include $(PROJECT_DIR)/controllers/modules/engine_state_machine/engine_state_machine.mk
+ include $(PROJECT_DIR)/controllers/modules/wot_enrichment/wot_enrichment.mk
+diff --git a/firmware/controllers/system/efi_gpio.cpp b/firmware/controllers/system/efi_gpio.cpp
+index f178410..cf55c99 100644
+--- a/firmware/controllers/system/efi_gpio.cpp
++++ b/firmware/controllers/system/efi_gpio.cpp
+@@ -153,6 +153,12 @@ EnginePins::EnginePins() :
+ 		nitrousRelay("Nitrous Relay", CONFIG_PIN_OFFSETS(nitrousRelay)),
+ 		vvlRelay("VVL Relay", CONFIG_PIN_OFFSETS(vvlRelay)),
+ 		alertOutput("Alert Output", CONFIG_PIN_OFFSETS(alertOutput)),
++		hallPullupCrank1("Hall pull-up crank 1", CONFIG_PIN_OFFSETS(hallPullupCrank1)),
++		hallPullupCrank2("Hall pull-up crank 2", CONFIG_PIN_OFFSETS(hallPullupCrank2)),
++		hallPullupCam1("Hall pull-up cam 1", CONFIG_PIN_OFFSETS(hallPullupCam1)),
++		hallPullupCam2("Hall pull-up cam 2", CONFIG_PIN_OFFSETS(hallPullupCam2)),
++		hallPullupCam3("Hall pull-up cam 3", CONFIG_PIN_OFFSETS(hallPullupCam3)),
++		hallPullupCam4("Hall pull-up cam 4", CONFIG_PIN_OFFSETS(hallPullupCam4)),
+ #if EFI_HD_ACR
+ 		harleyAcr("Harley ACR", CONFIG_OFFSET(acrPin)),
+ 		harleyAcr2("Harley ACR 2", CONFIG_OFFSET(acrPin2)),
+diff --git a/firmware/controllers/system/efi_gpio.h b/firmware/controllers/system/efi_gpio.h
+index 92564d8..876e488 100644
+--- a/firmware/controllers/system/efi_gpio.h
++++ b/firmware/controllers/system/efi_gpio.h
+@@ -93,6 +93,13 @@ public:
+ 	RegisteredOutputPin nitrousRelay;
+ 	RegisteredOutputPin vvlRelay;
+ 	RegisteredOutputPin alertOutput;
++	// Hall pull-up enable per input: crank 1, crank 2, cam 1 to 4, see HallPullupController
++	RegisteredOutputPin hallPullupCrank1;
++	RegisteredOutputPin hallPullupCrank2;
++	RegisteredOutputPin hallPullupCam1;
++	RegisteredOutputPin hallPullupCam2;
++	RegisteredOutputPin hallPullupCam3;
++	RegisteredOutputPin hallPullupCam4;
+ #if EFI_HD_ACR
+ 	RegisteredNamedOutputPin harleyAcr;
+ 	RegisteredOutputPin harleyAcr2;
+diff --git a/firmware/integration/rusefi_config.txt b/firmware/integration/rusefi_config.txt
+index 8a59433..00f1755 100644
+--- a/firmware/integration/rusefi_config.txt
++++ b/firmware/integration/rusefi_config.txt
+@@ -1987,6 +1987,23 @@ end_struct
+ 	uint8_t tuneCount;How many tunes the tune button cycles through. 1 means tune switching is off.;"", 1, 0, 1, 3, 0
+ 	uint8_t activeTune;Tune in use at start-up. Changing it switches right away, also with the engine running.;"", 1, 0, 1, 3, 0
+ 
++! Crank and cam inputs that take either a VR or a Hall sensor (pro-style, chosen in software).
++! Each input has an output that turns on its Hall pull-up when the sensor type is Hall.
++	input_sensor_type_e[TRIGGER_INPUT_PIN_COUNT iterate] triggerSensorType;Sensor on this crank input.
++	input_sensor_type_e[CAM_INPUTS_COUNT iterate] camSensorType;Sensor on this cam input.
++	output_pin_e hallPullupCrank1Pin;Output that turns on the Hall pull-up of crank input 1.
++	pin_output_mode_e hallPullupCrank1PinMode;
++	output_pin_e hallPullupCrank2Pin;Output that turns on the Hall pull-up of crank input 2.
++	pin_output_mode_e hallPullupCrank2PinMode;
++	output_pin_e hallPullupCam1Pin;Output that turns on the Hall pull-up of cam input 1.
++	pin_output_mode_e hallPullupCam1PinMode;
++	output_pin_e hallPullupCam2Pin;Output that turns on the Hall pull-up of cam input 2.
++	pin_output_mode_e hallPullupCam2PinMode;
++	output_pin_e hallPullupCam3Pin;Output that turns on the Hall pull-up of cam input 3.
++	pin_output_mode_e hallPullupCam3PinMode;
++	output_pin_e hallPullupCam4Pin;Output that turns on the Hall pull-up of cam input 4.
++	pin_output_mode_e hallPullupCam4PinMode;
++
+ struct vvl_s
+     int8_t fuelAdderPercent;;"%", 1, 0, 0, 100, 0
+ 	float ignitionRetard;Retard timing to remove from actual final timing (after all corrections) due to additional air.;"deg", 1, 0, -180, 180, 2
+@@ -2622,6 +2639,7 @@ uint8_t progressiveRevLimitStartCut;Spark cut at the start of the window. It ris
+ ! pro-style alert engine, see AlertManager
+ #define ALERT_COUNT 8
+ #define ALERT_CURVE_SIZE 8
++custom input_sensor_type_e 1 bits, U08, @OFFSET@, [0:0], "VR (inductive)", "Hall"
+ custom alert_action_e 1 bits, U08, @OFFSET@, [0:1], "Off", "Warn only", "Safe mode", "Engine off"
+ 
+ struct alert_s
+diff --git a/firmware/tunerstudio/tunerstudio.template.ini b/firmware/tunerstudio/tunerstudio.template.ini
+index 3d72c70..a6e9d39 100644
+--- a/firmware/tunerstudio/tunerstudio.template.ini
++++ b/firmware/tunerstudio/tunerstudio.template.ini
+@@ -2754,6 +2754,10 @@ cmd_set_engine_type_default					= "@@TS_IO_TEST_COMMAND_char@@@@ts_command_e_TS_
+ 		field = "Primary Edge",						invertPrimaryTriggerSignal@@if_ts_show_trigger_pins
+ 		field = "Secondary channel",					triggerInputPins2, { triggerInputPins2 != 0 || (triggerInputPins1 != 0 && (@@TRIGGER_TYPE_WITH_SECOND_WHEEL@@) ) }@@if_ts_show_trigger_pins
+ 		field = "Secondary Edge",						invertSecondaryTriggerSignal, {triggerInputPins2 != 0 && (@@TRIGGER_TYPE_WITH_SECOND_WHEEL@@) }@@if_ts_show_trigger_pins
++		field = "Primary sensor type",				triggerSensorType1
++		field = "Primary Hall pull-up output",		hallPullupCrank1Pin
++		field = "Secondary sensor type",			triggerSensorType2, { triggerInputPins2 != 0 }
++		field = "Secondary Hall pull-up output",	hallPullupCrank2Pin, { triggerInputPins2 != 0 }
+ 
+ 	dialog = trigger_cams, "Cam Inputs"
+ 		field = "!<html><a href=https://rusefi.com/s/vvt>https://rusefi.com/s/vvt</a></html>"
+@@ -2777,6 +2781,14 @@ cmd_set_engine_type_default					= "@@TS_IO_TEST_COMMAND_char@@@@ts_command_e_TS_
+ 		field = "Cam sensor bank 2 exhaust",		camInputs4, { camInputs4 != 0 || (vvtMode2 != @@vvt_mode_e_VVT_INACTIVE@@ && camInputs2 != 0 ) }@@if_ts_show_bank2_cam2
+ 		field = "intake Cam Edge Select",					      invertCamVVTSignal, { camInputs1 != 0 }@@if_ts_show_intake_cam_edge
+ 		field = "exhaust Cam Edge Select",					    invertExhaustCamVVTSignal, { camInputs2 != 0 }@@if_ts_show_cam2
++		field = "Cam 1 sensor type",				camSensorType1, { camInputs1 != 0 }
++		field = "Cam 1 Hall pull-up output",		hallPullupCam1Pin, { camInputs1 != 0 }
++		field = "Cam 2 sensor type",				camSensorType2, { camInputs2 != 0 }@@if_ts_show_cam2
++		field = "Cam 2 Hall pull-up output",		hallPullupCam2Pin, { camInputs2 != 0 }@@if_ts_show_cam2
++		field = "Cam 3 sensor type",				camSensorType3, { camInputs3 != 0 }@@if_ts_show_bank2_cam1
++		field = "Cam 3 Hall pull-up output",		hallPullupCam3Pin, { camInputs3 != 0 }@@if_ts_show_bank2_cam1
++		field = "Cam 4 sensor type",				camSensorType4, { camInputs4 != 0 }@@if_ts_show_bank2_cam2
++		field = "Cam 4 Hall pull-up output",		hallPullupCam4Pin, { camInputs4 != 0 }@@if_ts_show_bank2_cam2
+ 		field = ""
+ @@BOARD_CAM_SETTINGS_FILE@@
+ 		field = "#Set offset so VVT indicates 0 degrees in default position"
+diff --git a/unit_tests/tests/controllers/test_hall_pullup.cpp b/unit_tests/tests/controllers/test_hall_pullup.cpp
+new file mode 100644
+index 0000000..4ece414
+--- /dev/null
++++ b/unit_tests/tests/controllers/test_hall_pullup.cpp
+@@ -0,0 +1,41 @@
++#include "pch.h"
++
++#include "hall_pullup.h"
++
++// pro-style VR or Hall sensor chosen in software: each crank and cam input has an
++// output that turns on its Hall pull-up when its sensor type is Hall.
++
++TEST(HallPullup, OffForVrByDefault) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++
++	engine->module<HallPullupController>().unmock().update();
++
++	EXPECT_FALSE(enginePins.hallPullupCrank1.getLogicValue());
++	EXPECT_FALSE(enginePins.hallPullupCrank2.getLogicValue());
++	EXPECT_FALSE(enginePins.hallPullupCam1.getLogicValue());
++	EXPECT_FALSE(enginePins.hallPullupCam2.getLogicValue());
++}
++
++TEST(HallPullup, OnlyHallInputsGetPullup) {
++	EngineTestHelper eth(engine_type_e::TEST_ENGINE);
++	auto& dut = engine->module<HallPullupController>().unmock();
++
++	engineConfiguration->triggerSensorType[0] = INPUT_SENSOR_VR;
++	engineConfiguration->triggerSensorType[1] = INPUT_SENSOR_HALL;
++	engineConfiguration->camSensorType[0] = INPUT_SENSOR_HALL;
++	engineConfiguration->camSensorType[1] = INPUT_SENSOR_VR;
++	dut.update();
++
++	EXPECT_FALSE(enginePins.hallPullupCrank1.getLogicValue());
++	EXPECT_TRUE(enginePins.hallPullupCrank2.getLogicValue());
++	EXPECT_TRUE(enginePins.hallPullupCam1.getLogicValue());
++	EXPECT_FALSE(enginePins.hallPullupCam2.getLogicValue());
++
++	// switching the type in software follows right away
++	engineConfiguration->triggerSensorType[0] = INPUT_SENSOR_HALL;
++	engineConfiguration->camSensorType[0] = INPUT_SENSOR_VR;
++	dut.onSlowCallback();
++
++	EXPECT_TRUE(enginePins.hallPullupCrank1.getLogicValue());
++	EXPECT_FALSE(enginePins.hallPullupCam1.getLogicValue());
++}
+diff --git a/unit_tests/tests/tests.mk b/unit_tests/tests/tests.mk
+index 166b9d8..fffd3fa 100644
+--- a/unit_tests/tests/tests.mk
++++ b/unit_tests/tests/tests.mk
+@@ -270,6 +270,7 @@ TESTS_SRC_CPP = \
+ 	tests/controllers/test_ltft_injection_time.cpp \
+ 	tests/controllers/test_alert_manager.cpp \
+ 	tests/controllers/test_tune_selector.cpp \
++	tests/controllers/test_hall_pullup.cpp \
+ 	tests/ignition_injection/test_ignition_state.cpp \
+ 	tests/core/test_main_loop.cpp \
+ 	tests/test_trip_odometer.cpp \
+-- 
+2.43.0
+
