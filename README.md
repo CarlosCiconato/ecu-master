@@ -1,20 +1,15 @@
-# ECU master — projeto da injeção programável (base rusEFI)
+# ECU placa: hardware da injeção programável (base rusEFI)
 
-Tudo do projeto da ECU num lugar só: firmware, placa, notas e o programa de ajuste.
+> **Procurando o programa de ajuste (Mac/Windows)?** Ele fica em [CarlosCiconato/ecu-app](https://github.com/CarlosCiconato/ecu-app), com os instaladores em [Releases](https://github.com/CarlosCiconato/ecu-app/releases). Aqui fica só a placa.
+
+Placa da ECU: placa KiCad, caixa 3D, firmware da placa e manuais.
 
 | Pasta | O que tem |
 |---|---|
 | [`01-Firmware-rusEFI`](01-Firmware-rusEFI) | Configuração da placa no rusEFI e os patches de todas as melhorias |
 | [`02-Placas-PCB`](02-Placas-PCB) | Placa top 6c completa (KiCad): esquema, placa e caixa 3D |
 | [`03-Manuais-e-notas`](03-Manuais-e-notas) | Notas da placa, resumo das funções e como continuar o projeto |
-| [`04-App-interface`](04-App-interface) | Programa de ajuste no computador: link para o código, exemplos e fotos |
-
-## Programa de ajuste
-
-![Tela inicial](04-App-interface/fotos/tela-inicial.png)
-
-- Código: **[CarlosCiconato/ecu-app](https://github.com/CarlosCiconato/ecu-app)**
-- Baixar (Mac e Windows): **[Releases](https://github.com/CarlosCiconato/ecu-app/releases)**
+| Programa | Está no repositório [ecu-app](https://github.com/CarlosCiconato/ecu-app) |
 
 ## Firmware
 

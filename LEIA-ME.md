@@ -1,4 +1,4 @@
-# ECU master — o que tem em cada pasta
+# ECU placa — o que tem em cada pasta
 
 ## 01-Firmware-rusEFI
 - `placa-top6c-firmware.md` — resumo do firmware da placa top 6c (pinos, tamanhos, testes).
@@ -12,5 +12,5 @@ Placa top 6c completa (KiCad): `top-6c-esquema-kicad`, `top-6c-rascunho7` e `cai
 ## 03-Manuais-e-notas
 `notas-placa.md`, `resumo-funcoes.md` e `CONTINUAR.md` (como continuar o projeto).
 
-## 04-App-interface
-Link para o programa de ajuste ([ecu-app](https://github.com/CarlosCiconato/ecu-app)), exemplos e fotos.
+## Programa de ajuste
+Não fica aqui: está no repositório [ecu-app](https://github.com/CarlosCiconato/ecu-app) (instaladores em [Releases](https://github.com/CarlosCiconato/ecu-app/releases)).
